@@ -303,13 +303,13 @@ prometheusRule:
   # -- Alert rules
   rules: []
   # Example:
-  # - alert: LaminarDBPipelineDown
-  #   expr: laminardb_pipeline_state_info{state="Stopped"} == 1
+  # - alert: LaminarDBScrapeDown
+  #   expr: up{job="laminardb"} == 0
   #   for: 5m
   #   labels:
   #     severity: critical
   #   annotations:
-  #     summary: "LaminarDB pipeline is down"
+  #     summary: "LaminarDB metrics scrape is failing"
 
 # -- Grafana dashboard ConfigMap
 grafanaDashboard:

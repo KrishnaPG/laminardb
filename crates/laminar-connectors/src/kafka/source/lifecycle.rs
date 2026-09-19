@@ -323,6 +323,9 @@ impl SourceConnector for KafkaSource {
         if let Some(tx) = self.reader_shutdown.take() {
             let _ = tx.send(true);
         }
+        if let Some(progress) = &mut self.progress {
+            progress.stop();
+        }
         // Wake assignment and poll work before joining. Any advisory async commit cleanup remains
         // librdkafka-owned and is not allowed to extend the engine's source-shutdown deadline.
         if let Some(ref consumer) = self.consumer {
@@ -330,6 +333,9 @@ impl SourceConnector for KafkaSource {
         }
         let deadline = tokio::time::Instant::now() + KAFKA_BACKGROUND_CLOSE_BUDGET;
         join_background_task(&mut self.reader_handle, deadline, "reader").await;
+        if let Some(mut progress) = self.progress.take() {
+            progress.close(deadline).await;
+        }
         self.msg_rx = None;
         self.reader_drain_tx = None;
         self.source_drain = None;

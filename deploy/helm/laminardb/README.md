@@ -152,6 +152,11 @@ prometheusRule:
         summary: "LaminarDB instance is down on {{ $labels.pod }}"
 ```
 
+`grafanaDashboard.enabled` installs the separate cluster dashboard. Import the
+[overview dashboard](../../../grafana/laminardb.json) as well for Kafka reader lag and freshness
+panels. See the [monitoring notes](../../../grafana/README.md) for metric semantics and opt-in
+checkpoint progress alerts using the existing `prometheusRule.rules` setting.
+
 ---
 
 ## ⚙️ Configuration Reference

@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3 and S4a verified locally; remaining S4 security work is open; B0 and S5–S13 not started.
+**Status:** S1–S3, S4a/S4b and S5 verified locally; remaining S4 security work is open; B0 preparation is underway; S6–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -355,8 +355,9 @@ Use this brief for each fresh session:
 At handoff record: base/result SHA or uncommitted diff, affected modes, reproduction, test results,
 performance evidence, any compatibility change, outstanding blockers, and the next dependency.
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
-evidence. S1–S3 and S4a are **implemented and verified locally**. S4 is **partially implemented**;
-remaining dependency findings and gate enforcement are unresolved. B0 and S5–S13 remain **not started**.
+evidence. S1–S3, S4a/S4b and S5 are **implemented and verified locally**. S4 is **partially
+implemented**; remaining dependency findings and gate enforcement are unresolved. B0 workload
+and tooling inspection is underway. S6–S13 remain **not started**.
 
 ## Implementation progress — 2026-09-19
 
@@ -504,3 +505,75 @@ test and the proc-macro future-compatibility notice are unchanged. Logs are unde
 Next S4 work is the constrained XML/LRU dependency remediation, dormant-rkyv scope and RSA review,
 then license/schema policy and required CI gate enforcement. No clean audit, release qualification
 or branch-protection result is claimed.
+
+### S4b — remove dormant legacy serialization dependency
+
+The targeted Cargo update from rust_decimal 1.41.0 to 1.43.0 removes its optional rkyv 0.7
+support and ten unused packages from the lockfile. Laminar's active rkyv 0.8.18 codec and the
+analytical dependency generations are unchanged. The upstream release also includes decimal
+arithmetic and formatting changes, so this is validated as a dependency update, not merely
+manual lockfile cleanup. [Upstream release](https://github.com/paupino/rust-decimal/releases/tag/1.43.0).
+
+Audit against the current RustSec snapshot now reports three vulnerability findings: the two
+quick-xml advisories and RSA. The removed rkyv finding described an inactive optional dependency;
+this update does not claim to repair an active Laminar checkpoint vulnerability. No advisory
+exception or scanner policy change was made. Logs are under `target/s4-remaining/`.
+
+Focused pgwire text/binary decimal checks with postgres-types 0.2.14 pass six cases on both
+rust_decimal versions, covering signs, zero, extrema, scale 28, trailing zeros, known wire bytes,
+invalid text and truncated/special binary values. A seventh check fails on both versions:
+upstream `Decimal::from_sql` panics for an out-of-range binary NUMERIC value (`10^32`). This
+pre-existing helper defect is retained as a reproducible finding, not suppressed. Current Laminar
+handlers do not call that decoder; review it before adding typed NUMERIC parameter decoding or
+qualifying downstream uses of the maintained pgwire helper. Workspace validation passed with
+the S5 changes as recorded below; the exploratory decoder failure remains open.
+
+The remaining XML fixes require an analytical-generation migration or maintained upstream
+backport. LRU first resolves through Chitchat 0.13, which also changes the transport API, gossip
+envelopes and dead-node retention; that requires a separate cluster upgrade and mixed-version
+tests. Current Chitchat keys have no panicking destructor, but no advisory exception is accepted.
+RSA still has no patched compatible parent; active reqsign uses randomized signing, not decryption,
+which narrows the observed surface without proving absence of timing leakage. Preserve these
+findings while proceeding with the independent S5 work; avoid local forks or compatibility wrappers.
+
+### S5 — Kafka reader progress and delivery freshness
+
+Implemented from `598a656c` alongside S4b. This applies to Kafka sources in embedded, single-node
+and cluster modes when a metrics registry and canonical source name are supplied.
+
+Implementation reuses the existing canonical source name, source task tracker, bounded Kafka
+metadata lookup and Prometheus registry. A source-owned sampler runs every ten seconds,
+independently of the reader queue and connector polling. Samples use fresh broker high watermarks
+and the next offset handed to the Kafka reader, not broker advisory commits. No new coordinator
+or core-operator work, connector trait hook, dependency, or per-record allocation is introduced.
+
+New source-labelled metrics expose reader offset distance, sample availability and timestamp,
+and the timestamp of the last nonempty successful connector poll. Unknown positions, failed
+queries and assignment changes cannot manufacture zero lag. Partition labels follow the current
+assignment; source registration has one cleanup owner so retired workers cannot overwrite a
+replacement's metrics. Sampling uses the existing shutdown budget and retains cancelled native
+work through the existing blocking-task owner.
+
+The overview dashboard distinguishes unavailable/stale samples from zero lag and shows source
+delivery age separately. Checkpoint-stall guidance uses the existing successful-completion counter
+for explicitly selected periodically checkpointed pipelines, preserving readiness semantics.
+Reader lag may include offset gaps and uncommitted transactions; these signals do not measure
+settled SQL progress, committed recovery offset lag or external sink visibility.
+
+Eight focused regressions passed, including real librdkafka MockCluster writes while the reader
+is paused, each assignment-generation fence, revocation, failed lookup, bounded close, startup
+wiring and source replacement. The initial focused run caught a missing canonical source name
+in the test fixture; the corrected fixture uses the existing validated startup contract.
+
+Validation: `cargo test --workspace --lib --bin laminardb --test cluster_tls_integration --locked
+--offline -j1 -- --test-threads=2` with `RUST_MIN_STACK=4194304` passed **6,015 tests, zero failed,
+one ignored**. Both Clippy gates, nightly formatting, readability, locked metadata, analytical
+dependency generations and whitespace checks passed. Final Clippy cleanup only renamed a test
+binding. Dashboard JSON, all 60 dashboard/documentation PromQL expressions and local links were
+validated. Independent source/dependency review found no blocking issue. Logs are under
+`target/s4-remaining/`; the query validator is under `target/s5-query-validation/`.
+
+No coordinator or core-operator code changed, so no hot-path performance claim is made. MockCluster
+is local protocol evidence, not production broker qualification; the metadata-query overhead at
+production partition counts remains S12 work. The existing ignored ONNX model test, cached OpenSSL
+debug-symbol warnings and proc-macro future-compatibility notice are unchanged. Next is B0 before S6.
