@@ -577,3 +577,45 @@ No coordinator or core-operator code changed, so no hot-path performance claim i
 is local protocol evidence, not production broker qualification; the metadata-query overhead at
 production partition counts remains S12 work. The existing ignored ONNX model test, cached OpenSSL
 debug-symbol warnings and proc-macro future-compatibility notice are unchanged. Next is B0 before S6.
+
+### B0 — local baseline preparation
+
+Started from `42657355`. Reuse `latency_bench` and the existing `stream_executor_bench` cases
+`plain_select`, `agg_group_by`, `sort_limit` and `query_chain`. The SQL diagnostic uses one local,
+ephemeral DB, 1,024-row batches with four numeric columns and one short string column, four uniformly
+distributed region keys, and the in-process source/subscription path. Input is closed-loop:
+push a batch, then wait for output. This does not measure an independently offered event rate,
+external sink visibility, durable recovery or Kafka overhead. Checkpointing is disabled and no
+external object store is involved. Production latency/recovery ceilings and an RSS envelope remain unset.
+
+Host inventory records an AMD Ryzen 9 7900X (12 cores / 24 logical processors), approximately
+31 GiB usable RAM, Windows 11 Pro build 26200 and Rust 1.98.0. Use the same optimized bench profile
+with `CARGO_PROFILE_BENCH_DEBUG=1` and `CARGO_PROFILE_BENCH_STRIP=none` for before/after runs, so
+profiles retain symbols. Raw build/host evidence is under `target/b0/`. Timing and allocation/CPU
+profiles have not yet been captured.
+
+The original SQL smoke run failed source-schema admission: the fixture registered a two-column mock
+connector for a five-column source, then pushed batches through the separate embedded input path.
+The four selected cases now use the existing in-process source directly, create Tokio's timeout
+inside its runtime and reuse one warmed pipeline. Setup and graceful shutdown are outside timing;
+each measured iteration includes the shallow input clone, push, scheduling and first output decoding.
+This avoids concurrent fixtures and timed teardown from the previous batched harness. The separate
+high-cardinality cases are unchanged and excluded from this baseline. All four corrected optimized
+smoke cases passed. All-features/all-targets Clippy, nightly formatting and readability passed;
+the earlier workspace and no-default-features gates cover the unchanged production code.
+No engine execution code or dependency changed.
+
+The memory ownership contract for the later serial work is deliberately limited to existing owners:
+
+| Domain | Admission, ownership and release | Current bound / transient gap |
+|---|---|---|
+| Connector queue | Source actor transfers a batch through `SourceMsg`; dequeue transfers ownership to the coordinator, not necessarily to free memory. | Count-bounded channel; waiting producers retain their batch. S7 adds the byte boundary. |
+| Embedded input | `SourceEntry::push_and_buffer` admits into the core source channel and retains snapshot/broadcast references until their owners release them. | Count limits do not cover arbitrary Arrow width or all retained snapshots. S8 owns this separate path. |
+| Parked/staged cycles | The coordinator retains parked messages and cycle buffers until execution, retry, recovery or cleanup resolves them. Cursor settlement follows successful publication. | These retained references outlive dequeue; a released queue permit cannot serve as their memory budget. |
+| Graph ports | `OperatorGraph` admits and retains input/output batches, then releases port ownership when consumed or cleared. | Existing Backpressure/Fail/BestEffort shedding applies; pre-route current-usage checks can overshoot on the next batch. S9 owns prospective admission and fan-out treatment. |
+| DataFusion reservations | A context's runtime pool owns participating reservations until the consumer releases/drops them. Main DB and graph contexts are constructed separately. | Currently unbounded; direct Arrow/expression allocations are outside reservations. S6 shares a bounded pool and disables compute spilling. |
+| Tables/MVs | Stores retain live keys/rows through upsert, refresh, publication and restore; replacement/delete or configured append retention releases them. | No general live-byte quota; shared Arrow slices can retain large allocations. S10/S11 own preflight and failure atomicity. |
+| Checkpoint scratch | Capture retains immutable frames while background serialization/persistence overlaps live state, then releases them on completion/cleanup. | Existing checkpoint data limits do not establish a whole-process or transient scratch-memory allowance. |
+
+No values in this ownership inventory are an additive RSS guarantee. Establish measured headroom
+before selecting memory defaults; keep the S6 pool scoped to participating reservations.

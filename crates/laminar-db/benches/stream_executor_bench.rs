@@ -1,9 +1,11 @@
 #![allow(clippy::disallowed_types)]
-//! Pipeline micro-benchmark: measures per-cycle SQL overhead through
-//! the `LaminarDB` public API (OperatorGraph execution path).
+//! SQL pipeline benchmarks through the `LaminarDB` public API.
 //!
-//! Compares plain SQL execution (full DataFusion planning each cycle) against
-//! compiled projections and cached logical plans.
+//! The projection, four-group aggregate, sort and query-chain cases measure warmed
+//! push-to-first-output latency, including the shallow input clone, scheduling and
+//! subscription decoding. Each uses one DB; setup and graceful shutdown are untimed.
+//! These are in-process diagnostics, not external visibility or durable-commit latency.
+//! The separate high-cardinality cases retain their per-iteration setup and polling.
 //!
 //! Run with: `cargo bench --bench stream_executor_bench -p laminar-db`
 
@@ -99,8 +101,8 @@ fn wait_for_output(
     subscription: &mut laminar_db::TypedSubscription<RowCount>,
     timeout: Duration,
 ) {
-    runtime
-        .block_on(tokio::time::timeout(timeout, async {
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
             loop {
                 match subscription.next_frame().await {
                     Ok(Some(laminar_db::TypedSubscriptionFrame::Rows { .. })) => return,
@@ -109,8 +111,10 @@ fn wait_for_output(
                     Err(error) => panic!("benchmark subscription failed: {error}"),
                 }
             }
-        }))
+        })
+        .await
         .expect("benchmark stream did not emit before timeout");
+    });
 }
 
 /// Benchmark: `SELECT id, region, price FROM t WHERE quantity > 10`
@@ -127,48 +131,25 @@ fn bench_plain_select(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("1024_rows", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("filtered"))
-                    .unwrap();
-                // Warm up: first cycle triggers compilation
-                source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("filtered"))
+            .unwrap();
+        // Warm up: first cycle triggers compilation
+        source.push_arrow(batch.clone()).unwrap();
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
@@ -187,47 +168,24 @@ fn bench_agg_group_by(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("1024_rows_4_groups", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("agg_result"))
-                    .unwrap();
-                source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("agg_result"))
+            .unwrap();
+        source.push_arrow(batch.clone()).unwrap();
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
@@ -246,47 +204,24 @@ fn bench_sort_limit(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("1024_rows_top10", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("sorted"))
-                    .unwrap();
-                source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("sorted"))
+            .unwrap();
+        source.push_arrow(batch.clone()).unwrap();
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
@@ -305,50 +240,27 @@ fn bench_query_chain(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("3_query_chain", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
-                    db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
-                    db.execute("CREATE STREAM step_c AS SELECT COUNT(*) AS cnt FROM step_b").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("step_c"))
-                    .unwrap();
-                source.push_arrow(batch.clone()).unwrap();
-                // Wait for the terminal stream
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
+            db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
+            db.execute("CREATE STREAM step_c AS SELECT COUNT(*) AS cnt FROM step_b").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("step_c"))
+            .unwrap();
+        source.push_arrow(batch.clone()).unwrap();
+        // Wait for the terminal stream
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
