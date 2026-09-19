@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3 implemented and verified locally; S4 triaged with remediation pending; B0 and S5–S13 not started.
+**Status:** S1–S3 and S4a verified locally; remaining S4 security work is open; B0 and S5–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -355,8 +355,8 @@ Use this brief for each fresh session:
 At handoff record: base/result SHA or uncommitted diff, affected modes, reproduction, test results,
 performance evidence, any compatibility change, outstanding blockers, and the next dependency.
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
-evidence. S1–S3 are **implemented and verified locally**. S4 has current scan evidence but is
-**incomplete**; B0 and S5–S13 remain **not started**.
+evidence. S1–S3 and S4a are **implemented and verified locally**. S4 is **partially implemented**;
+remaining dependency findings and gate enforcement are unresolved. B0 and S5–S13 remain **not started**.
 
 ## Implementation progress — 2026-09-19
 
@@ -445,3 +445,62 @@ compatible dependency repairs first, then the constrained XML/LRU and RSA work, 
 the required audit/deny gates. Preserve the analytical-generation invariant and do not hide
 unresolved findings behind blanket ignores. S5 can proceed independently; B0 remains required
 before the serial S6–S11 memory changes.
+
+### S4a — compatible dependency repairs and PEM migration
+
+Implemented against `aa68f16e` on `codex/p0-production-hardening`. This bounded part of S4 repairs
+dependencies compatible with the current analytical generation and removes the unmaintained
+server PEM wrapper. It does not complete S4 or accept any advisory/license exceptions.
+
+| Dependency | Previous | Updated |
+|---|---|---|
+| crossbeam-epoch | 0.9.18 | 0.9.21 |
+| event-listener | 5.4.1 | 5.4.2 |
+| h2 | 0.4.14 | 0.4.19 |
+| chacha20 | 0.10.0 | 0.10.2 |
+| rustls | 0.23.40 | 0.23.45 |
+| rustls-webpki | 0.103.13 | 0.103.15 |
+| aws-lc-rs | 1.17.0 | 1.18.1 |
+| aws-lc-sys | 0.41.0 | 0.45.0 |
+
+`concurrent-queue` leaves the graph with the upstream event-listener update. `rustls-pemfile` is
+removed from the server and lockfile; pgwire now calls the existing rustls-pki-types `PemObject`
+API through tokio-rustls. The former wrapper already used that parser. File-open ordering,
+empty-file diagnostics, first supported private key selection (PKCS#1/PKCS#8/SEC1), certificate
+and CA bundles, key permission warnings, expiry checks and failed-reload retention are preserved.
+Underlying malformed-PEM detail strings now use the maintained parser's formatting; the server's
+contextual error labels are unchanged.
+
+The dependency updates affect builds using this workspace lockfile in all modes; the PEM change
+affects the single-node and cluster pgwire listeners. No coordinator/operator code or state ABI
+changes. Updated native crypto and transport behavior still require shipped-platform CI and
+workload qualification; no hot-path benchmark or production latency claim is made here.
+
+Cargo initially reselected unrelated parking_lot, socket2 and Windows dependency edges. The
+committed selections for unchanged packages were preserved and locked metadata revalidated.
+Independent review confirmed exactly eight version changes and two removals, with no unrelated
+edge changes. The only changed edge on an unchanged package is the removed server PEM dependency.
+Analytical dependency generations remain unchanged.
+
+Against the same current RustSec revision recorded above, the scoped audit comparison verifies
+five resolved advisory IDs: RUSTSEC-2026-0204, RUSTSEC-2026-0221, RUSTSEC-2026-0258,
+RUSTSEC-2026-0285 and RUSTSEC-2025-0134. Vulnerability findings fall from seven to four. The two
+quick-xml advisories, RSA and dormant rkyv remain; unsound LRU and three unmaintained dependencies
+remain warnings in cargo-audit. The strict temporary cargo-deny configuration still fails on
+active unresolved advisories and the existing license allow-list gaps. Scanner policies and CI
+workflows are unchanged. Raw before/after reports and dependency evidence are in
+`target/s4-compatible/`.
+
+Validation: the focused TLS run passed **44 tests**. `cargo test --workspace --lib --bin laminardb
+--test cluster_tls_integration --locked --offline -j1 -- --test-threads=2` with
+`RUST_MIN_STACK=4194304` passed **6,007 tests, zero failed, one ignored**. This includes the three
+new PEM regressions, both roots in the expanded CA-bundle test and the real cluster mTLS exchange.
+Both Clippy gates, nightly formatting, readability, analytical-dependency generation, locked
+metadata and whitespace checks passed. Independent source and dependency review found no
+actionable issues. Cached OpenSSL debug-symbol warnings, the ignored ONNX model
+test and the proc-macro future-compatibility notice are unchanged. Logs are under
+`target/s4-compatible/`.
+
+Next S4 work is the constrained XML/LRU dependency remediation, dormant-rkyv scope and RSA review,
+then license/schema policy and required CI gate enforcement. No clean audit, release qualification
+or branch-protection result is claimed.
