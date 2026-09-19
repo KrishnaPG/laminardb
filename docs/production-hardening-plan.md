@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a/S4b/S4c and S5 verified locally; S4 dependency findings now block CI/release; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
+**Status:** S1–S3, S4a–S4d and S5 verified locally; S4 dependency findings still block CI/release; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -355,7 +355,7 @@ Use this brief for each fresh session:
 At handoff record: base/result SHA or uncommitted diff, affected modes, reproduction, test results,
 performance evidence, any compatibility change, outstanding blockers, and the next dependency.
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
-evidence. S1–S3, S4a/S4b/S4c and S5 are **implemented and verified locally**. S4 is **partially
+evidence. S1–S3, S4a–S4d and S5 are **implemented and verified locally**. S4 is **partially
 implemented**; the enforced scans still fail on unresolved dependency findings. B0 local timings
 are recorded; CPU/IPC and allocation profiling is blocked. S6–S13 remain **not started**.
 
@@ -589,6 +589,32 @@ OpenSSL debug-symbol warning remain unchanged. Validation logs are under `target
 Next S4 work remains constrained dependency remediation or explicit, owned, time-bounded
 advisory review; B0 still blocks the serial memory changes. These passing regression and policy
 checks do not override the failing security scans.
+
+### S4d — remove unmaintained download-progress dependency
+
+Implemented from `3d8b502d`. The targeted `hf-hub` update from
+0.4.3 to 0.5.0 replaces indicatif 0.17.11 with 0.18.6 and console 0.15.11 with 0.16.6,
+removing number_prefix 0.4.0 in favor of unit-prefix 0.5.2. The selected Tokio/Rustls client
+features remain the same, as recorded in the [published 0.5.0 manifest](https://docs.rs/crate/hf-hub/0.5.0/source/Cargo.toml).
+The upgrade retains Laminar's existing async-client and cache APIs.
+
+This applies to builds enabling local AI, including the server. Cluster SQL admission is
+unchanged. Production loader/inference code and the analytical dependency generations are
+unchanged. Two focused regressions cover the existing Hugging Face snapshot layout and a local
+HTTP download with progress reporting, label-cache publication and a second read without HTTP.
+They need neither an external model download nor an ONNX Runtime installation.
+
+Fresh audit/deny scans against RustSec revision `d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16`
+remove only `RUSTSEC-2025-0119`, with no new findings. Deny retains six advisory errors;
+audit also reports unmaintained `instant` in its broader lockfile scope. Both scans still
+exit 1. No scanner policy or advisory exception changed. Evidence is under `target/s4-hub/`.
+
+Validation passed: **six focused local-backend tests** and **5,674 workspace library tests**,
+zero failures, plus both Clippy gates, nightly formatting, readability, locked metadata,
+analytical-dependency generation and whitespace checks. The existing model-download/ONNX test
+remains ignored; this is cache/client compatibility evidence, not a new inference qualification.
+The Windows feature change required a wider rebuild; existing OpenSSL debug-symbol warnings
+are unchanged. No coordinator/core-operator code changed, and no hot-path performance claim is made.
 
 ### S5 — Kafka reader progress and delivery freshness
 

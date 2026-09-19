@@ -5,7 +5,7 @@
 
 The [execution plan](production-hardening-plan.md) turns this backlog into bounded sessions,
 dependencies, correctness tests and performance gates. Planning refinements below were checked
-against the same HEAD. S1–S3, S4a/S4b dependency repairs, S4c CI/release enforcement and S5 Kafka
+against the same HEAD. S1–S3, S4a/S4b/S4d dependency repairs, S4c CI/release enforcement and S5 Kafka
 progress telemetry are implemented and verified locally. Remaining S4 findings now block CI/release.
 Findings below describe the reviewed baseline. See the execution plan for validation and remaining work.
 
