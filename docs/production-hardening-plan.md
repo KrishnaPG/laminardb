@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a/S4b and S5 verified locally; remaining S4 security work is open; B0 preparation is underway; S6–S13 not started.
+**Status:** S1–S3, S4a/S4b and S5 verified locally; remaining S4 security work is open; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -578,7 +578,7 @@ is local protocol evidence, not production broker qualification; the metadata-qu
 production partition counts remains S12 work. The existing ignored ONNX model test, cached OpenSSL
 debug-symbol warnings and proc-macro future-compatibility notice are unchanged. Next is B0 before S6.
 
-### B0 — local baseline preparation
+### B0 — local timing baseline; profiling pending
 
 Started from `42657355`. Reuse `latency_bench` and the existing `stream_executor_bench` cases
 `plain_select`, `agg_group_by`, `sort_limit` and `query_chain`. The SQL diagnostic uses one local,
@@ -591,8 +591,8 @@ external object store is involved. Production latency/recovery ceilings and an R
 Host inventory records an AMD Ryzen 9 7900X (12 cores / 24 logical processors), approximately
 31 GiB usable RAM, Windows 11 Pro build 26200 and Rust 1.98.0. Use the same optimized bench profile
 with `CARGO_PROFILE_BENCH_DEBUG=1` and `CARGO_PROFILE_BENCH_STRIP=none` for before/after runs, so
-profiles retain symbols. Raw build/host evidence is under `target/b0/`. Timing and allocation/CPU
-profiles have not yet been captured.
+profiles retain symbols. Builds and benchmark runs use `RUST_MIN_STACK=4194304`.
+Raw build/host evidence is under `target/b0/`.
 
 The original SQL smoke run failed source-schema admission: the fixture registered a two-column mock
 connector for a five-column source, then pushed batches through the separate embedded input path.
@@ -604,6 +604,42 @@ high-cardinality cases are unchanged and excluded from this baseline. All four c
 smoke cases passed. All-features/all-targets Clippy, nightly formatting and readability passed;
 the earlier workspace and no-default-features gates cover the unchanged production code.
 No engine execution code or dependency changed.
+
+Uninstrumented Criterion runs completed against source commit
+`54b551b14f7bb8b36b0ab7504e8a7c0f48a66c70`, using the matching working-tree binaries built before
+that commit. `target/b0/baseline-identity.json` records executable paths, SHA-256 hashes and run time.
+Raw samples and estimates are saved under `target/criterion/**/s6-before/`; the host remains on its
+existing Balanced power scheme. Each case collected 100 samples after a three-second warmup, with
+a five-second measurement target automatically extended for the slower SQL cases.
+
+| Diagnostic | Criterion mean | 95% confidence interval |
+|---|---:|---:|
+| Tumbling-window assignment | 1.414 ns | 1.409–1.421 ns |
+| Projection/filter, 1,024 input rows | 0.921 ms | 0.795–1.051 ms |
+| Four-group aggregate, 1,024 input rows | 1.476 ms | 1.265–1.702 ms |
+| Sort/top ten, 1,024 input rows | 1.161 ms | 0.989–1.336 ms |
+| Three-query chain, 1,024 input rows | 1.434 ms | 1.285–1.584 ms |
+
+These are mean estimates from `estimates.json`, not Criterion's displayed regression slopes or
+event-latency percentiles. SQL intervals are too wide to resolve a 5% regression confidently;
+repeat matched before/after measurements on a stable target host before accepting hot-path changes.
+The window-assignment microbenchmark does not measure full event processing.
+
+The reproducible commands, with the two executable paths from `target/b0/executables.json`, are:
+
+```text
+cargo bench -p laminar-core -p laminar-db --no-default-features --bench latency_bench --bench stream_executor_bench --no-run --message-format=json --locked --offline -j1
+<latency_bench.exe> --bench --noplot --save-baseline s6-before
+<stream_executor_bench.exe> --bench "^(plain_select|agg_group_by|sort_limit|query_chain)/" --noplot --save-baseline s6-before
+```
+
+CPU/IPC and allocation profiles remain outstanding. WPR rejected the named CPU/PMC capture with
+`0xc5585011` (could not enable the profiling policy), and image-specific heap tracing with
+`0x80070005` (access denied). The execution token lacks the profiling privilege. Final checks show
+the task's WPR instance idle and heap tracing disabled; no profile workload ran. Capture logs and
+the validated PMC profile are retained under `target/b0/`. Completing B0 requires an elevated
+profiling environment; this timing-only run does not close B0 or authorize performance conclusions
+for S6. No production workload targets or memory defaults have been inferred from these results.
 
 The memory ownership contract for the later serial work is deliberately limited to existing owners:
 
