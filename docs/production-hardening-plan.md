@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4d and S5 verified locally; S4 dependency findings still block CI/release; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
+**Status:** S1–S3, S4a–S4e and S5 verified locally; S4 dependency findings still block CI/release; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -615,6 +615,59 @@ analytical-dependency generation and whitespace checks. The existing model-downl
 remains ignored; this is cache/client compatibility evidence, not a new inference qualification.
 The Windows feature change required a wider rebuild; existing OpenSSL debug-symbol warnings
 are unchanged. No coordinator/core-operator code changed, and no hot-path performance claim is made.
+
+### S4e — remove the unsound gossip cache dependency
+
+Implemented from `0c78edc0`. Chitchat 0.10.1 → 0.13.0 permits the fixed LRU 0.18.4,
+removing `RUSTSEC-2026-0253`. The only added package is itertools 0.15.0. LRU now enables
+default allocator/hasher features on the existing hashbrown 0.17.1; no other existing package's
+selected features change. The analytical dependency generations and Tokio version are unchanged.
+
+This affects cluster gossip discovery. Embedded, single-node and static discovery behavior are
+unchanged. Chitchat's new [protocol selector](https://docs.rs/chitchat/0.13.0/chitchat/struct.ChitchatConfig.html)
+is explicitly V0, preserving the existing uncompressed wire format. The existing partition-test
+transport forwards the new envelope/outcome types and socket address, and reports zero bytes
+when it drops a simulated packet. KV lookup compares the new shared node-ID type through borrowed
+strings. No new wrapper, configuration knob or compatibility layer is added.
+Callers supplying their own Chitchat transports must adopt the updated upstream socket API.
+Laminar's software-version, discovery-protocol and process-generation admission checks remain intact.
+
+A regression checks actual outbound V0 bytes, replies to legacy SYN vectors and rejection of
+a foreign cluster. The vectors were checked against the published 0.10.1 UDP encoder in an
+isolated probe. A second probe runs published 0.10.1 and 0.13.0 peers together over loopback UDP:
+both directions pass live membership, initial values, updates, tombstones, dead-peer collection
+and higher-generation rejoin. Its separate old dependency graph is test evidence under
+`target/s4-gossip/mixed/`, not part of the workspace or shipped lockfile. This is protocol evidence,
+not an S13 cross-release upgrade or rollback qualification.
+
+Upstream also increases the bounded garbage-collected-node history from 500 to 5,000 entries and
+uses shared node-ID strings. Laminar's explicit failure-detector and tombstone grace periods are
+preserved. The larger history can reserve and retain more control-plane memory; production
+RSS qualification remains open. No coordinator/core-operator code changed and no hot-path
+performance claim is made.
+
+Fresh scans at RustSec revision `d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16` remove only the
+LRU advisory, with no new findings. Both scans still exit 1: deny retains five advisory errors
+(two quick-xml findings, RSA, paste and proc-macro-error2), and audit additionally reports instant.
+No advisory exception or scanner policy changed. Raw dependency, scan and probe evidence is
+under `target/s4-gossip/`.
+
+The locked/offline workspace library and cluster integration run passed **5,685 tests, zero
+failed, two ignored**, using `RUST_MIN_STACK=4194304`, one build job and two test threads. This
+includes **5,675 library tests** with the new V0 regression and ten core/DB cluster integration cases.
+The normally ignored same-ID rejoin case also passed when explicitly selected; its existing
+test ignore remains because one successful run does not establish repeatability. The ONNX
+model test remains ignored. Both Clippy gates, nightly formatting, readability, locked metadata,
+analytical-dependency generations and whitespace checks passed. Readability exceptions did not grow.
+
+The test command was `cargo test --workspace --lib --test cluster_integration --locked --offline
+-j1 -- --test-threads=2`; the rejoin check used the same targets with the
+`killed_node_can_rejoin -- --ignored --exact --test-threads=1` filter. The two isolated compatibility
+probe tests also passed. These local Windows results do not replace shipped-platform CI or S12/S13.
+
+Windows linking initially exhausted disk space. Removing older generated incremental caches
+freed approximately 110 GiB, preserving benchmark baselines, compiled outputs and evidence;
+the same validation then passed. Existing OpenSSL debug-symbol warnings remain unchanged.
 
 ### S5 — Kafka reader progress and delivery freshness
 

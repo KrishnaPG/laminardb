@@ -137,7 +137,7 @@ iceberg-storage-opendal = { version = "=0.10.1", default-features = false }
 apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)
-chitchat = "0.10"
+chitchat = "0.13"
 tokio-util = { version = "0.7", features = ["rt"] }
 # xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
 # bump and updated golden vectors.
