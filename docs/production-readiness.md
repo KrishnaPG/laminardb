@@ -5,8 +5,8 @@
 
 The [execution plan](production-hardening-plan.md) turns this backlog into bounded sessions,
 dependencies, correctness tests and performance gates. Planning refinements below were checked
-against the same HEAD. S1–S3, the dependency repairs in S4a/S4b and Kafka progress telemetry in S5
-are implemented and verified locally. Remaining S4 scan findings and gate enforcement are unresolved.
+against the same HEAD. S1–S3, S4a/S4b dependency repairs, S4c CI/release enforcement and S5 Kafka
+progress telemetry are implemented and verified locally. Remaining S4 findings now block CI/release.
 Findings below describe the reviewed baseline. See the execution plan for validation and remaining work.
 
 LaminarDB already has a substantial streaming execution, checkpoint, fencing, recovery, and

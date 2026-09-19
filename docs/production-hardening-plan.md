@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a/S4b and S5 verified locally; remaining S4 security work is open; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
+**Status:** S1–S3, S4a/S4b/S4c and S5 verified locally; S4 dependency findings now block CI/release; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -355,9 +355,9 @@ Use this brief for each fresh session:
 At handoff record: base/result SHA or uncommitted diff, affected modes, reproduction, test results,
 performance evidence, any compatibility change, outstanding blockers, and the next dependency.
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
-evidence. S1–S3, S4a/S4b and S5 are **implemented and verified locally**. S4 is **partially
-implemented**; remaining dependency findings and gate enforcement are unresolved. B0 workload
-and tooling inspection is underway. S6–S13 remain **not started**.
+evidence. S1–S3, S4a/S4b/S4c and S5 are **implemented and verified locally**. S4 is **partially
+implemented**; the enforced scans still fail on unresolved dependency findings. B0 local timings
+are recorded; CPU/IPC and allocation profiling is blocked. S6–S13 remain **not started**.
 
 ## Implementation progress — 2026-09-19
 
@@ -412,7 +412,7 @@ checks passed. Test linking reported cached OpenSSL debug-symbol warnings; the b
 succeeded. The ignored ONNX model test and proc-macro future-compatibility notice are unchanged.
 Logs are under `target/s3-hardening/`. No performance or external-system qualification is claimed.
 
-### S4 — current dependency triage, enforcement still pending
+### S4 — initial dependency triage before enforcement
 
 Read-only triage used cargo-audit **0.22.2**, cargo-deny **0.20.2**, and freshly fetched RustSec
 revision `d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16` on 2026-09-19 against the unchanged lockfile.
@@ -535,6 +535,60 @@ tests. Current Chitchat keys have no panicking destructor, but no advisory excep
 RSA still has no patched compatible parent; active reqsign uses randomized signing, not decryption,
 which narrows the observed surface without proving absence of timing leakage. Preserve these
 findings while proceeding with the independent S5 work; avoid local forks or compatibility wrappers.
+
+### S4c — require dependency checks in CI and release
+
+Implemented from `a8aedeee`. This changes repository/release policy for all shipped modes;
+runtime code, dependency versions and hot-path behavior are unchanged. Enforcement now proceeds
+before the constrained dependency migrations: the existing findings deliberately block CI and
+release instead of being hidden by successful aggregate results. S4 remains incomplete.
+
+The existing audit/deny jobs no longer tolerate failure, and both are required by `ci-success`.
+Audit treats warnings as errors; deny checks the locked, all-features graph across the existing
+six target triples and rejects vulnerability, unsoundness, unmaintained and yanked findings.
+The old `instant` advisory ignore was removed; no advisory exceptions were added. The existing
+release dependency chain already requires reusable CI before artifact builds, release creation,
+crate publication and manifest updates, so it needs no additional scanner or workflow.
+
+The deny policy uses the [current configuration schema](https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html).
+Unlicensed and unlisted licenses remain errors under the tool's default-deny license policy.
+Four permissive license identifiers used by the locked dependencies are now explicitly allowed,
+after checking package license files against their SPDX texts:
+
+| License | Existing dependency examples | Conditions relevant to redistribution |
+|---|---|---|
+| [Unicode-3.0](https://spdx.org/licenses/Unicode-3.0.html) | ICU4X, unicode-ident | Retain copyright/permission notices in copies or documentation; no unauthorized name promotion. |
+| [bzip2-1.0.6](https://spdx.org/licenses/bzip2-1.0.6.html) | libbz2-rs-sys | Retain source notices, identify altered sources and respect origin/endorsement restrictions. |
+| [CDLA-Permissive-2.0](https://spdx.org/licenses/CDLA-Permissive-2.0.html) | webpki-roots, webpki-root-certs | Include the agreement with shared data. |
+| [BSL-1.0](https://spdx.org/licenses/BSL-1.0.html) | xxhash-rust | Retain notices and license text, subject to the license's object-code exception. |
+
+This allow-list decision does not verify notice packaging in every release artifact. Package
+license paths/hashes and scan output are retained under `target/s4-gates/`.
+
+Fresh scans with cargo-audit 0.22.2 and cargo-deny 0.20.2 used RustSec revision
+`d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16`. Both exit **1** for substantive advisory findings.
+Deny's license, source and ban checks have no errors; duplicate-version and one unused-license
+warning remain. Its seven advisory errors are the two quick-xml vulnerabilities, RSA, unsound
+LRU, and unmaintained number_prefix, paste and proc-macro-error2. Audit additionally reports
+unmaintained `instant` in its broader lockfile scope. These are remediation/review work, not a
+clean security scan or newly accepted exceptions.
+
+The nonpublishing failure exercise executes the actual aggregate Bash step extracted from CI:
+**65 cases passed**, including every required job failing, cancelling, skipping or missing its
+result, all-success, and all audit/deny status combinations. The release dependency chain was
+checked locally; actionlint 1.7.12 accepts both workflows. Three isolated license probes confirm
+MIT is accepted while an unlisted GPL license and an unlicensed package are rejected. No hosted
+CI/release run or external branch-protection setting was changed or verified. The exercise is
+local evidence, not a publishing rehearsal.
+
+Workspace library tests passed **5,672 tests, zero failed, one ignored**, using the locked,
+offline graph, `RUST_MIN_STACK=4194304`, one build job and two test threads. Both Clippy gates,
+nightly formatting, readability and whitespace checks passed. The ignored ONNX test and cached
+OpenSSL debug-symbol warning remain unchanged. Validation logs are under `target/s4-gates/`.
+
+Next S4 work remains constrained dependency remediation or explicit, owned, time-bounded
+advisory review; B0 still blocks the serial memory changes. These passing regression and policy
+checks do not override the failing security scans.
 
 ### S5 — Kafka reader progress and delivery freshness
 
