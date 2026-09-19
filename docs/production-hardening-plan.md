@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1/S2 implemented and verified locally; remaining sessions not started.
+**Status:** S1–S3 implemented and verified locally; S4 triaged with remediation pending; B0 and S5–S13 not started.
 **Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -355,7 +355,8 @@ Use this brief for each fresh session:
 At handoff record: base/result SHA or uncommitted diff, affected modes, reproduction, test results,
 performance evidence, any compatibility change, outstanding blockers, and the next dependency.
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
-evidence. S1/S2 are **implemented and verified locally**; the other sessions remain **not started**.
+evidence. S1–S3 are **implemented and verified locally**. S4 has current scan evidence but is
+**incomplete**; B0 and S5–S13 remain **not started**.
 
 ## Implementation progress — 2026-09-19
 
@@ -386,5 +387,61 @@ authentication, outside the streaming record path; no hot-path benchmark claim i
 Compatibility: non-loopback HTTP now requires `server.console_token`; durable delivery now rejects
 `ShedOldest` through builder and direct configuration. Use Backpressure or Fail for durable delivery.
 Regression logs and gate output are under `target/p0-hardening/`. S12/S13 release and upgrade
-qualification remain outstanding. S3 is the next sequential session; S4/S5 can
-proceed independently under the ownership rules above.
+qualification remain outstanding.
+
+### S3 — supported-surface documentation
+
+Completed against `a16c5a6d` on `codex/p0-production-hardening`. The root and crate READMEs now
+describe rejected PostgreSQL/MongoDB CDC admission, Delta reader versus streaming-route
+capability, managed direct-source cluster windows, the single compute runtime, and local versus
+cluster subscription replay. The root README links named admission examples and rejection tests.
+The SQL README no longer presents PostgreSQL CDC as a positive connector example. `SECURITY.md`
+now reflects the existing latest-minor support policy for 0.30 and the S1 HTTP authentication rule.
+
+This is documentation only, affecting guidance for all modes. It changes no API, admission rule,
+dependency or execution path. Existing contract coverage was reused; no duplicate capability
+registry or tests of document wording were added. An independent source/test review found no
+actionable inaccuracies, and local Markdown links resolve.
+
+Validation: `cargo test --workspace --lib --bin laminardb --test cdc_admission --locked --offline
+-j1 -- --test-threads=2` with `RUST_MIN_STACK=4194304` passed **6,005 tests, zero failed, one ignored**.
+All 15 admission/replay/config checks linked from the corrected sections ran and passed. Both
+Clippy gates, nightly formatting, readability, analytical-dependency generation and whitespace
+checks passed. Test linking reported cached OpenSSL debug-symbol warnings; the builds and tests
+succeeded. The ignored ONNX model test and proc-macro future-compatibility notice are unchanged.
+Logs are under `target/s3-hardening/`. No performance or external-system qualification is claimed.
+
+### S4 — current dependency triage, enforcement still pending
+
+Read-only triage used cargo-audit **0.22.2**, cargo-deny **0.20.2**, and freshly fetched RustSec
+revision `d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16` on 2026-09-19 against the unchanged lockfile.
+Audit reported **seven vulnerability findings** in the lockfile; this is not a claim that all
+seven are reachable in each deployed binary. In particular, the old rkyv entry has no selected
+edge in the all-features/all-targets graph inspected during triage.
+
+| Locked dependency | Finding / fixed range | Next bounded work |
+|---|---|---|
+| crossbeam-epoch 0.9.18 | RUSTSEC-2026-0204; fixed >=0.9.20 | Compatible update and regression checks |
+| h2 0.4.14 | RUSTSEC-2026-0258; fixed >=0.4.16 | Compatible update and transport checks |
+| quick-xml 0.39.4 | RUSTSEC-2026-0194 and RUSTSEC-2026-0195; fixed >=0.41.0 | object_store 0.13.2 and OpenDAL 0.57.0 constrain XML to 0.39; review a backport or coordinated dependency migration. Cloud response parsing reaches the affected reader. |
+| rkyv 0.7.46 | RUSTSEC-2026-0235; fixed >=0.8.17 | Dormant optional rust_decimal dependency; review parent resolution/feature removal without changing the active 0.8 state ABI |
+| rsa 0.9.10 | RUSTSEC-2023-0071; no patched release listed | Finish transitive signing/decryption reachability review before considering any exception |
+| rustls 0.23.40 | RUSTSEC-2026-0285; fixed >=0.23.45 | Exact-version dry run succeeds but also upgrades aws-lc native crypto and webpki; validate all TLS feature sets |
+
+Additional findings: unsound `event-listener` 5.4.1 (fixed >=5.4.2) and `lru` 0.16.3
+(fixed >=0.18.2, constrained by chitchat), yanked `chacha20` 0.10.0, and unmaintained transitive
+dependencies. Compatible-update dry runs succeeded for crossbeam-epoch, event-listener, h2 and
+chacha20. A generic rustls update selected a still-affected version, so it is insufficient.
+
+The checked-in `deny.toml` fails the current tool's schema before scanning. A temporary modernized
+configuration also exposed missing license allow-list entries for Unicode-3.0, bzip2-1.0.6,
+CDLA-Permissive-2.0 and BSL-1.0. License review, schema migration, finding remediation and the
+nonpublishing failure exercise remain part of S4. The release workflow already depends on reusable
+CI; audit/deny remain advisory-only and absent from `ci-success` until this work is completed.
+
+No dependency versions, scanner policy, exceptions or workflows changed during this triage.
+Full scan output, parent graphs and dry runs are under `target/s4-hardening/`. Follow up with
+compatible dependency repairs first, then the constrained XML/LRU and RSA work, before enabling
+the required audit/deny gates. Preserve the analytical-generation invariant and do not hide
+unresolved findings behind blanket ignores. S5 can proceed independently; B0 remains required
+before the serial S6–S11 memory changes.

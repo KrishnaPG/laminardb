@@ -70,7 +70,8 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # [server.pgwire_users]
 # alice = "${ALICE_PASSWORD}"
 # bob   = "${BOB_PASSWORD}"
-# Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
+# Main I/O runtime worker count uses $TOKIO_WORKER_THREADS (default: logical CPUs).
+# Streaming compute uses one separate single-threaded laminar-compute runtime.
 
 [checkpoint]
 # Provider-neutral object_store URL: absolute file://, s3[a]://, gs/gcs://,
@@ -196,11 +197,15 @@ including remote AI — runs normally.
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
 
-- `SUBSCRIBE <name> [WHERE <predicate>]`: streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
+- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
-`WHERE` is compiled with DataFusion against the target's schema and works on materialized views and sources. It is rejected on named streams because their output schema isn't introspectable.
+`WHERE` is compiled with DataFusion against the resolved output schema; an unresolved named-stream
+schema is rejected. Local epoch replay uses byte-bounded in-memory history. Cluster replay uses
+verified segments in the checkpoint store and is partition-ordered. There is no atomic
+snapshot-plus-tail attachment or durable named-consumer cursor. See the
+[subscription boundaries and tests](../../README.md#ddl).
 
 ### Authentication
 
@@ -315,7 +320,7 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:3000,muzzy_d
 
 ### Settings to avoid
 
-- **Do not set `narenas:N` to a small value.** The jemalloc default is `ncpus * 4`, which gives each reactor / sink thread its own arena and eliminates cross-thread contention on `malloc`/`free`. LaminarDB is thread-per-core. Forcing `narenas:4` on an 8-core box means multiple reactors share an arena, and the lock contention shows up directly in the sink commit path. Leave `narenas` unset.
+- **Leave `narenas` unset unless measurements justify changing it.** LaminarDB runs one coordinator on the dedicated single-threaded `laminar-compute` runtime; connector I/O, checkpoint persistence and sink publication use the main work-stealing runtime. Too few allocator arenas can increase contention among those threads. Profile the actual workload before tuning the arena count.
 - **Do not set `tcache:false`.** The per-thread small-allocation cache is load-bearing on any sink that churns Arrow/Parquet buffers.
 
 ### How to set it

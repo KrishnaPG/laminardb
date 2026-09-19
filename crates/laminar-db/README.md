@@ -28,6 +28,22 @@ laminar-db
   |-- laminar-connectors  (external connectors)
 ```
 
+One `StreamingCoordinator` task executes on the dedicated single-threaded `laminar-compute`
+runtime. Connector I/O, checkpoint persistence and sink publication run on the main runtime.
+This model applies to embedded, single-node and cluster execution.
+
+See the [SQL and delivery boundaries](../../README.md#supported-sql-and-delivery-boundaries) for
+mode-specific admission and executable contract examples. Cluster plans deliberately reject local
+materialized views and reference-table enrichment; managed direct-source final windows and
+certified interval/temporal joins have their own admitted paths. Feature flags and checkpoints
+alone do not imply exactly-once delivery.
+
+Local subscriptions use in-memory replay history; cluster subscriptions expose committed,
+partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate
+snapshot query followed by a subscription nor a client cursor establishes an atomic
+snapshot-plus-tail or transactional external-consumer guarantee. See the
+[subscription boundaries](../../README.md#ddl) and linked replay tests before designing consumers.
+
 ## Feature Flags
 
 | Flag | Purpose |
@@ -35,9 +51,9 @@ laminar-db
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
 | `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC source (also builds the standalone `postgres` lookup connector) |
+| `postgres-cdc` | PostgreSQL CDC implementation (source admission rejected); also builds the supported `postgres` lookup connector |
 | `postgres-sink` | PostgreSQL sink |
-| `mongodb-cdc` | MongoDB CDC source and sink |
+| `mongodb-cdc` | MongoDB sink/lookup and CDC implementation (CDC source admission rejected) |
 | `delta-lake` | Delta Lake sink and source |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
 | `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
