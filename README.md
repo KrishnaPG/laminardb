@@ -106,8 +106,9 @@ tar xzf laminardb-server-*.tar.gz
 Multi-arch images are published to **Docker Hub** and **GHCR** on every release:
 
 ```bash
-docker run -p 8080:8080 laminardb/laminardb-server:latest          # Docker Hub
-docker run -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest  # GHCR
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+docker run -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN laminardb/laminardb-server:latest          # Docker Hub
+docker run -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN ghcr.io/laminardb/laminardb-server:latest  # GHCR
 ```
 
 The image ships a default config at `/etc/laminardb/laminardb.toml` (mount your own over it) and persists state in `/var/lib/laminardb`. A full `docker compose` stack — server plus Redpanda, Prometheus, and Grafana — is in [`docker-compose.yml`](docker-compose.yml).
@@ -185,6 +186,7 @@ node_id = "node-1" # Required and unique per node
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"
 key_groups = 256
 
@@ -204,7 +206,9 @@ interval = "30s"
 timeout = "120s"
 ```
 
-Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields are omitted. To enable mTLS, configure all four fields; every node certificate must chain to the configured CA and contain `cluster_tls_server_name` as a SAN. These fields do not wrap Chitchat gossip, so restrict `gossip_port` to a trusted network. Use mTLS for production clusters unless transport security is provided by the deployment network.
+Set `LAMINAR_CONSOLE_TOKEN` to a random secret before starting each node. Non-loopback HTTP binds require `server.console_token`. Terminate HTTP TLS at a trusted proxy and restrict access to the public health and metrics endpoints.
+
+Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields are omitted. To enable mTLS, configure all four fields; every node certificate must chain to the configured CA and contain `cluster_tls_server_name` as a SAN. These fields do not protect HTTP or Chitchat gossip, so restrict `gossip_port` to a trusted network. Use mTLS for production clusters unless transport security is provided by the deployment network.
 
 > [!NOTE]
 > If `server.mode` is set to `"single"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.
@@ -488,7 +492,7 @@ The HTTP API binds to `bind` configured under `[server]`. It serves the followin
   * `POST /api/v1/checkpoint` to trigger manual checkpoints.
   * `POST /api/v1/reload` to trigger configuration and TLS certificate hot-reloading.
 
-Authentication is gated using a token defined by `server.console_token` in headers/query parameters. CORS origins are restricted via `server.console_cors_allowed_origins`.
+Non-loopback HTTP binds require `server.console_token`; loopback development can omit it. Protected routes accept `Authorization: Bearer <token>`. The `?token=` alternative is limited to WebSocket upgrades. CORS origins are restricted via `server.console_cors_allowed_origins`.
 
 ---
 

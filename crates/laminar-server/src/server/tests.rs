@@ -84,6 +84,59 @@ async fn server_entry_rejects_invalid_temporal_retention_in_both_modes() {
 }
 
 #[tokio::test]
+async fn server_entry_rejects_anonymous_remote_http_before_other_startup_work() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        for bind in ["0.0.0.0:8080", "[::]:8080", "[::ffff:127.0.0.1]:8080"] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.bind = bind.into();
+            // A later validation failure keeps this regression safe even if the auth
+            // guard is removed, without reaching bootstrap or creating a listener.
+            config.checkpoint.max_node_data_bytes = Some(0);
+
+            let result = run_server(config, PathBuf::from("unused.toml")).await;
+            let Err(error) = result else {
+                panic!("remote anonymous HTTP was admitted: {mode:?} {bind}");
+            };
+            let message = error.to_string();
+            assert!(message.contains("HTTP authentication"), "{message}");
+            assert!(
+                message.contains("non-loopback server.bind requires server.console_token"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("checkpoint.max_node_data_bytes"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_entry_revalidates_cli_admin_bind_after_file_loading() {
+    use clap::Parser as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("loopback.toml");
+    std::fs::write(&config_path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+    let mut config = load_config(&config_path).expect("anonymous loopback config must load");
+    let args = crate::Args::try_parse_from(["laminardb", "--admin-bind", "0.0.0.0:8080"]).unwrap();
+    config.server.bind = args.admin_bind.unwrap();
+    config.checkpoint.max_node_data_bytes = Some(0);
+
+    let result = run_server(config, config_path).await;
+    let Err(error) = result else {
+        panic!("CLI bind override bypassed authentication validation");
+    };
+    let message = error.to_string();
+    assert!(message.contains("HTTP authentication"), "{message}");
+    assert!(
+        message.contains("non-loopback server.bind requires server.console_token"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn server_entry_rejects_programmatic_diagnostic_auth_before_other_startup_work() {
     let mut config: ServerConfig = toml::from_str("").unwrap();
     config.server.diagnostic_read_token = Some(Secret::new("invalid"));

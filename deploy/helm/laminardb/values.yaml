@@ -78,7 +78,8 @@ laminardb:
       minVersion: "1.2"
 
   # -- Bearer token for the control-plane (console) HTTP API, read from an
-  # -- existing Secret. Empty existingSecret = unauthenticated API (dev only).
+  # -- existing Secret. Required for non-loopback HTTP binds, including the default.
+  # -- An empty value without a console token in configOverride fails server startup.
   consoleToken:
     existingSecret: ""
     secretKey: "token"

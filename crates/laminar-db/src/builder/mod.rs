@@ -422,7 +422,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Backpressure policy (default `Backpressure`).
+    /// Backpressure policy (default `Backpressure`). `ShedOldest` is `BestEffort` only.
     #[must_use]
     pub fn pipeline_backpressure_policy(
         mut self,
@@ -575,7 +575,7 @@ impl LaminarDbBuilder {
             ));
         }
 
-        Self::validate_backpressure(&self.config)?;
+        self.config.validate_backpressure_policy()?;
         self.validate_vnode_topology(runtime_mode)?;
         if let Some(key_groups) = self
             .key_groups
@@ -731,36 +731,6 @@ impl LaminarDbBuilder {
                     "cluster shuffle sender and receiver must be installed together".into(),
                 ));
             }
-        }
-        Ok(())
-    }
-
-    fn validate_backpressure(config: &LaminarConfig) -> Result<(), DbError> {
-        use crate::config::BackpressurePolicy;
-        use laminar_connectors::connector::DeliveryGuarantee;
-
-        let policy = config.pipeline_backpressure_policy;
-        if policy == BackpressurePolicy::Backpressure {
-            return Ok(());
-        }
-
-        let has_count_cap = config.pipeline_max_input_buf_batches.is_none_or(|c| c > 0);
-        let has_byte_cap = config.pipeline_max_input_buf_bytes.is_some_and(|b| b > 0);
-        if !has_count_cap && !has_byte_cap {
-            return Err(DbError::Config(format!(
-                "backpressure_policy={policy:?} requires at least one of \
-                 pipeline_max_input_buf_batches (>0) or pipeline_max_input_buf_bytes"
-            )));
-        }
-
-        if policy == BackpressurePolicy::ShedOldest
-            && config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-        {
-            return Err(DbError::Config(
-                "ShedOldest drops data; it is incompatible with exactly-once \
-                 delivery. Use Backpressure or Fail, or downgrade the guarantee."
-                    .into(),
-            ));
         }
         Ok(())
     }

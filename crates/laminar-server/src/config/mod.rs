@@ -187,7 +187,8 @@ pub struct ServerSection {
     /// Minimum TLS protocol version: `"1.2"` (default) or `"1.3"`.
     #[serde(default = "default_pgwire_tls_min_version")]
     pub pgwire_tls_min_version: String,
-    /// Bearer token gating the HTTP console API; `None` leaves it unauthenticated (loopback/dev only).
+    /// Bearer token gating the HTTP console API; required for every non-loopback bind.
+    /// `None` permits anonymous loopback development access.
     #[serde(default)]
     pub console_token: Option<Secret>,
     /// Read-only bearer token for cluster diagnostics; enables the split diagnostic boundary.

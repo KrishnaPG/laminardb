@@ -121,6 +121,190 @@ async fn test_shed_oldest_rejects_exactly_once() {
     assert!(err.to_string().contains("exactly-once"), "{err}");
 }
 
+fn delivery_policy_cases() -> [(
+    laminar_connectors::connector::DeliveryGuarantee,
+    crate::config::BackpressurePolicy,
+    bool,
+); 9] {
+    use crate::config::BackpressurePolicy::{Backpressure, Fail, ShedOldest};
+    use laminar_connectors::connector::DeliveryGuarantee::{AtLeastOnce, BestEffort, ExactlyOnce};
+
+    [
+        (BestEffort, Backpressure, true),
+        (BestEffort, ShedOldest, true),
+        (BestEffort, Fail, true),
+        (AtLeastOnce, Backpressure, true),
+        (AtLeastOnce, ShedOldest, false),
+        (AtLeastOnce, Fail, true),
+        (ExactlyOnce, Backpressure, true),
+        (ExactlyOnce, ShedOldest, false),
+        (ExactlyOnce, Fail, true),
+    ]
+}
+
+#[tokio::test]
+async fn backpressure_delivery_matrix_builder() {
+    for (guarantee, policy, accepted) in delivery_policy_cases() {
+        let result = LaminarDbBuilder::new()
+            .delivery_guarantee(guarantee)
+            .pipeline_backpressure_policy(policy)
+            .build()
+            .await;
+        assert_eq!(result.is_ok(), accepted, "{guarantee:?} / {policy:?}");
+        if let Err(error) = result {
+            assert!(matches!(&error, DbError::Config(_)), "{error}");
+            assert!(error.to_string().contains("BestEffort"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn backpressure_delivery_matrix_direct_config() {
+    for (guarantee, policy, accepted) in delivery_policy_cases() {
+        let result = LaminarDB::open_with_config(LaminarConfig {
+            delivery_guarantee: guarantee,
+            pipeline_backpressure_policy: policy,
+            ..LaminarConfig::default()
+        });
+        assert_eq!(result.is_ok(), accepted, "{guarantee:?} / {policy:?}");
+        if let Err(error) = result {
+            assert!(matches!(&error, DbError::Config(_)), "{error}");
+            assert!(error.to_string().contains("BestEffort"), "{error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn backpressure_cap_validation_matches_all_constructors() {
+    use crate::config::BackpressurePolicy;
+
+    let caps = [
+        (None, None, true),
+        (None, Some(0), true),
+        (Some(0), None, false),
+        (Some(0), Some(0), false),
+        (Some(1), Some(0), true),
+        (Some(0), Some(1), true),
+    ];
+    for policy in [
+        BackpressurePolicy::Backpressure,
+        BackpressurePolicy::ShedOldest,
+        BackpressurePolicy::Fail,
+    ] {
+        for (batches, bytes, has_effective_cap) in caps {
+            let accepted = policy == BackpressurePolicy::Backpressure || has_effective_cap;
+            let mut builder = LaminarDbBuilder::new().pipeline_backpressure_policy(policy);
+            if let Some(batches) = batches {
+                builder = builder.pipeline_max_input_buf_batches(batches);
+            }
+            if let Some(bytes) = bytes {
+                builder = builder.pipeline_max_input_buf_bytes(bytes);
+            }
+            let results = [
+                builder.build().await,
+                LaminarDB::open_with_config(LaminarConfig {
+                    pipeline_backpressure_policy: policy,
+                    pipeline_max_input_buf_batches: batches,
+                    pipeline_max_input_buf_bytes: bytes,
+                    ..LaminarConfig::default()
+                }),
+            ];
+            for (constructor, result) in ["builder", "direct"].into_iter().zip(results) {
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "{constructor}: {policy:?}, batches={batches:?}, bytes={bytes:?}"
+                );
+                if let Err(error) = result {
+                    assert!(matches!(&error, DbError::Config(_)), "{error}");
+                    assert!(
+                        error.to_string().contains("requires at least one"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn backpressure_invalid_delivery_never_invokes_connector_callback() {
+    use crate::config::BackpressurePolicy;
+    use laminar_connectors::connector::DeliveryGuarantee;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for guarantee in [
+        DeliveryGuarantee::AtLeastOnce,
+        DeliveryGuarantee::ExactlyOnce,
+    ] {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let callback_invoked = Arc::clone(&invoked);
+        let result = LaminarDbBuilder::new()
+            .delivery_guarantee(guarantee)
+            .pipeline_backpressure_policy(BackpressurePolicy::ShedOldest)
+            .register_connector(move |_| {
+                callback_invoked.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .build()
+            .await;
+
+        assert!(!invoked.load(Ordering::SeqCst), "{guarantee:?}");
+        let error = result.expect_err("durable shedding must fail before connector registration");
+        assert!(error.to_string().contains("BestEffort"), "{error}");
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn backpressure_cluster_durable_shedding_rejected_before_lease_binding() {
+    use crate::config::BackpressurePolicy;
+    use laminar_connectors::connector::DeliveryGuarantee;
+    use laminar_core::cluster::control::LeaseDeadline;
+
+    for guarantee in [
+        None,
+        Some(DeliveryGuarantee::AtLeastOnce),
+        Some(DeliveryGuarantee::ExactlyOnce),
+    ] {
+        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
+            1,
+            uuid::Uuid::from_u128(1),
+        ));
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                1,
+                "127.0.0.1:0".parse().unwrap(),
+                uuid::Uuid::from_u128(1),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut builder = LaminarDbBuilder::new()
+            .cluster_controller(test_cluster_controller())
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(Arc::clone(&receiver))
+            .pipeline_backpressure_policy(BackpressurePolicy::ShedOldest);
+        if let Some(guarantee) = guarantee {
+            builder = builder.delivery_guarantee(guarantee);
+        }
+
+        let error = builder
+            .build()
+            .await
+            .expect_err("inferred and explicit durable delivery must reject shedding");
+        assert!(error.to_string().contains("BestEffort"), "{error}");
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+        sender
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .expect("invalid delivery must leave the shuffle sender unbound");
+        receiver
+            .install_process_lease_deadline(deadline)
+            .expect("invalid delivery must leave the shuffle receiver unbound");
+    }
+}
+
 #[tokio::test]
 async fn local_replay_delivery_rejects_cloud_checkpoint_storage_at_build() {
     use laminar_connectors::connector::DeliveryGuarantee;

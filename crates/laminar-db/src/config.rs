@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
+use crate::error::DbError;
+
 /// Default pipeline-wide lower-bound charge allowed for managed operator working state.
 ///
 /// This execution budget is independent of checkpoint storage.
@@ -58,6 +60,7 @@ pub enum BackpressurePolicy {
     #[default]
     Backpressure,
     /// Drop oldest batches; counted in `shed_records_total`.
+    /// Available only with [`DeliveryGuarantee::BestEffort`].
     ShedOldest,
     /// Error out the cycle.
     Fail,
@@ -157,13 +160,74 @@ pub struct LaminarConfig {
     /// Event timestamps farther ahead of wall clock do not advance source watermarks.
     /// Zero disables the guard.
     pub event_time_max_future_skew: std::time::Duration,
-    /// Backpressure policy. See [`BackpressurePolicy`].
+    /// Backpressure policy. [`BackpressurePolicy::ShedOldest`] is `BestEffort` only.
     pub pipeline_backpressure_policy: BackpressurePolicy,
     /// Auto-restart policy applied when supervision is enabled.
     pub restart_policy: RestartPolicy,
     /// Isolate queries that share a source into independent failure domains.
     /// Default off; when off, shared-source queries fault and recover together.
     pub shared_source_isolation: bool,
+}
+
+impl LaminarConfig {
+    pub(crate) fn validate_and_normalize(&mut self) -> Result<(), DbError> {
+        self.source_idle_timeout = source_idle_timeout_ms(self.source_idle_timeout)
+            .map_err(|error| DbError::Config(error.to_string()))?
+            .map(std::time::Duration::from_millis);
+        let future_skew_ms = event_time_max_future_skew_ms(self.event_time_max_future_skew)
+            .map_err(|error| DbError::Config(error.to_string()))?;
+        self.event_time_max_future_skew =
+            std::time::Duration::from_millis(future_skew_ms.unsigned_abs());
+        let max_managed_state_bytes = self
+            .pipeline_max_managed_state_bytes
+            .unwrap_or(DEFAULT_MAX_MANAGED_STATE_BYTES);
+        if max_managed_state_bytes == 0 {
+            return Err(DbError::Config(
+                "pipeline_max_managed_state_bytes must be greater than zero".into(),
+            ));
+        }
+        self.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
+
+        if let Some(checkpoint) = self.checkpoint.as_mut() {
+            let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
+                laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
+            );
+            laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
+                max_node_data_bytes,
+            )
+            .map_err(|error| DbError::Config(format!("checkpoint.max_node_data_bytes: {error}")))?;
+            checkpoint.max_node_data_bytes = Some(max_node_data_bytes);
+        }
+
+        self.validate_backpressure_policy()
+    }
+
+    pub(crate) fn validate_backpressure_policy(&self) -> Result<(), DbError> {
+        let policy = self.pipeline_backpressure_policy;
+        if policy == BackpressurePolicy::Backpressure {
+            return Ok(());
+        }
+
+        let has_count_cap = self.pipeline_max_input_buf_batches.is_none_or(|c| c > 0);
+        let has_byte_cap = self.pipeline_max_input_buf_bytes.is_some_and(|b| b > 0);
+        if !has_count_cap && !has_byte_cap {
+            return Err(DbError::Config(format!(
+                "backpressure_policy={policy:?} requires at least one of \
+                 pipeline_max_input_buf_batches (>0) or pipeline_max_input_buf_bytes"
+            )));
+        }
+
+        if policy == BackpressurePolicy::ShedOldest
+            && self.delivery_guarantee != DeliveryGuarantee::BestEffort
+        {
+            return Err(DbError::Config(
+                "ShedOldest drops data and supports BestEffort only; at-least-once and \
+                 exactly-once delivery require Backpressure or Fail."
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for LaminarConfig {

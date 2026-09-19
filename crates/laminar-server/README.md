@@ -39,7 +39,9 @@ cargo install laminar-server
 laminardb --config laminardb.toml
 
 # Docker
-docker run -d -p 8080:8080 -v laminardb-data:/var/lib/laminardb \
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
+  -v laminardb-data:/var/lib/laminardb \
   ghcr.io/laminardb/laminardb-server:latest
 
 # Check health
@@ -50,10 +52,16 @@ curl http://localhost:8080/health
 
 See the [Configuration Reference](https://laminardb.io/docs/) for every field, or the example below:
 
+Set `LAMINAR_CONSOLE_TOKEN` before starting with this configuration. Non-loopback HTTP binds
+require a console token; loopback development can omit it. Use `Authorization: Bearer <token>`
+for protected routes. HTTP TLS terminates at a trusted proxy; pgwire and cluster TLS settings
+do not protect HTTP. Restrict network access to the public health and metrics endpoints.
+
 ```toml
 [server]
 mode = "single"             # "single" (standalone) or "cluster" (multi-node)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,

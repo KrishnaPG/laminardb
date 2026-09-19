@@ -31,6 +31,12 @@ fn collect_http_auth_errors(config: &ServerConfig, errors: &mut Vec<String>) {
         }
     };
 
+    if bind.is_some_and(|bind| !bind.ip().is_loopback()) && config.server.console_token.is_none() {
+        errors.push(
+            "non-loopback server.bind requires server.console_token to be configured".to_string(),
+        );
+    }
+
     let Some(diagnostic_token) = &config.server.diagnostic_read_token else {
         if let Some(console_token) = &config.server.console_token {
             if console_token.len() < MIN_CONSOLE_TOKEN_LEN {

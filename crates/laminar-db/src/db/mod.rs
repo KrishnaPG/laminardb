@@ -1681,7 +1681,7 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if `DataFusion` context creation fails.
+    /// Returns `DbError` if the configuration is invalid or `DataFusion` context creation fails.
     pub fn open_with_config(config: LaminarConfig) -> Result<Arc<Self>, DbError> {
         let db = Self::open_with_config_and_vars(config, HashMap::new())?;
         db.connector_registry.freeze();
@@ -1692,7 +1692,7 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if `DataFusion` context creation fails.
+    /// Returns `DbError` if the configuration is invalid or `DataFusion` context creation fails.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn open_with_config_and_vars(
         config: LaminarConfig,
@@ -1720,34 +1720,7 @@ impl LaminarDB {
         target_partitions: Option<usize>,
         runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
-        config.source_idle_timeout =
-            crate::config::source_idle_timeout_ms(config.source_idle_timeout)
-                .map_err(|error| DbError::Config(error.to_string()))?
-                .map(Duration::from_millis);
-        let future_skew_ms =
-            crate::config::event_time_max_future_skew_ms(config.event_time_max_future_skew)
-                .map_err(|error| DbError::Config(error.to_string()))?;
-        config.event_time_max_future_skew = Duration::from_millis(future_skew_ms.unsigned_abs());
-        let max_managed_state_bytes = config
-            .pipeline_max_managed_state_bytes
-            .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
-        if max_managed_state_bytes == 0 {
-            return Err(DbError::Config(
-                "pipeline_max_managed_state_bytes must be greater than zero".into(),
-            ));
-        }
-        config.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
-
-        if let Some(checkpoint) = config.checkpoint.as_mut() {
-            let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
-                laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
-            );
-            laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
-                max_node_data_bytes,
-            )
-            .map_err(|error| DbError::Config(format!("checkpoint.max_node_data_bytes: {error}")))?;
-            checkpoint.max_node_data_bytes = Some(max_node_data_bytes);
-        }
+        config.validate_and_normalize()?;
 
         // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();

@@ -84,6 +84,18 @@ classify = "finbert"
 complete = "haiku"
 "#;
 
+#[test]
+fn shipped_cluster_example_authenticates_remote_http() {
+    let input = include_str!("../../../../examples/laminardb-cluster.toml")
+        .replace("${LAMINAR_CONSOLE_TOKEN}", "example-console-token");
+    let config: ServerConfig = toml::from_str(&input).unwrap();
+    assert_eq!(
+        config.server.console_token.as_ref().unwrap().expose(),
+        "example-console-token"
+    );
+    validate_http_auth(&config).expect("cluster example must configure remote HTTP authentication");
+}
+
 fn canonical_http_auth_secret(byte: u8) -> Secret {
     Secret::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]))
 }
@@ -419,6 +431,7 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "cluster-console-token"
 delivery = "at_least_once"
 key_groups = 256
 
@@ -782,6 +795,7 @@ node_id = "node-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "cluster-console-token"
 delivery = "at_least_once"
 
 [checkpoint]
@@ -826,6 +840,7 @@ seeds = ["127.0.0.1:7946"]
         std::fs::write(path, b"test material").unwrap();
     }
     config.server.bind = "0.0.0.0:8080".into();
+    config.server.console_token = Some(Secret::new("cluster-console-token"));
     let discovery = config.discovery.as_mut().unwrap();
     discovery.seeds = vec!["10.0.0.2:7946".into()];
     discovery.cluster_tls_cert = Some(cert);
@@ -1007,6 +1022,91 @@ alice = "short"
 }
 
 #[test]
+fn http_auth_requires_console_token_on_non_loopback_addresses() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        for bind in [
+            "0.0.0.0:8080",
+            "192.0.2.1:8080",
+            "[::]:8080",
+            "[2001:db8::1]:8080",
+            "[fe80::1%3]:8080",
+            "[::ffff:0.0.0.0]:8080",
+            "[::ffff:192.0.2.1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.bind = bind.into();
+            let errors = http_auth_errors(&config);
+            assert!(
+                errors.iter().any(|error| error
+                    .contains("non-loopback server.bind requires server.console_token")),
+                "{mode:?} {bind}: {errors:?}"
+            );
+
+            config.server.console_token = Some(Secret::new("existing-console-token"));
+            validate_http_auth(&config).unwrap_or_else(|error| {
+                panic!("console credentials must permit {mode:?} {bind}: {error}")
+            });
+            config.server.console_token = Some(Secret::new("short"));
+            assert!(http_auth_errors(&config)
+                .iter()
+                .any(|error| error.contains("at least 8 characters")));
+        }
+    }
+}
+
+#[test]
+fn http_auth_allows_anonymous_loopback_addresses() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        for bind in ["127.0.0.1:8080", "127.42.0.1:8080", "[::1]:8080"] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.bind = bind.into();
+            validate_http_auth(&config)
+                .unwrap_or_else(|error| panic!("loopback {mode:?} {bind}: {error}"));
+        }
+    }
+}
+
+#[test]
+fn file_loader_requires_remote_http_console_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("remote-http-auth.toml");
+    for mode in ["single", "cluster"] {
+        let valid = format!(
+            r#"node_id = "node-1"
+
+[server]
+mode = "{mode}"
+bind = "[::]:8080"
+console_token = "existing-console-token"
+delivery = "at_least_once"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+"#
+        );
+        let anonymous = valid.replace("console_token = \"existing-console-token\"\n", "");
+        std::fs::write(&path, anonymous).unwrap();
+        let error = load_config(&path).expect_err("remote anonymous HTTP must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("non-loopback server.bind requires server.console_token"),
+            "{mode}: {error}"
+        );
+
+        std::fs::write(&path, valid).unwrap();
+        load_config(&path).expect("remote HTTP with existing console credentials must pass");
+    }
+}
+
+#[test]
 fn test_validate_short_console_token() {
     let toml = r#"
 [server]
@@ -1153,13 +1253,14 @@ fn diagnostic_token_requires_loopback_http_bind() {
         canonical_http_auth_secret(9),
         Some(canonical_http_auth_secret(10)),
     );
-    config.server.bind = "0.0.0.0:8080".to_string();
-    let errors = http_auth_errors(&config);
-
-    assert!(
-        errors.iter().any(|error| error.contains("loopback")),
-        "errors: {errors:?}"
-    );
+    for bind in ["0.0.0.0:8080", "[::]:8080", "[::ffff:127.0.0.1]:8080"] {
+        config.server.bind = bind.into();
+        let errors = http_auth_errors(&config);
+        assert!(
+            errors.iter().any(|error| error.contains("loopback")),
+            "{bind}: {errors:?}"
+        );
+    }
 }
 
 #[test]
