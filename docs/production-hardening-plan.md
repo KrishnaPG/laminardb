@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e and S5 verified locally; S4 dependency findings still block CI/release; B0 diagnostic timings/profiles recorded; S6 starts with measured cached-plan retention; S6–S13 not implemented.
+**Status:** S1–S3, S4a–S4e, S5 and S6a verified locally; S4 dependency findings still block CI/release; S6a has an explained sort-latency cost; shared reservation limits and S7–S13 remain unimplemented.
 **Date:** 2026-09-20. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -132,19 +132,12 @@ its authority/lifecycle meaning. No network polling or per-row metric allocation
 
 ### S6 — bound participating DataFusion working memory (G2)
 
+**Progress (2026-09-20):** cached-plan reuse is repaired and verified; see S6a below for the measured
+sort cost. The shared reservation pool and compute no-spill configuration are next.
+
 **Owns:** cached physical-plan reuse, configuration and DataFusion runtime/context creation.
 **Modes:** all DB modes. **Risk:** medium; execution-state reuse, query failures and spilling behavior
 change. **Depends on:** S2 and B0.
-
-Implement two bounded changes in order. **First, repair cached-plan execution-state retention:**
-B0's 2026-09-20 allocation profiles show metrics accumulating across repeated executions of the
-same physical plan. Cover all cached physical-plan execution call sites, successful execution,
-error/cancel and the next batch, including changing values across sorted batches. Preserve live
-source bindings and independent expected query results. Evaluate DataFusion's existing
-`reset_plan_states` API and its dynamic-filter/recursive-plan limitations before choosing the
-smallest supported repair. Do not introduce a custom plan-cache
-framework or disable metrics to hide growth. This touches the record path: refresh B0 and compare
-latency and retained allocations before landing. **Then, bound participating reservations** as below.
 
 Reuse DataFusion 53.1's bounded pool and runtime APIs. Establish the budget scope explicitly and
 share the intended per-DB pool with both the main context and the separately built connector
@@ -882,3 +875,59 @@ the lossy first chain capture despite its zero exit status. Formatting, readabil
 dependency, local-link and whitespace checks passed. This follow-up changes documentation only;
 prior workspace test/Clippy
 results are historical, and no new full-workspace regression run is claimed.
+
+### S6a — release cached execution state between batches (2026-09-20)
+
+Implemented for all DB modes. Cached plans remain unexecuted templates; each collection uses
+DataFusion's [`reset_plan_states`](https://github.com/apache/datafusion/blob/53.1.0/datafusion/physical-plan/src/execution_plan.rs)
+to give metrics and join build state one execution lifetime, including errors and cancellation.
+Live source slots stay shared. All SQL, aggregate/window pre-projection and post-projection cache
+paths use the same execution helper. No dependency, public setting or cache framework was added.
+
+Preparation disables dynamic-filter pushdown only in its planning-state copy and rejects recursive
+plans after view expansion. Direct file scans are also rejected because DataFusion 53.1's
+[`DataSourceExec`](https://github.com/apache/datafusion/blob/53.1.0/datafusion/datasource/src/source.rs)
+returns the same leaf on reset, retaining file-source metrics. Connector I/O supplies live Arrow
+batches to streaming plans; ordinary one-shot DataFusion queries keep their existing behavior.
+
+**Correctness:** nine new regressions cover changing ascending/descending Top-K inputs, live join
+inputs, running aggregates, window closure, compiled fallback after an error, repeated query errors,
+cancellation and subsequent execution, and recursive/file-plan rejection without changing ad-hoc
+queries. The workspace library suite with cluster features passed **5,684 tests, 0 failures,
+1 ignored** (the existing external ONNX-model test). Both required Clippy configurations, nightly
+formatting, readability (19 module / 195 function exceptions), analytical dependency and whitespace
+checks passed. The diff review found no new unused code, unnecessary abstraction or unrelated cleanup.
+
+**Performance:** refreshed the existing Linux baseline before editing and preserved both binaries.
+Same WSL host, Rust 1.95.0, bench profile, five workloads and 100-sample protocol as B0; builds were
+finished before measurements. Initial Criterion means:
+
+| Workload | Before | After | Change |
+|---|---:|---:|---:|
+| Window assignment | 4.872 ns | 5.107 ns | +4.83% |
+| Plain select | 131.49 µs | 137.69 µs | +4.72% |
+| Four-group aggregate | 142.97 µs | 150.00 µs | +4.91% |
+| Sort / top 10 | 143.37 µs | 175.83 µs | +22.64% |
+| Three-query chain | 157.17 µs | 163.24 µs | +3.87% |
+
+The sort result exceeds the 5% gate and is retained as an **explained correctness cost**, not a
+sub-5% performance claim. Two matched repeats, with reversed run order, measured sort changes of
+**+4.23%** (167.59 → 174.69 µs) and **+15.29%** (153.48 → 176.95 µs). The unchanged select control
+varied −4.07% / +4.92%; even the identical core binary varied +4.83% in the initial comparison.
+CPU profiles attribute 28.81% of post-fix samples to Top-K heap maintenance. An independent probe
+confirmed that the old cached plan returned `[1000, 900]` for one batch, then incorrectly returned
+no rows for `[100, 90, 80]`; resetting returned `[100, 90]`. The old retained cutoff skipped valid
+sorting work. Keeping that shortcut would preserve incorrect results. This does not establish a
+production latency budget; target-workload qualification remains S12.
+
+Heaptrack peaks changed from **16.74 MB → 1.66 MB** for sort and **40.49 MB → 1.73 MB** for the
+five-second chain profile. The longer chain profile changed from **143.27 MB → 1.73 MB**; sampled
+live heap stayed near 1.49–1.71 MB after warmup and returned to 134 KB at teardown. Participating
+reservation limits and whole-process memory bounds are still separate work. Both 99 Hz CPU captures
+had zero lost samples; process IPC ranged 0.47–1.33 on WSL, below the 2.0 kernel guideline.
+
+Evidence is in `target/s6-cache/`: commands, test/Clippy logs, Criterion samples and confidence
+intervals, CPU/heap traces, the isolated Top-K probe, source hashes and `summary.json`. The final
+SQL benchmark SHA-256 is `65a2b170a048949b7553d20715f9cfbf625292adf0d35fe09acda6a56291fd19`;
+the core binary is unchanged from B0. Starting HEAD was `23666ebf`. Native binaries and profiles
+remain under `/home/sujit/.cache/laminardb-b0-9bb1e996/s6-cache` for the next bounded change.

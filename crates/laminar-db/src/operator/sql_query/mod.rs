@@ -1052,10 +1052,7 @@ impl SqlQueryOperator {
                 self.state = QueryState::Compiled(proj);
                 return Ok(());
             }
-            let physical = self
-                .ctx
-                .state()
-                .create_physical_plan(&plan)
+            let physical = super::create_cached_physical_plan(&self.ctx, &plan)
                 .await
                 .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
             if weighted_projection {
@@ -1064,10 +1061,7 @@ impl SqlQueryOperator {
             self.log_execution_path(false);
             self.state = QueryState::CachedPlan(physical);
         } else {
-            let physical = self
-                .ctx
-                .state()
-                .create_physical_plan(&plan)
+            let physical = super::create_cached_physical_plan(&self.ctx, &plan)
                 .await
                 .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
             self.log_execution_path(false);
@@ -1141,10 +1135,7 @@ impl SqlQueryOperator {
             .await
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
         let plan = df.logical_plan().clone();
-        let physical = self
-            .ctx
-            .state()
-            .create_physical_plan(&plan)
+        let physical = super::create_cached_physical_plan(&self.ctx, &plan)
             .await
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
         self.state = QueryState::CachedPlan(physical);
@@ -1157,9 +1148,7 @@ impl SqlQueryOperator {
                 "internal: execute_cached_plan called on non-CachedPlan state".into(),
             ));
         };
-        datafusion::physical_plan::collect(plan.clone(), self.task_ctx.clone())
-            .await
-            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
+        super::execute_cached_physical(self.task_ctx.clone(), &self.op_name, plan).await
     }
 
     async fn pre_aggregate(&mut self, inputs: &[RecordBatch]) -> Result<Vec<RecordBatch>, DbError> {
@@ -4029,5 +4018,7 @@ impl GraphOperator for SqlQueryOperator {
     }
 }
 
+#[cfg(test)]
+mod cached_plan_tests;
 #[cfg(test)]
 mod checkpoint_tests;
