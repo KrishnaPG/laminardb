@@ -265,6 +265,95 @@ fn bench_query_chain(c: &mut Criterion) {
     group.finish();
 }
 
+/// Exercise source handoff in bursts, including variable-width storage and a shared
+/// channel with four producers. Time admission through complete output consumption.
+fn bench_source_queue(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("source_queue");
+    for (label, width, source_count) in [
+        ("narrow_burst", 16, 1),
+        ("wide_burst", 4096, 1),
+        ("four_sources", 256, 4),
+    ] {
+        let payload = "x".repeat(width);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![payload.as_str(); 256]))],
+        )
+        .unwrap();
+        // Retain a complete wide burst even when tracing delays the output reader.
+        let retention = if width == 4096 {
+            " WITH ('retain_history' = '128mb')"
+        } else {
+            ""
+        };
+        group.throughput(criterion::Throughput::Elements(256 * 64 * source_count));
+        group.bench_function(label, |b| {
+            let db = rt.block_on(async {
+                let db = LaminarDB::builder().build().await.unwrap();
+                for index in 0..source_count {
+                    db.execute(&format!("CREATE SOURCE input_{index} (payload VARCHAR)"))
+                        .await
+                        .unwrap();
+                    db.execute(&format!(
+                        "CREATE STREAM output_{index} AS SELECT payload FROM input_{index}{retention}"
+                    ))
+                    .await
+                    .unwrap();
+                }
+                db.start().await.unwrap();
+                db
+            });
+            let sources: Vec<_> = (0..source_count)
+                .map(|index| db.source_untyped(&format!("input_{index}")).unwrap())
+                .collect();
+            let mut subscriptions: Vec<_> = (0..source_count)
+                .map(|index| {
+                    rt.block_on(db.subscribe::<RowCount>(&format!("output_{index}")))
+                        .unwrap()
+                })
+                .collect();
+            let mut burst = || {
+                for _ in 0..64 {
+                    for source in &sources {
+                        source.push_arrow(batch.clone()).unwrap();
+                    }
+                }
+                rt.block_on(async {
+                    for subscription in &mut subscriptions {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let mut received = 0;
+                            while received < 256 * 64 {
+                                match subscription.next_frame().await.unwrap().unwrap() {
+                                    laminar_db::TypedSubscriptionFrame::Rows { rows, .. } => {
+                                        received += rows.iter().map(|count| count.0).sum::<usize>();
+                                    }
+                                    laminar_db::TypedSubscriptionFrame::Barrier { .. } => {}
+                                }
+                            }
+                            assert_eq!(received, 256 * 64);
+                        })
+                        .await
+                        .expect("source queue burst did not drain");
+                    }
+                });
+            };
+            burst();
+            b.iter(&mut burst);
+            rt.block_on(db.shutdown()).unwrap();
+        });
+    }
+    group.finish();
+}
+
 /// Subscribe, push, then poll until one emit lands. Subscribe-before-push so the
 /// emit isn't missed; `poll` is non-blocking so no tokio context is needed (the
 /// pipeline runs on the runtime workers started by `db.start()`).
@@ -342,5 +431,6 @@ criterion_group!(
     bench_agg_high_cardinality,
     bench_sort_limit,
     bench_query_chain,
+    bench_source_queue,
 );
 criterion_main!(benches);

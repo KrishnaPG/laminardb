@@ -62,6 +62,28 @@ lambda evaluation context retain upstream defaults and do not join a DB's pool. 
 is an execution policy, not a qualified production memory envelope; size it for the workload
 and leave headroom for allocations outside DataFusion reservations.
 
+## Connector source queue limit
+
+The connector-to-coordinator FIFO has a shared **64 MiB** Arrow-byte limit in all modes,
+in addition to its default 64-message capacity. Set `LaminarConfig::source_queue_max_bytes`
+or `LaminarDB::builder().source_queue_max_bytes(bytes)` to change it. Direct coordinator
+users set `PipelineConfig::source_queue_max_bytes`. Zero and values above
+`MAX_SOURCE_QUEUE_BYTES` are rejected before connector startup.
+
+Admission charges retained Arrow array capacity and batch/column descriptors, including
+backing buffers of slices, nested arrays and views. Shared buffers are charged independently
+for each queued batch/column. A message retains its charge while parked by an intake fence;
+staging or discard releases it. A single oversized batch faults the source without settling
+its cursor. Full queues backpressure producers; shutdown-tail sends use the same byte limit.
+Barriers share the ordered FIFO but do not consume data-byte capacity.
+
+Each source may additionally hold one validated batch while waiting for capacity or a cursor,
+up to the queue limit per source. Connector decoding happens before this validation and has
+its own memory ownership. Schemas/cursor metadata, embedded push rings, staged cycles, graph
+ports, replay buffers, sinks and checkpoints are outside this queue budget. Dequeue/staging
+does not prove that the Arrow buffers have been freed. Size these owners separately; this
+limit does not establish a whole-process RSS envelope.
+
 ## Feature Flags
 
 | Flag | Purpose |

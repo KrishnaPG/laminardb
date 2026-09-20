@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use crossfire::{mpsc, AsyncRx, MAsyncTx};
+use crossfire::{mpsc, AsyncRx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 #[cfg(test)]
 use laminar_connectors::checkpoint::SourceCheckpointDelta;
@@ -49,8 +49,7 @@ use crate::catalog::{schema_has_reserved_mutation_columns, validate_source_batch
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
-type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
-type SourceMsgTx = MAsyncTx<mpsc::Array<SourceMsg>>;
+use source_channel::{QueuedSourceMsg, SourceMsgRx, SourceMsgTx};
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 type ForceCheckpointRequest = crate::db::ForceCheckpointRequest;
 
@@ -70,6 +69,7 @@ mod execution;
 mod intake_backpressure;
 mod shutdown;
 mod source_actor;
+mod source_channel;
 mod source_drain;
 mod source_lifecycle;
 mod source_runtime;
@@ -386,7 +386,7 @@ pub struct StreamingCoordinator {
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// At most one FIFO message removed just as the external intake gate closes. Exact source
     /// barrier holds make post-barrier data impossible; this slot exists only for that gate race.
-    parked_source_msg: Option<SourceMsg>,
+    parked_source_msg: Option<QueuedSourceMsg>,
     pending_watermark_batches: Vec<PendingWatermarkBatch>,
     /// Sources that delivered a barrier this drain cycle. A later batch from one of these sources
     /// violates the source hold protocol and faults the pipeline.
@@ -448,7 +448,7 @@ impl CoordinatorRunState {
 
 #[derive(Default)]
 struct CoordinatorWake {
-    message: Option<SourceMsg>,
+    message: Option<QueuedSourceMsg>,
     retrying_replay: bool,
     checkpoint_control_due: bool,
     gates: CoordinatorGates,

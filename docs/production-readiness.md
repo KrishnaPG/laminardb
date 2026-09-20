@@ -12,6 +12,9 @@ S6a now releases cached execution state and corrects stale Top-K cutoffs. Correc
 sort latency has a documented 4–23% cost across diagnostic comparisons. S6b now shares bounded
 DataFusion reservations across DB contexts and disables their disk spilling. Correctness gates
 and matched local performance checks pass. This does not close G2's wider memory scope.
+S7 now bounds connector queue bytes through parking, with a configurable 64 MiB default;
+correctness gates and matched local performance checks pass. Embedded push rings,
+staged/graph retention and the remaining G2/G3 memory owners still require their planned work.
 Findings below describe the reviewed baseline. See the execution plan for validation and remaining work.
 
 LaminarDB already has a substantial streaming execution, checkpoint, fencing, recovery, and

@@ -95,7 +95,7 @@ fn prepare_cluster_bootstrap(
 ) -> Result<PreparedClusterBootstrap, ClusterStartupError> {
     config
         .server
-        .validate_datafusion_memory_limit()
+        .validate_memory_limits()
         .map_err(|error| ClusterStartupError::EngineConstruction(format!("server.{error}")))?;
     let temporal_join_idle_history_retention = config
         .server

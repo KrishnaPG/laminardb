@@ -18,6 +18,28 @@ pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
 /// This does not limit direct Arrow allocations or process RSS.
 pub const DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default shared connector-to-coordinator Arrow-byte budget (64 MiB).
+pub const DEFAULT_SOURCE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest source queue budget supported by byte-sized semaphore reservations.
+pub const MAX_SOURCE_QUEUE_BYTES: usize = if tokio::sync::Semaphore::MAX_PERMITS < u32::MAX as usize
+{
+    tokio::sync::Semaphore::MAX_PERMITS
+} else {
+    u32::MAX as usize
+};
+
+/// Validates the shared source queue byte budget before connector I/O.
+///
+/// # Errors
+/// Returns an error for zero or values above [`MAX_SOURCE_QUEUE_BYTES`].
+pub fn validate_source_queue_max_bytes(bytes: usize) -> Result<(), &'static str> {
+    if bytes == 0 || bytes > MAX_SOURCE_QUEUE_BYTES {
+        return Err("source_queue_max_bytes must be nonzero and at most MAX_SOURCE_QUEUE_BYTES");
+    }
+    Ok(())
+}
+
 pub(crate) fn event_time_max_future_skew_ms(
     skew: std::time::Duration,
 ) -> Result<i64, &'static str> {
@@ -147,6 +169,10 @@ pub struct LaminarConfig {
     pub delivery_guarantee: DeliveryGuarantee,
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
+    /// Shared connector FIFO Arrow-byte budget, including parked messages (default 64 MiB).
+    /// Also caps each source's one batch waiting for capacity or a cursor. Does not cover
+    /// connector decode scratch, embedded push rings, staged cycles, graph buffers or RSS.
+    pub source_queue_max_bytes: usize,
     /// Micro-batch coalescing window. `None` = 5ms connectors / 0 embedded.
     pub pipeline_batch_window: Option<std::time::Duration>,
     /// Drain budget per cycle (ns). `None` = 1ms.
@@ -185,6 +211,8 @@ impl LaminarConfig {
                 "datafusion_memory_limit_bytes must be greater than zero".into(),
             ));
         }
+        validate_source_queue_max_bytes(self.source_queue_max_bytes)
+            .map_err(|error| DbError::Config(error.into()))?;
         self.source_idle_timeout = source_idle_timeout_ms(self.source_idle_timeout)
             .map_err(|error| DbError::Config(error.to_string()))?
             .map(std::time::Duration::from_millis);
@@ -258,6 +286,7 @@ impl Default for LaminarConfig {
             http_auth_token: None,
             delivery_guarantee: DeliveryGuarantee::default(),
             pipeline_channel_capacity: None,
+            source_queue_max_bytes: DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,
             pipeline_query_budget_ns: None,
@@ -272,6 +301,42 @@ impl Default for LaminarConfig {
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),
             shared_source_isolation: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn source_queue_limits_are_validated_at_db_entry() {
+        assert_eq!(
+            LaminarConfig::default().source_queue_max_bytes,
+            64 * 1024 * 1024
+        );
+        for bytes in [0, MAX_SOURCE_QUEUE_BYTES + 1] {
+            let error = crate::LaminarDB::open_with_config(LaminarConfig {
+                source_queue_max_bytes: bytes,
+                ..Default::default()
+            })
+            .err()
+            .unwrap();
+            assert!(
+                matches!(error, DbError::Config(ref message) if message.contains("source_queue_max_bytes"))
+            );
+            let error = crate::LaminarDB::builder()
+                .source_queue_max_bytes(bytes)
+                .build()
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(error, DbError::Config(ref message) if message.contains("source_queue_max_bytes"))
+            );
+        }
+        for bytes in [1, MAX_SOURCE_QUEUE_BYTES] {
+            assert!(validate_source_queue_max_bytes(bytes).is_ok());
         }
     }
 }

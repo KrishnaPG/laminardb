@@ -151,6 +151,9 @@ pub struct ServerSection {
     /// DB-owned contexts disable disk spilling. Must be greater than zero.
     #[serde(default = "default_datafusion_memory_limit_bytes")]
     pub datafusion_memory_limit_bytes: usize,
+    /// Shared connector FIFO Arrow-byte limit per DB/node, including parked input.
+    #[serde(default = "default_source_queue_max_bytes")]
+    pub source_queue_max_bytes: usize,
     /// Right-side history retained while a temporal join input is idle.
     #[serde(default, with = "humantime_serde")]
     pub temporal_join_idle_history_retention: Option<Duration>,
@@ -224,6 +227,7 @@ impl Default for ServerSection {
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
             datafusion_memory_limit_bytes: default_datafusion_memory_limit_bytes(),
+            source_queue_max_bytes: default_source_queue_max_bytes(),
             temporal_join_idle_history_retention: None,
             source_idle_timeout: None,
             event_time_max_future_skew: default_event_time_max_future_skew(),
@@ -244,11 +248,11 @@ impl Default for ServerSection {
 }
 
 impl ServerSection {
-    pub(crate) fn validate_datafusion_memory_limit(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate_memory_limits(&self) -> Result<(), &'static str> {
         if self.datafusion_memory_limit_bytes == 0 {
             return Err("datafusion_memory_limit_bytes must be greater than zero");
         }
-        Ok(())
+        laminar_db::validate_source_queue_max_bytes(self.source_queue_max_bytes)
     }
 
     /// Configured key-group topology, or the common deployment default.
@@ -300,6 +304,10 @@ fn default_event_time_max_future_skew() -> Duration {
 
 fn default_datafusion_memory_limit_bytes() -> usize {
     laminar_db::DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES
+}
+
+fn default_source_queue_max_bytes() -> usize {
+    laminar_db::DEFAULT_SOURCE_QUEUE_MAX_BYTES
 }
 
 /// `[supervision]` — auto-restart policy; unset fields fall back to engine defaults.

@@ -344,7 +344,7 @@ fn collect_delivery_errors(config: &ServerConfig, errors: &mut Vec<String>) {
 }
 
 fn collect_runtime_limit_errors(config: &ServerConfig, errors: &mut Vec<String>) {
-    if let Err(error) = config.server.validate_datafusion_memory_limit() {
+    if let Err(error) = config.server.validate_memory_limits() {
         errors.push(format!("server.{error}"));
     }
     // WHY: zero pauses barrier admission permanently and wedges checkpointing.

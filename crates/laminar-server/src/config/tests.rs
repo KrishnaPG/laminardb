@@ -1699,3 +1699,24 @@ fn datafusion_memory_limit_default_override_and_zero_validation() {
         .to_string()
         .contains("datafusion_memory_limit_bytes"));
 }
+
+#[test]
+fn source_queue_limit_default_override_and_invalid_validation() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(
+        default.server.source_queue_max_bytes,
+        laminar_db::DEFAULT_SOURCE_QUEUE_MAX_BYTES
+    );
+    let configured: ServerConfig =
+        toml::from_str("[server]\nsource_queue_max_bytes = 65536").unwrap();
+    assert_eq!(configured.server.source_queue_max_bytes, 65536);
+    validate_config(&configured).unwrap();
+    for bytes in [0, laminar_db::MAX_SOURCE_QUEUE_BYTES + 1] {
+        let invalid: ServerConfig =
+            toml::from_str(&format!("[server]\nsource_queue_max_bytes = {bytes}")).unwrap();
+        assert!(validate_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("source_queue_max_bytes"));
+    }
+}

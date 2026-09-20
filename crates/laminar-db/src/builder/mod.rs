@@ -356,6 +356,15 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Shared connector FIFO Arrow-byte budget (default 64 MiB), including parked messages.
+    /// Also caps each producer's waiting batch; excludes decoder scratch and downstream buffers.
+    /// Zero and values above [`crate::MAX_SOURCE_QUEUE_BYTES`] are rejected at build time.
+    #[must_use]
+    pub fn source_queue_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.source_queue_max_bytes = bytes;
+        self
+    }
+
     /// Micro-batch coalescing window (default 5ms for connectors, 0 for embedded).
     #[must_use]
     pub fn pipeline_batch_window(mut self, window: std::time::Duration) -> Self {

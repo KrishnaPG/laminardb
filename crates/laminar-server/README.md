@@ -64,6 +64,7 @@ bind = "0.0.0.0:8080"       # HTTP API bind address
 console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
 datafusion_memory_limit_bytes = 268435456 # shared per DB/node; 256 MiB default, must be > 0
+source_queue_max_bytes = 67108864 # shared connector FIFO per DB/node; 64 MiB default
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -302,6 +303,11 @@ Changes to `[server]` and `[checkpoint]` require a restart. Disable the file wat
 server modes and requires a restart to change. DB-owned contexts share the limit and disable
 disk spilling. It does not cap process RSS, queues, managed state or connector I/O allocations;
 see the [memory scope](../laminar-db/README.md#datafusion-memory-limit).
+
+`server.source_queue_max_bytes` bounds queued connector Arrow storage in both server modes
+and requires a restart to change. It also caps each individual source batch; oversized input
+faults before its cursor is settled. See the [queue ownership scope](../laminar-db/README.md#connector-source-queue-limit)
+for producer scratch, parked messages and downstream retention.
 
 ## Tuning the Allocator (`MALLOC_CONF`)
 

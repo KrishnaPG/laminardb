@@ -153,8 +153,9 @@ pub use checkpoint_coordinator::{
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
 };
 pub use config::{
-    BackpressurePolicy, LaminarConfig, RestartPolicy, DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES,
-    DEFAULT_MAX_MANAGED_STATE_BYTES,
+    validate_source_queue_max_bytes, BackpressurePolicy, LaminarConfig, RestartPolicy,
+    DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES, DEFAULT_MAX_MANAGED_STATE_BYTES,
+    DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
 };
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;

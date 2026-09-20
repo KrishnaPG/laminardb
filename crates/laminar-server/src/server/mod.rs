@@ -179,7 +179,7 @@ fn validate_server_startup(config: &ServerConfig) -> Result<(), ServerError> {
         .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
     config
         .server
-        .validate_datafusion_memory_limit()
+        .validate_memory_limits()
         .map_err(|error| ServerError::Build(format!("server.{error}")))?;
     config
         .server
@@ -237,6 +237,7 @@ pub async fn run_server(
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
     builder = builder.datafusion_memory_limit_bytes(config.server.datafusion_memory_limit_bytes);
+    builder = builder.source_queue_max_bytes(config.server.source_queue_max_bytes);
     if let Some(retention) = config.server.temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);
     }

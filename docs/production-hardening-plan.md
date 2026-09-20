@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e, S5 and S6 verified locally; S4 dependency findings still block CI/release; S6a has an explained sort-latency cost; S6b shared reservation limits pass the local gates; S7–S13 remain unimplemented.
+**Status:** S1–S3, S4a–S4e and S5–S7 verified locally; S4 dependency findings still block CI/release; S6a has an explained sort-latency cost; S6b shared reservation limits and S7 source queue bounds pass the local gates; S8–S13 remain unimplemented.
 **Date:** 2026-09-20. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -158,6 +158,9 @@ source progress/recovery. Test concurrent contexts against the shared budget and
 reuse after failure. Baseline and rerun representative DataFusion/coordinator workloads.
 
 ### S7 — bound connector-to-coordinator queued bytes (G2)
+
+**Progress (2026-09-20):** implemented and verified locally. See the dated S7 record below for
+the ownership contract, correctness gates, corrected burst fixtures and matched performance evidence.
 
 **Owns:** `SourceMsg` admission and source-task handoff, including shutdown-tail sends.
 **Modes:** all connector pipelines. **Risk:** high correctness/performance. **Depends on:** S6 + fresh B0.
@@ -366,7 +369,8 @@ A passing PR closes its scoped gap only; production readiness requires the corre
 evidence. S1–S3, S4a–S4e and S5 are **implemented and verified locally**. S4 is **partially
 implemented**; the enforced scans still fail on unresolved dependency findings. B0 now has local
 diagnostic timings and CPU/allocation profiles. S6a repairs cached-plan retention; S6b reservation
-limits are **implemented and verified locally**. S7–S13 remain **not implemented**. Production
+limits and S7 source queue byte bounds are **implemented and verified locally**. S8–S13 remain
+**not implemented**. Production
 qualification is open.
 
 ## Implementation progress
@@ -796,7 +800,7 @@ The memory ownership contract for the later serial work is deliberately limited 
 
 | Domain | Admission, ownership and release | Current bound / transient gap |
 |---|---|---|
-| Connector queue | Source actor transfers a batch through `SourceMsg`; dequeue transfers ownership to the coordinator, not necessarily to free memory. | Count-bounded channel; waiting producers retain their batch. S7 adds the byte boundary. |
+| Connector queue | Source actor transfers a batch through `SourceMsg`; dequeue transfers ownership to the coordinator, not necessarily to free memory. | Count-bounded plus a shared 64 MiB Arrow-byte budget, retained through parking and released at staging/discard. Each source may additionally hold one validated waiting batch up to the same limit; connector decode scratch is outside this budget. |
 | Embedded input | `SourceEntry::push_and_buffer` admits into the core source channel and retains snapshot/broadcast references until their owners release them. | Count limits do not cover arbitrary Arrow width or all retained snapshots. S8 owns this separate path. |
 | Parked/staged cycles | The coordinator retains parked messages and cycle buffers until execution, retry, recovery or cleanup resolves them. Cursor settlement follows successful publication. | These retained references outlive dequeue; a released queue permit cannot serve as their memory budget. |
 | Graph ports | `OperatorGraph` admits and retains input/output batches, then releases port ownership when consumed or cleared. | Existing Backpressure/Fail/BestEffort shedding applies; pre-route current-usage checks can overshoot on the next batch. S9 owns prospective admission and fan-out treatment. |
@@ -1006,3 +1010,101 @@ verified by hash. The after SQL benchmark SHA-256 is
 The source/diff review found no new dependencies, per-row bookkeeping, unused abstractions or
 unrelated edits. The next serial session is S7; release qualification and remaining S4 findings
 remain open.
+
+### S7 — bound connector-to-coordinator queued bytes (2026-09-20)
+
+**Status:** implemented and verified locally; correctness gates pass and the final matched timing
+means have no regression above 5%.
+Starting HEAD: `014b997f07ffcef443f95da978e4a2a07fdebe3d`.
+**Modes:** all connector pipelines in embedded, single-node and cluster deployments. Cluster
+SQL/delivery admission, checkpoint formats and committed cursor semantics remain unchanged.
+
+`LaminarConfig::source_queue_max_bytes`, its builder method, `PipelineConfig::source_queue_max_bytes`
+and `[server].source_queue_max_bytes` configure a **64 MiB** default shared by all source senders
+in one coordinator generation. The existing 64-message default also remains in force. Zero and
+values above the platform semaphore/u32 range (`MAX_SOURCE_QUEUE_BYTES`) fail before connector
+startup; both server entry points validate before discovery/leases. Server changes require restart.
+
+The source channel owns one Tokio byte semaphore. An owned permit travels with each queued
+message through dequeue and intake parking until staging or discard. Closing the receiver wakes
+byte waiters even when a parked message still holds capacity. Normal sends, pending-cursor sends
+and both shutdown-tail `try_send` paths share admission. A batch larger than the entire budget
+fails promptly, before a pending cursor can retain it. Refused input never advances the
+coordinator's recovery cursor. Cancelled acquisition, failed count admission and dropped messages
+return their charges. Barriers remain in the mixed FIFO and bypass only the data-byte semaphore;
+per-source ordering and existing bounded checkpoint/shutdown failure paths are preserved.
+
+Accounting uses Arrow-reported retained array storage plus fixed batch/column charges. Slices,
+views and nested arrays retain their backing storage in this accounting; aliases are charged
+independently, without a per-row allocator or deduplication map. Each source can additionally
+hold one validated batch while waiting for capacity or a cursor, up to the configured limit.
+Connector decode scratch and schema/cursor metadata are outside this queue charge. Staging
+transfers Arrow ownership into the cycle/graph; it does not prove that storage was freed.
+Embedded push rings, staged/graph buffers, replay, tables/MVs, sink buffers and checkpoint scratch
+remain separate owners. S8/S9 and the remaining memory/qualification sessions are still required.
+
+**Correctness:** the pre-change regression admitted a batch exceeding 64 MiB. Eighteen new tests
+cover configuration/startup in each mode, oversized data and deferred cursor capture, parked input
+through actual coordinator staging, multiple producers with a slow consumer, FIFO barriers while
+bytes are saturated, partial reservation cancellation, lease loss, shutdown-tail admission,
+receiver closure and backing storage retained by wide slices/views. Targeted validation passed
+**404 tests**. All **6,058 workspace library/server tests passed, zero failed, one existing ignored**
+ONNX-model test. Both Clippy configurations with `-D warnings`, nightly formatting, readability,
+analytical-dependency and whitespace checks passed. Builds used one Cargo job, two test threads
+and `RUST_MIN_STACK=8388608`; cached OpenSSL debug-symbol warnings did not prevent linking.
+
+**Performance:** standard core/SQL baselines were refreshed before implementation. Final SQL
+comparisons use the same B0 WSL/Linux host, Rust 1.95.0, no default features, optimized builds
+with debug symbols, 100 Criterion samples, a 3-second warmup and a 30-second measurement target.
+Candidate runs precede baseline runs; builds, timings and profiles run serially. The unchanged
+core benchmark binary measured 5.368 → 5.176 ns in the initial matched check; optimized core and
+hot-path kernel smoke checks passed.
+
+Three new public-API burst cases exercise narrow rows, 4 KiB strings and four sources. Each
+sends 64 batches of 256 rows per source and waits for every row at the subscription. Setup and
+shutdown are untimed; input clones share Arrow backing storage. A nullable-schema mismatch was
+corrected in both fixtures. The wide fixture also explicitly retains 128 MiB of output in both
+versions: its original 16 MiB live-log default could evict unread output from a 64 MiB burst,
+under tracing and during a longer timing run. Those incomplete runs are retained as invalid
+evidence. Both rebuilt versions use the identical corrected fixture, all 64 batches and the
+same source-admission configuration. The fixture's output retention is separate from S7's budget.
+
+| Criterion mean | Before | After | Change |
+|---|---:|---:|---:|
+| Plain SELECT, 1,024 rows | 142.39 µs | 140.88 µs | −1.06% |
+| GROUP BY, 1,024 rows / 4 groups | 154.41 µs | 151.67 µs | −1.77% |
+| Sort / top 10, 1,024 rows | 182.92 µs | 181.03 µs | −1.03% |
+| Three-query chain | 168.75 µs | 168.23 µs | −0.31% |
+| Narrow burst | 174.33 µs | 177.00 µs | +1.53% |
+| Wide burst with 128 MiB output history | 10.310 ms | 6.723 ms | −34.79% |
+| Four-source burst | 437.32 µs | 431.71 µs | −1.28% |
+
+The initial four-source (+33.4%) and aggregate (+15.5%) slowdowns did not recur in this longer
+matched comparison. Raw samples, mean confidence intervals and approximate change intervals
+are retained. The wide case has substantial variance; its observed improvement is diagnostic,
+not a promised speedup. No production code was changed to make a timing pass.
+
+CPU and heap captures passed for four-source bursts, wide bursts and GROUP BY in both versions.
+CPU sampling used 49 Hz DWARF stacks; final reports disable the failing inline-symbol lookup.
+Some frames remain unresolved, so attribution is qualitative. Arrow concatenation dominates
+the burst profiles (about 56% and 91–93% inclusive CPU respectively). Source publication is
+about 1.5% in the candidate four-source profile. IPC remains below the >2 heuristic in both
+versions: 0.41 → 0.55 for four sources, 0.17 → 0.17 for wide bursts and 1.16 → 1.16 for GROUP BY.
+
+Heaptrack peak allocated memory was 19.79 → 20.34 MB for four sources, 149.23 → 191.22 MB for
+wide bursts and 1.84 → 1.84 MB for GROUP BY. These fixed-time profiles execute different amounts
+of work and include connector concatenation, output history and runtime allocations. The wide
+heap increase is retained in the evidence; a source-queue limit does not constrain those other
+owners. Instrumented RSS also includes profiler overhead. These local diagnostics do not qualify
+a production RSS or external-visibility envelope. S8/S9 and workload qualification remain necessary.
+
+Commands, gate/regression logs, source/binary identities, raw Criterion samples and profiles are
+under `target/s7-queue/`, including `final-summary.json`, `final-perf-commands.json` and final
+source/binary hashes. The pre-change source snapshot and corrected fixture are preserved there;
+native binaries remain under `/home/sujit/.cache/laminardb-b0-9bb1e996/s7-queue`. Final candidate
+SQL benchmark SHA-256: `a256a6042c7db3fe6f1503c262838b76e4d79b975c3865fb9b0b551c96ab836b`.
+All 36 final build/smoke/timing/profile commands passed. Runtime source hashes are unchanged
+since the correctness gates; formatting and all-target Clippy passed again after the fixture fix.
+The final diff review found no dependencies, readability exceptions, per-row bookkeeping or
+unrelated changes. The next serial session is S8. S4 dependency findings and production
+release/upgrade qualification remain open.

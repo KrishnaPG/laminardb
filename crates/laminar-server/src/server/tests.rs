@@ -3,6 +3,23 @@ use super::*;
 use crate::config::*;
 
 #[tokio::test]
+async fn source_queue_limit_is_validated_before_server_mode_routing() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.mode = mode;
+        config.server.source_queue_max_bytes = 0;
+        let error = run_server(config, PathBuf::from("unused.toml"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("source_queue_max_bytes"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn datafusion_memory_limit_is_validated_before_server_mode_routing() {
     for mode in [ServerMode::Single, ServerMode::Cluster] {
         let mut config: ServerConfig = toml::from_str("").unwrap();
