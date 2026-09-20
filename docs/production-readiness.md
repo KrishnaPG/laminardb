@@ -7,6 +7,8 @@ The [execution plan](production-hardening-plan.md) turns this backlog into bound
 dependencies, correctness tests and performance gates. Planning refinements below were checked
 against the same HEAD. S1–S3, S4a/S4b/S4d/S4e dependency repairs, S4c CI/release enforcement and S5 Kafka
 progress telemetry are implemented and verified locally. Remaining S4 findings now block CI/release.
+B0 Linux diagnostics completed on 2026-09-20 and found growing cached-plan metric retention;
+the execution plan puts that repair first in S6, before bounding DataFusion reservations.
 Findings below describe the reviewed baseline. See the execution plan for validation and remaining work.
 
 LaminarDB already has a substantial streaming execution, checkpoint, fencing, recovery, and

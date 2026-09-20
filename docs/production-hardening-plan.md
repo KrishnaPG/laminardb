@@ -1,7 +1,7 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e and S5 verified locally; S4 dependency findings still block CI/release; B0 local timings are recorded but profiling is blocked; S6–S13 not started.
-**Date:** 2026-09-19. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
+**Status:** S1–S3, S4a–S4e and S5 verified locally; S4 dependency findings still block CI/release; B0 diagnostic timings/profiles recorded; S6 starts with measured cached-plan retention; S6–S13 not implemented.
+**Date:** 2026-09-20. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
 Implement the smallest correctness fixes first. Establish performance evidence before changing
@@ -132,13 +132,27 @@ its authority/lifecycle meaning. No network polling or per-row metric allocation
 
 ### S6 — bound participating DataFusion working memory (G2)
 
-**Owns:** configuration and DataFusion runtime/context creation. **Modes:** all DB modes.
-**Risk:** medium; query failures and spilling behavior change. **Depends on:** S2 and B0.
+**Owns:** cached physical-plan reuse, configuration and DataFusion runtime/context creation.
+**Modes:** all DB modes. **Risk:** medium; execution-state reuse, query failures and spilling behavior
+change. **Depends on:** S2 and B0.
+
+Implement two bounded changes in order. **First, repair cached-plan execution-state retention:**
+B0's 2026-09-20 allocation profiles show metrics accumulating across repeated executions of the
+same physical plan. Cover all cached physical-plan execution call sites, successful execution,
+error/cancel and the next batch, including changing values across sorted batches. Preserve live
+source bindings and independent expected query results. Evaluate DataFusion's existing
+`reset_plan_states` API and its dynamic-filter/recursive-plan limitations before choosing the
+smallest supported repair. Do not introduce a custom plan-cache
+framework or disable metrics to hide growth. This touches the record path: refresh B0 and compare
+latency and retained allocations before landing. **Then, bound participating reservations** as below.
 
 Reuse DataFusion 53.1's bounded pool and runtime APIs. Establish the budget scope explicitly and
 share the intended per-DB pool with both the main context and the separately built connector
 operator-graph context in [operator_graph.rs](../crates/laminar-db/src/pipeline_lifecycle/operator_graph.rs).
 Inspect other public context constructors so the documented scope has no unbounded bypass.
+The cluster-only `collect_local_table` diagnostic also constructs a fresh context; include it
+in the per-DB scope. Standalone `laminar-sql` context factories and the expression-only lambda
+context need an explicit scope decision rather than an implicit whole-process guarantee.
 
 Disable disk spilling for execution on the compute runtime using the existing disk-manager API;
 the upstream default can use OS temporary files. Do not introduce a new spill subsystem. The
@@ -355,11 +369,12 @@ Use this brief for each fresh session:
 At handoff record: base/result SHA or uncommitted diff, affected modes, reproduction, test results,
 performance evidence, any compatibility change, outstanding blockers, and the next dependency.
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
-evidence. S1–S3, S4a–S4d and S5 are **implemented and verified locally**. S4 is **partially
-implemented**; the enforced scans still fail on unresolved dependency findings. B0 local timings
-are recorded; CPU/IPC and allocation profiling is blocked. S6–S13 remain **not started**.
+evidence. S1–S3, S4a–S4e and S5 are **implemented and verified locally**. S4 is **partially
+implemented**; the enforced scans still fail on unresolved dependency findings. B0 now has local
+diagnostic timings and CPU/allocation profiles. S6–S13 remain **not implemented**; S6 first repairs
+the measured cached-plan retention, then bounds reservations. Production qualification is open.
 
-## Implementation progress — 2026-09-19
+## Implementation progress
 
 S1/S2 changes were made against the base SHA above. Before production edits, five new delivery-policy
 tests and five new HTTP tests failed for the expected admission/parser problems. Shared policy
@@ -669,6 +684,13 @@ Windows linking initially exhausted disk space. Removing older generated increme
 freed approximately 110 GiB, preserving benchmark baselines, compiled outputs and evidence;
 the same validation then passed. Existing OpenSSL debug-symbol warnings remain unchanged.
 
+A 2026-09-20 registry/manifest follow-up found no additional narrow repair: object_store 0.13.2
+and OpenDAL 0.57.0 remain the latest releases in their permitted series and still require XML
+0.39. Delta Lake 0.32.4 still requires validator 0.19. Published reqsign-core 3.3.1,
+reqsign-google 3.1.1 and reqsign-azure-storage 3.2.1 still depend on RSA 0.9; their archives were
+checked against the registry checksums. No dependency or advisory policy changed. This was a
+manifest review, not a fresh security scan; evidence is under `target/s4-next/`.
+
 ### S5 — Kafka reader progress and delivery freshness
 
 Implemented from `598a656c` alongside S4b. This applies to Kafka sources in embedded, single-node
@@ -711,7 +733,7 @@ is local protocol evidence, not production broker qualification; the metadata-qu
 production partition counts remains S12 work. The existing ignored ONNX model test, cached OpenSSL
 debug-symbol warnings and proc-macro future-compatibility notice are unchanged. Next is B0 before S6.
 
-### B0 — local timing baseline; profiling pending
+### B0 — Windows timing baseline (2026-09-19)
 
 Started from `42657355`. Reuse `latency_bench` and the existing `stream_executor_bench` cases
 `plain_select`, `agg_group_by`, `sort_limit` and `query_chain`. The SQL diagnostic uses one local,
@@ -766,13 +788,14 @@ cargo bench -p laminar-core -p laminar-db --no-default-features --bench latency_
 <stream_executor_bench.exe> --bench "^(plain_select|agg_group_by|sort_limit|query_chain)/" --noplot --save-baseline s6-before
 ```
 
-CPU/IPC and allocation profiles remain outstanding. WPR rejected the named CPU/PMC capture with
-`0xc5585011` (could not enable the profiling policy), and image-specific heap tracing with
+CPU/IPC and allocation profiles were not captured in this Windows run. WPR rejected the named
+CPU/PMC capture with `0xc5585011` (could not enable the profiling policy), and image-specific heap tracing with
 `0x80070005` (access denied). The execution token lacks the profiling privilege. Final checks show
 the task's WPR instance idle and heap tracing disabled; no profile workload ran. Capture logs and
-the validated PMC profile are retained under `target/b0/`. Completing B0 requires an elevated
-profiling environment; this timing-only run does not close B0 or authorize performance conclusions
-for S6. No production workload targets or memory defaults have been inferred from these results.
+the validated PMC profile were recorded under `target/b0/`. This timing-only run did not close B0.
+The Linux follow-up below supplies diagnostic profiles. The previous ignored Windows evidence
+directories were no longer present at that follow-up; the numbers above remain historical results.
+No production workload targets or memory defaults have been inferred from them.
 
 The memory ownership contract for the later serial work is deliberately limited to existing owners:
 
@@ -788,3 +811,74 @@ The memory ownership contract for the later serial work is deliberately limited 
 
 No values in this ownership inventory are an additive RSS guarantee. Establish measured headroom
 before selecting memory defaults; keep the S6 pool scoped to participating reservations.
+
+### B0 — Linux timings, profiles and retained-plan finding (2026-09-20)
+
+Measured production/benchmark source at `9bb1e996f9ff2b7287d2decc80d55d3b482bda4b`, with only
+documentation edits during the run. The existing Ubuntu 24.04.4 WSL2 environment supplies
+user-process profiling without changing kernel profiling permissions. It exposes 24 logical CPUs
+on the same Ryzen 9 7900X, approximately 15.2 GiB RAM and 4 GiB swap. Windows reported Balanced
+power at run start. Rust 1.95.0 built the locked graph with one build job, opt-level 3, thin LTO,
+one codegen unit, debug level 1, no debug stripping and `RUST_MIN_STACK=4194304`. This is a benchmark build
+at the declared MSRV, not an all-feature MSRV qualification.
+
+Reused the workload described above. All five optimized smoke cases passed. Each timing case
+collected 100 samples after a three-second warmup; SQL measurement targets were twenty seconds,
+and the assignment target was five seconds. Timings ran before profiling, with no concurrent build.
+The table reports Criterion **means and 95% confidence intervals**, not regression slopes or
+per-event percentiles. Different OS/toolchain and source identities prevent comparison with the
+Windows numbers as a regression/improvement claim.
+
+| Diagnostic | Mean | 95% confidence interval | User-process IPC | Profile peak heap, MB |
+|---|---:|---:|---:|---:|
+| Tumbling-window assignment | 5.057 ns | 5.030–5.082 ns | — | — |
+| Projection/filter, 1,024 rows | 136.15 µs | 134.53–137.82 µs | 0.453 | 1.47 |
+| Four-group aggregate, 1,024 rows | 144.17 µs | 142.66–145.67 µs | 1.134 | 1.49 |
+| Sort/top ten, 1,024 rows | 150.69 µs | 148.40–153.24 µs | 0.390 | 16.74 |
+| Three-query chain, 1,024 rows | 161.12 µs | 158.79–163.89 µs | 0.646 | 40.49 |
+
+Perf 6.8.12 recorded grouped user cycles/instructions for requested fifteen-second SQL profiles;
+both counters report 100% running time. These aggregate process counters include runtime/harness
+work under virtualization. They are below the IPC > 2 heuristic and do not establish an optimized
+compute kernel. Kernel scheduling counters were excluded; their reported zeros are not evidence
+of no context switches. Separate CPU stack captures use 16 KiB DWARF stacks at 199 Hz. The first
+chain capture lost samples and is superseded by a 99 Hz repeat. All four accepted captures report
+zero lost samples and contain resolved application stacks. Perf writes on the Windows mount
+failed; captures succeeded on Linux's native filesystem and were copied into the workspace.
+
+[Heaptrack](https://github.com/KDE/heaptrack) 1.5.0 profiled the same SQL cases separately with a
+requested five-second duration. The table's rounded decimal MB values measure intercepted heap
+allocations across fixture setup, warmup, execution and teardown using the system allocator.
+They are not DataFusion reservation totals or production RSS limits. The uninstrumented SQL timing
+process peaked at **165,056 KiB RSS**; this short diagnostic does not establish a steady plateau.
+
+**New G2 evidence:** a fifteen-second chain allocation profile peaked at **143.27 MB**, compared
+with 40.49 MB in the five-second profile. Its exported live-heap timeline rises through roughly
+40, 61, 82, 105 and 127 MB during the long execution, then falls to about 134 KB on teardown.
+Retained stacks point to DataFusion metric labels/values and their registry under cached projection
+and sort execution. Source inspection matches the observation: `execute_cached_plan` repeatedly
+collects the same plan; `ProjectionExec::execute` registers new metrics, and
+`ExecutionPlanMetricsSet::register` appends to its shared set. This is retained execution state
+until the plan is released, outside participating memory reservations. S6 therefore starts with
+a focused reuse repair before adding the pool. No engine fix or safe memory default is claimed here.
+
+Raw samples, profiles, reports, exact commands, hashes and the retention timeline are under
+`target/b0-wsl/`; `summary.json` identifies the accepted and superseded CPU reports. The native
+build/profiles remain in `/home/sujit/.cache/laminardb-b0-9bb1e996` inside Ubuntu. Executable hashes:
+
+- `stream_executor_bench-a84282b6a7c6d167`: `7b478bdb422666695b3d79aff3c122b3aa8cac2de114921332652dbb17a8fd41`.
+- `latency_bench-c15ce6117c8edbe1`: `41cf9196f2b4a8f65dd4ee6e693c4f53c2859b059bdea0e4cadf1eb7f66d0b9a`.
+
+Reproduction uses the prior build command with `cargo +1.95.0`, the documented profile variables
+and native `CARGO_TARGET_DIR`. Run the two binaries with `--bench --noplot --save-baseline
+s6-before-wsl`; add the existing four-case SQL filter and `--measurement-time 20` for SQL.
+Profiles use that filter narrowed to one case with `--profile-time 15` (perf) or `5` (heaptrack).
+Refresh the matched Linux baseline immediately before S6; retain the >5% regression gate and
+repeat uncertain measurements. Production workload targets, external visibility, recovery,
+other feature combinations and shipped-platform qualification remain S12/S13 work.
+
+All 32 recorded benchmark/capture/export commands exited successfully; trace quality review rejected
+the lossy first chain capture despite its zero exit status. Formatting, readability, analytical
+dependency, local-link and whitespace checks passed. This follow-up changes documentation only;
+prior workspace test/Clippy
+results are historical, and no new full-workspace regression run is claimed.
