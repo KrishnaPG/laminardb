@@ -14,6 +14,10 @@ use crate::error::DbError;
 /// This execution budget is independent of checkpoint storage.
 pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default per-DB limit for participating `DataFusion` reservations (256 MiB).
+/// This does not limit direct Arrow allocations or process RSS.
+pub const DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
 pub(crate) fn event_time_max_future_skew_ms(
     skew: std::time::Duration,
 ) -> Result<i64, &'static str> {
@@ -116,6 +120,11 @@ impl Default for RestartPolicy {
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
+    /// Shared limit for participating `DataFusion` reservations across this DB's contexts.
+    /// Must be greater than zero; defaults to [`DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES`].
+    /// DB-owned contexts cannot spill to disk. Direct Arrow allocations, managed state,
+    /// queues, connector-owned contexts and process RSS are outside this budget.
+    pub datafusion_memory_limit_bytes: usize,
     /// Streaming channel buffer size.
     pub default_buffer_size: usize,
     /// Backpressure strategy.
@@ -171,6 +180,11 @@ pub struct LaminarConfig {
 
 impl LaminarConfig {
     pub(crate) fn validate_and_normalize(&mut self) -> Result<(), DbError> {
+        if self.datafusion_memory_limit_bytes == 0 {
+            return Err(DbError::Config(
+                "datafusion_memory_limit_bytes must be greater than zero".into(),
+            ));
+        }
         self.source_idle_timeout = source_idle_timeout_ms(self.source_idle_timeout)
             .map_err(|error| DbError::Config(error.to_string()))?
             .map(std::time::Duration::from_millis);
@@ -233,6 +247,7 @@ impl LaminarConfig {
 impl Default for LaminarConfig {
     fn default() -> Self {
         Self {
+            datafusion_memory_limit_bytes: DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES,
             default_buffer_size: 65536,
             default_backpressure: BackpressureStrategy::Block,
             storage_dir: None,

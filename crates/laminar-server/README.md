@@ -63,6 +63,7 @@ mode = "single"             # "single" (standalone) or "cluster" (multi-node)
 bind = "0.0.0.0:8080"       # HTTP API bind address
 console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
+datafusion_memory_limit_bytes = 268435456 # shared per DB/node; 256 MiB default, must be > 0
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -296,6 +297,11 @@ Edit the TOML file while the server is running. The file watcher detects changes
 2. Recreates sources, lookups, pipelines, sinks that were added or changed
 
 Changes to `[server]` and `[checkpoint]` require a restart. Disable the file watcher with `LAMINAR_DISABLE_FILE_WATCH=1`.
+
+`server.datafusion_memory_limit_bytes` bounds participating fallible DataFusion reservations in both
+server modes and requires a restart to change. DB-owned contexts share the limit and disable
+disk spilling. It does not cap process RSS, queues, managed state or connector I/O allocations;
+see the [memory scope](../laminar-db/README.md#datafusion-memory-limit).
 
 ## Tuning the Allocator (`MALLOC_CONF`)
 

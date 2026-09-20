@@ -209,7 +209,7 @@ impl LaminarDB {
             table_store: self.table_store.clone(),
             mv_store_has_any: self.mv_store.read().has_any_handle(),
             mv_store: self.mv_store.clone(),
-            filter_ctx: laminar_sql::create_session_context(),
+            filter_ctx: self.create_auxiliary_context(),
             compiled_sink_filters: Vec::new(),
             pending_sink_filter_compiles,
             delivery_guarantee: config.delivery_guarantee,

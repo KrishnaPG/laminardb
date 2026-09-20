@@ -377,6 +377,16 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Shared per-DB limit for participating `DataFusion` reservations in bytes (default 256 MiB).
+    ///
+    /// Zero is rejected at build time. DB-owned contexts disable disk spilling.
+    /// This does not bound direct Arrow allocations, managed state, connector I/O or process RSS.
+    #[must_use]
+    pub fn datafusion_memory_limit_bytes(mut self, bytes: usize) -> Self {
+        self.config.datafusion_memory_limit_bytes = bytes;
+        self
+    }
+
     /// Per-port operator input-buffer cap in batches (default 256).
     #[must_use]
     pub fn pipeline_max_input_buf_batches(mut self, batches: usize) -> Self {

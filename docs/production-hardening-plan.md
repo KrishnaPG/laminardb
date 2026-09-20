@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e, S5 and S6a verified locally; S4 dependency findings still block CI/release; S6a has an explained sort-latency cost; shared reservation limits and S7–S13 remain unimplemented.
+**Status:** S1–S3, S4a–S4e, S5 and S6 verified locally; S4 dependency findings still block CI/release; S6a has an explained sort-latency cost; S6b shared reservation limits pass the local gates; S7–S13 remain unimplemented.
 **Date:** 2026-09-20. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -132,8 +132,9 @@ its authority/lifecycle meaning. No network polling or per-row metric allocation
 
 ### S6 — bound participating DataFusion working memory (G2)
 
-**Progress (2026-09-20):** cached-plan reuse is repaired and verified; see S6a below for the measured
-sort cost. The shared reservation pool and compute no-spill configuration are next.
+**Progress (2026-09-20):** implemented and verified locally. See S6a below for the cached-plan
+repair and measured sort cost, and S6b for the shared reservation pool, no-spill configuration,
+correctness gates and matched performance evidence. Wider memory bounds remain S7–S11 work.
 
 **Owns:** cached physical-plan reuse, configuration and DataFusion runtime/context creation.
 **Modes:** all DB modes. **Risk:** medium; execution-state reuse, query failures and spilling behavior
@@ -364,8 +365,9 @@ performance evidence, any compatibility change, outstanding blockers, and the ne
 A passing PR closes its scoped gap only; production readiness requires the corresponding S12/S13
 evidence. S1–S3, S4a–S4e and S5 are **implemented and verified locally**. S4 is **partially
 implemented**; the enforced scans still fail on unresolved dependency findings. B0 now has local
-diagnostic timings and CPU/allocation profiles. S6–S13 remain **not implemented**; S6 first repairs
-the measured cached-plan retention, then bounds reservations. Production qualification is open.
+diagnostic timings and CPU/allocation profiles. S6a repairs cached-plan retention; S6b reservation
+limits are **implemented and verified locally**. S7–S13 remain **not implemented**. Production
+qualification is open.
 
 ## Implementation progress
 
@@ -798,7 +800,7 @@ The memory ownership contract for the later serial work is deliberately limited 
 | Embedded input | `SourceEntry::push_and_buffer` admits into the core source channel and retains snapshot/broadcast references until their owners release them. | Count limits do not cover arbitrary Arrow width or all retained snapshots. S8 owns this separate path. |
 | Parked/staged cycles | The coordinator retains parked messages and cycle buffers until execution, retry, recovery or cleanup resolves them. Cursor settlement follows successful publication. | These retained references outlive dequeue; a released queue permit cannot serve as their memory budget. |
 | Graph ports | `OperatorGraph` admits and retains input/output batches, then releases port ownership when consumed or cleared. | Existing Backpressure/Fail/BestEffort shedding applies; pre-route current-usage checks can overshoot on the next batch. S9 owns prospective admission and fan-out treatment. |
-| DataFusion reservations | A context's runtime pool owns participating reservations until the consumer releases/drops them. Main DB and graph contexts are constructed separately. | Currently unbounded; direct Arrow/expression allocations are outside reservations. S6 shares a bounded pool and disables compute spilling. |
+| DataFusion reservations | The per-DB runtime pool owns participating reservations until the consumer releases/drops them; main, graph and auxiliary contexts share it. | S6b adds a 256 MiB configurable fallible-reservation limit and disables DB-context spilling. Direct Arrow/expression allocations remain outside reservations. |
 | Tables/MVs | Stores retain live keys/rows through upsert, refresh, publication and restore; replacement/delete or configured append retention releases them. | No general live-byte quota; shared Arrow slices can retain large allocations. S10/S11 own preflight and failure atomicity. |
 | Checkpoint scratch | Capture retains immutable frames while background serialization/persistence overlaps live state, then releases them on completion/cleanup. | Existing checkpoint data limits do not establish a whole-process or transient scratch-memory allowance. |
 
@@ -931,3 +933,76 @@ intervals, CPU/heap traces, the isolated Top-K probe, source hashes and `summary
 SQL benchmark SHA-256 is `65a2b170a048949b7553d20715f9cfbf625292adf0d35fe09acda6a56291fd19`;
 the core binary is unchanged from B0. Starting HEAD was `23666ebf`. Native binaries and profiles
 remain under `/home/sujit/.cache/laminardb-b0-9bb1e996/s6-cache` for the next bounded change.
+
+### S6b — share bounded DataFusion reservations (2026-09-20)
+
+**Status:** implemented and verified locally. Starting HEAD:
+`07d0e6b45b001732274ab81a9d6387d7bc88b7b5`; result is an uncommitted diff.
+
+All DB modes now create one DataFusion 53.1 `GreedyMemoryPool` per `LaminarDB`, shared through
+the runtime used by main queries, connector operator graphs, sink-filter contexts and the
+cluster local-table diagnostic. New graph generations retain the same pool. Separate DBs have
+separate budgets. Catalogs remain separate where they were previously separate.
+
+`LaminarConfig::datafusion_memory_limit_bytes`, the matching builder method, and
+`[server].datafusion_memory_limit_bytes` select the finite limit; the default is **256 MiB**.
+Zero is rejected, including direct server/cluster startup before discovery or lease acquisition.
+Changing the server setting requires restart. DB-owned contexts use `DiskManagerMode::Disabled`,
+including ad-hoc queries. Participating allocation failures retain DataFusion's resource error
+or the existing `DbError::QueryPipeline`; translation identifies resource exhaustion as query
+execution failure (`LDB-9001`) rather than an internal bug.
+
+The budget covers fallible DataFusion reservations, not every Arrow allocation or process RSS.
+Queues, managed state, tables/MVs and checkpoint scratch remain separately owned. Connector-owned
+I/O contexts, standalone `laminar-sql` factories and its thread-local lambda context retain their
+existing defaults and are explicitly outside the per-DB scope. The 256 MiB policy does not establish
+a production memory envelope or close G2. S7–S11 and S12 workload sizing remain separate work.
+
+Before implementation, regressions demonstrated that a default DB admitted a reservation larger
+than the proposed cap and enabled temporary spill files. Fourteen new tests cover default/explicit
+limits, independent DBs and concurrent contexts, real sort/aggregate/join exhaustion, cached-plan
+retry and cancellation with live reservations, the cluster diagnostic, connector-graph failure
+source reporting and reconstruction, configuration/startup validation, and error translation.
+All **6,040 workspace library/server tests passed, zero failed, one ignored** (the existing
+external ONNX-model test). Both Clippy configurations with `-D warnings`, nightly formatting,
+readability, analytical-dependency and whitespace checks passed. Tests used one Cargo build job,
+two test threads and `RUST_MIN_STACK=8388608`; existing cached OpenSSL debug-symbol warnings did
+not prevent linking. No production cursor/recovery behavior or cluster SQL admission was changed.
+
+**Performance:** same WSL host, Rust 1.95.0, release settings, five workloads and 100-sample
+protocol as S6a, with a refreshed baseline before implementation. SQL measurement targets were
+20 seconds, with three-second warmups; builds and profiling did not overlap measurements.
+The table reports Criterion means; raw estimates include their 95% confidence intervals.
+
+| Workload | Before | After | Change |
+|---|---:|---:|---:|
+| Window assignment | 5.160 ns | 5.107 ns | −1.02% |
+| Plain select, 1,024 rows | 137.42 µs | 139.06 µs | +1.19% |
+| Four-group aggregate, 1,024 rows | 149.71 µs | 151.96 µs | +1.51% |
+| Sort / top 10, 1,024 rows | 179.24 µs | 178.00 µs | −0.69% |
+| Three-query chain, 1,024 rows | 164.28 µs | 169.45 µs | +3.15% |
+
+The chain's initial approximate 95% change interval overlapped the 5% gate, so it and the select
+control were repeated with reversed run order and 30-second measurement targets. The chain
+measured **170.05 → 168.02 µs (−1.19%)**, with an approximate change interval of **−2.86% to +0.48%**;
+select measured **141.82 → 143.18 µs (+0.96%)**. No measured mean exceeded the 5% gate. This is local
+diagnostic evidence, not a production latency or RSS qualification. The unchanged `hot_path_micro`
+kernels passed optimized smoke checks; they do not construct a DataFusion runtime and do not
+measure this pool change. No record-path kernel, queue admission or fan-out implementation changed.
+
+Separate Heaptrack profiles measured peak heap **1.66 → 1.63 MB** for sort and **1.73 → 1.69 MB**
+for the 15-second chain; both returned to the same roughly 134 KB process teardown remainder as
+their before runs. These figures include fixture/runtime allocations and are not pool accounting.
+Four 99 Hz CPU captures had zero lost samples. Grouped user counters ran 100% of the requested
+time: sort IPC **1.286 → 1.284**, chain **0.657 → 0.678**. These virtualized process counters include
+runtime/harness work and remain below the IPC > 2 kernel guideline; no kernel optimization or
+target-hardware qualification is claimed.
+
+`target/s6-memory/` contains commands, source/binary hashes, regression and gate logs, Criterion
+samples/intervals, CPU/heap traces and `summary.json`. Native artifacts remain under
+`/home/sujit/.cache/laminardb-b0-9bb1e996/s6-memory`. The before binaries were preserved from S6a and
+verified by hash. The after SQL benchmark SHA-256 is
+`a6cb9365e40cc25eb4dafaebf6e546bd8b165c34ae19653b10cd1a1d4a4f4ed3`; the core binary is unchanged.
+The source/diff review found no new dependencies, per-row bookkeeping, unused abstractions or
+unrelated edits. The next serial session is S7; release qualification and remaining S4 findings
+remain open.

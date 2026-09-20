@@ -1680,3 +1680,22 @@ fn test_config_error_display_messages() {
     assert!(msg.contains("error one"));
     assert!(msg.contains("error two"));
 }
+
+#[test]
+fn datafusion_memory_limit_default_override_and_zero_validation() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(
+        default.server.datafusion_memory_limit_bytes,
+        laminar_db::DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES
+    );
+    let configured: ServerConfig =
+        toml::from_str("[server]\ndatafusion_memory_limit_bytes = 65536").unwrap();
+    assert_eq!(configured.server.datafusion_memory_limit_bytes, 65536);
+    validate_config(&configured).unwrap();
+    let invalid: ServerConfig =
+        toml::from_str("[server]\ndatafusion_memory_limit_bytes = 0").unwrap();
+    assert!(validate_config(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("datafusion_memory_limit_bytes"));
+}

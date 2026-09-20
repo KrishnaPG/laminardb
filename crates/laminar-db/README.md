@@ -44,6 +44,24 @@ snapshot query followed by a subscription nor a client cursor establishes an ato
 snapshot-plus-tail or transactional external-consumer guarantee. See the
 [subscription boundaries](../../README.md#ddl) and linked replay tests before designing consumers.
 
+## DataFusion memory limit
+
+Every `LaminarDB` has a shared 256 MiB limit for participating fallible DataFusion reservations.
+Set `LaminarConfig::datafusion_memory_limit_bytes` or
+`LaminarDB::builder().datafusion_memory_limit_bytes(bytes)` to change it; zero is rejected.
+The limit applies in embedded, single-node and cluster modes, per DB instance (per node in
+a cluster). Main queries, connector operator graphs, sink-filter contexts and local-table
+diagnostics share the budget, including concurrent queries and restarted graph generations.
+DB-owned contexts disable disk spilling. Exhaustion returns an allocation/query error;
+streaming delivery and recovery use their existing failure handling.
+
+This is a reservation limit, not a process RSS cap. Direct Arrow/expression allocations,
+managed operator state, queues, tables/MVs, checkpoint scratch and connector-owned I/O
+contexts have separate ownership. Standalone `laminar-sql` factories and its thread-local
+lambda evaluation context retain upstream defaults and do not join a DB's pool. The default
+is an execution policy, not a qualified production memory envelope; size it for the workload
+and leave headroom for allocations outside DataFusion reservations.
+
 ## Feature Flags
 
 | Flag | Purpose |

@@ -147,6 +147,10 @@ pub struct ServerSection {
     /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
     #[serde(default = "default_incremental_emit")]
     pub incremental_emit: bool,
+    /// Per-DB/node limit for participating `DataFusion` reservations; excludes process RSS.
+    /// DB-owned contexts disable disk spilling. Must be greater than zero.
+    #[serde(default = "default_datafusion_memory_limit_bytes")]
+    pub datafusion_memory_limit_bytes: usize,
     /// Right-side history retained while a temporal join input is idle.
     #[serde(default, with = "humantime_serde")]
     pub temporal_join_idle_history_retention: Option<Duration>,
@@ -219,6 +223,7 @@ impl Default for ServerSection {
             bind: default_bind(),
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
+            datafusion_memory_limit_bytes: default_datafusion_memory_limit_bytes(),
             temporal_join_idle_history_retention: None,
             source_idle_timeout: None,
             event_time_max_future_skew: default_event_time_max_future_skew(),
@@ -239,6 +244,13 @@ impl Default for ServerSection {
 }
 
 impl ServerSection {
+    pub(crate) fn validate_datafusion_memory_limit(&self) -> Result<(), &'static str> {
+        if self.datafusion_memory_limit_bytes == 0 {
+            return Err("datafusion_memory_limit_bytes must be greater than zero");
+        }
+        Ok(())
+    }
+
     /// Configured key-group topology, or the common deployment default.
     #[must_use]
     pub(crate) fn resolved_key_groups(&self) -> KeyGroupCount {
@@ -284,6 +296,10 @@ impl ServerSection {
 
 fn default_event_time_max_future_skew() -> Duration {
     Duration::from_millis(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs())
+}
+
+fn default_datafusion_memory_limit_bytes() -> usize {
+    laminar_db::DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES
 }
 
 /// `[supervision]` — auto-restart policy; unset fields fall back to engine defaults.

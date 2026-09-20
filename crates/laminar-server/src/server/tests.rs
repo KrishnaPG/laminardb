@@ -2,6 +2,23 @@ use super::*;
 
 use crate::config::*;
 
+#[tokio::test]
+async fn datafusion_memory_limit_is_validated_before_server_mode_routing() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.mode = mode;
+        config.server.datafusion_memory_limit_bytes = 0;
+        let error = run_server(config, PathBuf::from("unused.toml"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("datafusion_memory_limit_bytes"),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn checkpoint_config_rejects_relative_file_urls() {
     for url in ["file://./relative", "FILE://./relative"] {

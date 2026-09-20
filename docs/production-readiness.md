@@ -9,8 +9,9 @@ against the same HEAD. S1–S3, S4a/S4b/S4d/S4e dependency repairs, S4c CI/relea
 progress telemetry are implemented and verified locally. Remaining S4 findings now block CI/release.
 B0 Linux diagnostics completed on 2026-09-20 and found growing cached-plan metric retention.
 S6a now releases cached execution state and corrects stale Top-K cutoffs. Correctness gates pass;
-sort latency has a documented 4–23% cost across diagnostic comparisons. Shared DataFusion
-reservation limits remain next in S6.
+sort latency has a documented 4–23% cost across diagnostic comparisons. S6b now shares bounded
+DataFusion reservations across DB contexts and disables their disk spilling. Correctness gates
+and matched local performance checks pass. This does not close G2's wider memory scope.
 Findings below describe the reviewed baseline. See the execution plan for validation and remaining work.
 
 LaminarDB already has a substantial streaming execution, checkpoint, fencing, recovery, and

@@ -5,6 +5,9 @@
 mod assignment_authority;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
+#[cfg(test)]
+mod datafusion_memory_tests;
+mod session;
 #[cfg(feature = "cluster")]
 pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
@@ -21,7 +24,6 @@ use laminar_core::catalog::CatalogObjectKind;
 use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
-use laminar_sql::register_streaming_functions;
 
 use crate::builder::LaminarDbBuilder;
 use crate::catalog::SourceCatalog;
@@ -1727,29 +1729,12 @@ impl LaminarDB {
 
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
-        // Wire the LookupJoinExtensionPlanner so LookupJoinNode → LookupJoinExec.
-        let ctx = {
-            let mut session_config = laminar_sql::datafusion::base_session_config();
-            if let Some(n) = target_partitions {
-                session_config = session_config.with_target_partitions(n);
-            }
-            let extension_planner: Arc<
-                dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync,
-            > = Arc::new(laminar_sql::datafusion::LookupJoinExtensionPlanner::new(
-                Arc::clone(&lookup_registry),
-            ));
-            let query_planner: Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> =
-                Arc::new(LookupQueryPlanner { extension_planner });
-            let mut state_builder = datafusion::execution::SessionStateBuilder::new()
-                .with_config(session_config)
-                .with_default_features()
-                .with_query_planner(query_planner);
-            for rule in extra_optimizer_rules {
-                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
-            }
-            SessionContext::new_with_state(state_builder.build())
-        };
-        register_streaming_functions(&ctx);
+        let ctx = session::create_context(
+            &config,
+            Arc::clone(&lookup_registry),
+            extra_optimizer_rules,
+            target_partitions,
+        )?;
 
         let catalog = Arc::new(SourceCatalog::new(
             config.default_buffer_size,
@@ -4318,7 +4303,7 @@ impl LaminarDB {
 
         let _catalog_guard = self.topology_ddl_lock.read().await;
         let provider = self.ctx.table_provider(exact_table_reference(name)).await?;
-        let context = SessionContext::new();
+        let context = self.create_auxiliary_context();
         context.register_table(exact_table_reference(LOCAL_SCAN_NAME), provider)?;
         Ok(context
             .sql(&format!("SELECT * FROM {LOCAL_SCAN_NAME}"))
