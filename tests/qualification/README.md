@@ -58,14 +58,15 @@ object containing every field below, using workload-approved values:
 |---|---|
 | `visibility_ms` | Ordered array of p50, p95, p99, p99.9 ceilings, applied to each pipeline |
 | `rss_bytes` | Maximum sampled server RSS |
-| `rss_growth_bytes_per_second` | Maximum fitted RSS slope over the second half of offered load |
+| `rss_growth_bytes_per_second` | Maximum fitted RSS slope across process generations; each fit uses the latter half of that generation's sampled post-warmup offered-load interval |
 | `backlog_growth_rows_per_second` | Maximum fitted offered-minus-observed backlog slope over the same window |
 | `checkpoint_p99_ms` | Maximum final cumulative checkpoint p99 upper bound across process generations |
 | `recovery_ms` | Kill to a continuous externally visible prefix including a post-death scheduled input, plus a checkpoint completed by the restarted process |
 
 Declared-limit runs require at least 3,600 seconds of offered load after warmup, at least
 60 seconds of warmup, 100,000 measured records **per pipeline**, and 100 checkpoint observations
-per process generation. Prometheus
+per process generation. Every generation also needs at least 60 RSS samples spanning at least
+60 seconds in its fitting window. Prometheus
 histograms retain finite bucket upper bounds; overflow or unavailable evidence cannot satisfy
 a limit. End-to-end visibility uses the existing Prometheus histogram implementation with
 one-percent bucket spacing, a 1 μs minimum bucket and a finite range exceeding ten minutes.
@@ -84,6 +85,19 @@ requires all IDs followed by a drained, stable public Kafka boundary. A missing 
 hidden by later records or by another pipeline. Source origins make cross-routing detectable even
 when different pipelines use the same IDs and payload. `backlog` is an end-to-end row backlog, not an
 engine queue-byte measurement. RSS is sampled; spikes shorter than a scrape interval may be missed.
+
+Reports use `laminardb-workload-observation/v2`. The resource summary retains each process
+generation's sampled interval, fitting window, sample count, missing RSS samples after warmup,
+peak RSS, fitted growth and final checkpoint p99. The RSS warmup begins at the generation's first
+sample during offered load and lasts `warmup_seconds`; it does not change latency warmup or
+the offered schedule. Missing RSS during that startup interval is retained but excluded from the
+fit. Any missing RSS after warmup during offered load makes that generation's growth unavailable,
+even if it falls before the fitting window. Final drain cannot supply missing load evidence.
+Diagnostic fits require at least three samples; declared limits require the stronger floor above.
+A short-lived or unmeasured generation cannot be hidden by a later healthy process. The overall
+growth result is available only when every generation has a usable fit, and is their maximum.
+This avoids averaging a restart's RSS drop into apparent stability. The version 1 reports used a
+single second-half window; retain them as earlier observations with those measurement limitations.
 
 Use `--repetitions 3` for the same declared spec, then separately run the one/four-pipeline and
 uniform/Zipf/hot-key combinations. The runner never emits `s12_qualified: true`. Even a

@@ -192,6 +192,7 @@ fn qualification_requested_kill_requires_recovery_even_without_limits() {
         backlog_growth_rows_per_second: None,
         max_backlog_rows: 0,
         checkpoint_p99_ms: None,
+        generations: Vec::new(),
     };
     let output = super::observer::Observation {
         unique_rows: 0,
@@ -204,4 +205,126 @@ fn qualification_requested_kill_requires_recovery_even_without_limits() {
     assert!(super::check_limits(&spec, &resources, &output, Some(1.0)).is_ok());
     spec.fault = Fault::None;
     assert!(super::check_limits(&spec, &resources, &output, None).is_ok());
+}
+
+fn restart_samples() -> Vec<super::evidence::Sample> {
+    (0..20)
+        .map(|second| super::evidence::Sample {
+            seconds: f64::from(second),
+            generation: if second < 10 { 1 } else { 2 },
+            offered: 0,
+            enqueued: 0,
+            acknowledged: 0,
+            observed: 0,
+            backlog: 0,
+            rss_bytes: if second < 10 {
+                Some(1_000.0)
+            } else if second == 10 {
+                None
+            } else {
+                Some(100.0 + f64::from(second - 10) * 2.0)
+            },
+            cycle_p50_p95_p99_ms: None,
+            checkpoint_p99_ms: Some(if second < 10 { 50.0 } else { 10.0 }),
+            checkpoint_stall_p99_ms: None,
+        })
+        .collect()
+}
+
+#[test]
+fn qualification_restart_warmup_does_not_erase_rss_growth() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = super::evidence::Evidence::new(directory.path()).unwrap();
+    evidence.samples = restart_samples();
+    let summary = evidence.summary(&spec());
+    assert_eq!(summary.rss_growth_bytes_per_second, Some(2.0));
+    assert_eq!(summary.peak_rss_bytes, Some(1_000.0));
+    assert_eq!(summary.checkpoint_p99_ms, Some(50.0));
+    assert_eq!(summary.generations.len(), 2);
+    assert_eq!(
+        summary.generations[0].rss_growth_bytes_per_second,
+        Some(0.0)
+    );
+    assert_eq!(
+        summary.generations[1].rss_growth_bytes_per_second,
+        Some(2.0)
+    );
+    assert_eq!(summary.generations[1].rss_growth_start_seconds, Some(15.0));
+    assert_eq!(summary.generations[1].rss_growth_samples, 5);
+}
+
+#[test]
+fn qualification_restart_cannot_hide_a_leaking_predecessor() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = super::evidence::Evidence::new(directory.path()).unwrap();
+    evidence.samples = restart_samples();
+    for sample in &mut evidence.samples {
+        sample.rss_bytes = Some(if sample.generation == 1 {
+            1_000.0 + sample.seconds * 3.0
+        } else {
+            100.0
+        });
+    }
+    assert_eq!(
+        evidence.summary(&spec()).rss_growth_bytes_per_second,
+        Some(3.0)
+    );
+}
+
+#[test]
+fn qualification_missing_running_rss_cannot_pass_growth_checks() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = super::evidence::Evidence::new(directory.path()).unwrap();
+    for missing_second in [3, 8, 13, 18] {
+        evidence.samples = restart_samples();
+        evidence.samples[missing_second].rss_bytes = None;
+        assert_eq!(evidence.summary(&spec()).rss_growth_bytes_per_second, None);
+    }
+}
+
+#[test]
+fn qualification_drain_and_short_lived_processes_cannot_supply_rss_growth() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = super::evidence::Evidence::new(directory.path()).unwrap();
+    evidence.samples = restart_samples();
+    let mut spec = spec();
+    spec.seconds = 13;
+    // Only two post-warmup samples remain in generation 2; drain cannot complete its evidence.
+    assert_eq!(evidence.summary(&spec).rss_growth_bytes_per_second, None);
+    spec.warmup_seconds = 5;
+    assert_eq!(evidence.summary(&spec).rss_growth_bytes_per_second, None);
+    let summary = evidence.summary(&spec);
+    assert_eq!(summary.generations[1].rss_growth_start_seconds, None);
+    assert_eq!(summary.generations[1].rss_growth_samples, 0);
+}
+
+#[test]
+fn qualification_declared_rss_growth_needs_sample_count_and_duration_per_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut evidence = super::evidence::Evidence::new(directory.path()).unwrap();
+    let mut spec = spec();
+    spec.seconds = 3_660;
+    spec.warmup_seconds = 60;
+    spec.limits = Some(Limits {
+        visibility_ms: [1.0, 2.0, 3.0, 4.0],
+        rss_bytes: 1_000,
+        rss_growth_bytes_per_second: 0.0,
+        backlog_growth_rows_per_second: 0.0,
+        checkpoint_p99_ms: 1.0,
+        recovery_ms: 1.0,
+    });
+    for (count, interval, expected) in [(200, 1.0, Some(2.0)), (100, 1.0, None), (80, 10.0, None)] {
+        evidence.samples = (0..count)
+            .map(|second| {
+                let mut sample = restart_samples().remove(0);
+                sample.seconds = f64::from(second) * interval;
+                sample.rss_bytes = Some(100.0 + sample.seconds * 2.0);
+                sample
+            })
+            .collect();
+        assert_eq!(
+            evidence.summary(&spec).rss_growth_bytes_per_second,
+            expected
+        );
+    }
 }

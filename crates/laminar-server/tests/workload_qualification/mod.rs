@@ -130,7 +130,7 @@ fn run(spec: &Spec, directory: &Path) -> Result<()> {
     let summary = evidence.summary(spec);
     let verdict = check_limits(spec, &summary, &output, recovery_ms);
     let report = json!({
-        "schema":"laminardb-workload-observation/v1", "s12_qualified":false,
+        "schema":"laminardb-workload-observation/v2", "s12_qualified":false,
         "status":if verdict.is_err() { "failed" } else if spec.limits.is_some() { "run_limits_passed" } else { "observed" },
         "mode":"single", "delivery":"at_least_once", "composition":"kafka_to_kafka",
         "clock":"one observer-process monotonic Instant; includes producer delay and external consumer polling",
@@ -138,6 +138,7 @@ fn run(spec: &Spec, directory: &Path) -> Result<()> {
         "spec":spec, "resources":summary, "producer_schedule_lag":producer_lag,
         "output":output, "recovery_ms":recovery_ms,
         "limitations":["projection workload only; no tables, MVs or joins", "sampled process RSS; no total-host memory claim",
+            "RSS growth checks each sampled process generation separately, excluding its startup warmup and final drain",
             "backlog is offered minus externally observed rows, not an internal queue-byte gauge",
             "single run only; S12 requires repeated workload/fault matrix and separate mode/composition qualification",
             "slow/failed sinks, corrupt cuts, expired replay and G9 saturation/restart remain separate cases"]

@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 dependency findings still block CI/release. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix and a passing local release smoke matrix; production workload qualification remains open. S13 remains unimplemented.
+**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 dependency findings still block CI/release. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix, RSS evidence per process generation and passing local release diagnostics; production workload qualification remains open. S13 remains unimplemented.
 **Date:** 2026-09-21. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -270,8 +270,9 @@ and coordinator benchmarks/profiles pass.
 
 ### S12 — qualify the integrated workload (G5)
 
-**Status (2026-09-21):** the workload observer and local release smoke matrix pass, including
-the Kafka multi-source startup fix found during preparation. No production workload has been
+**Status (2026-09-21):** the workload observer, local release smoke matrix and repeated recovery
+diagnostics pass, including the Kafka multi-source startup fix and RSS measurement correction
+found during preparation. No production workload has been
 qualified. See the S12 execution evidence and the
 [workload harness instructions](../tests/qualification/README.md).
 
@@ -1948,3 +1949,80 @@ saturation → checkpoint → restart external-ledger cases. Qualify tables/MVs,
 each additional mode/composition separately, including applicable leader/rejoin/scale scenarios.
 These remain required evidence; neither the new observer nor the existing correctness soaks close
 them. S4 dependency findings still block release. S12 remains the active session; S13 is not started.
+
+### S12 — RSS evidence across process loss (2026-09-21)
+
+**Status:** measurement correction implemented and validated locally; S12 remains open.
+**Starting SHA:** `c6f3dbb429dd9a60e0f8d0f7b5160489e31faaf3`. The selected scope remains
+single-node Kafka → Kafka ALO projection. The user selected continued diagnostic fault testing;
+production workload targets remain unset. Production code, dependencies and admission are unchanged.
+
+Two failing regressions reproduced distinct measurement defects: a missing startup scrape after
+restart made RSS growth unavailable, while a healthy restarted process could hide growth in its
+predecessor because the original fit covered only the second half of the whole run. The failed
+regressions are retained in `target/s12-recovery-resources/restart-before.log`.
+
+Version 2 resource reports fit RSS separately for every observed process generation. Each fit
+uses the latter half of that generation's sampled post-warmup offered-load interval. The configured
+warmup is applied from each generation's first load sample; only missing RSS in that startup
+interval is excluded. Any missing RSS after warmup during offered load invalidates that
+generation's growth result, including gaps before the fitting window. Final drain cannot provide
+missing load evidence. The report retains per-generation intervals, fitting sample counts,
+missing-sample counts, peaks, slopes and final checkpoint p99. Overall RSS growth is the highest
+generation slope and is unavailable if any generation lacks usable evidence. Checkpoint p99 still
+retains the worst final histogram across generations.
+
+Diagnostic fits need three samples. Declared-limit fits additionally need at least 60 samples
+spanning 60 seconds per generation; the existing hour, warmup, latency-sample and checkpoint-sample
+requirements remain. Five new regressions cover startup gaps, a leaking predecessor, missing
+running-process RSS, drain/short-lived generations and the declared sampling floors. These changes
+are confined to the workload harness and its documentation, so no engine hot-path benchmark is
+required. Version 1 evidence remains available with its original measurement limitations.
+
+**Retained preparation failures:** the first Windows-mounted control delivered all 48,000 rows
+but overlapped an integration build and missed one RSS sample at 8.05 seconds. Its growth result
+is correctly unavailable. The following fault run was rejected: verification of the 803 MB
+executable preceded a kill at 63.08 seconds, after its 60-second input schedule had ended. The
+required post-death target was therefore beyond the input range, and the existing recovery guard
+refused success. Both bundles remain under `target/s12-recovery-resources/{steady,recovery}`.
+The replacement diagnostics use native Linux storage for executable copies and local checkpoints;
+this storage placement differs from the earlier Windows-mounted smoke matrix. These failures do
+not justify weakening the missing-sample or post-death recovery checks.
+
+**Validation:** 6,133 workspace library/server tests, eight checkpoint/recovery/shared-source
+integration tests and 89 non-ignored soak-harness tests passed. All 14 measurement tests also
+passed on the final Linux release harness. Both Clippy configurations, nightly formatting,
+readability, analytical-dependency policy and whitespace gates passed. Commands and logs are
+retained in `target/s12-recovery-resources/gates.json`.
+
+**Release diagnostics:** after the validation builds completed, a native-Linux steady control
+and three process-kill repetitions each ran a 60-second schedule with three seconds of latency
+warmup, four Zipf-distributed pipelines, 200 rows/second per pipeline, 128-byte payloads, 1,024
+keys, four source partitions and 500 ms checkpoints. The independent checker verified all
+**192,000 unique records**, no gaps, source routing, arithmetic, external offsets, latency
+quantiles, recovery events, RSS fits and every indexed artifact. The 965 replay duplicates are
+allowed by the declared ALO composition.
+
+| Run | ALO replays | Peak sampled RSS | Highest generation RSS growth | Recovery | Highest pipeline p99.9 upper bound |
+|---|---:|---:|---:|---:|---:|
+| Steady control | 0 | 86.31 MiB | 118.24 KiB/s | — | 5,457.9 ms |
+| Process kill 1 | 280 | 84.69 MiB | 0.00 KiB/s | 2,610.3 ms | 2,462.1 ms |
+| Process kill 2 | 273 | 83.66 MiB | 65.00 KiB/s | 1,603.4 ms | 593.4 ms |
+| Process kill 3 | 412 | 84.96 MiB | 20.17 KiB/s | 1,629.9 ms | 570.3 ms |
+
+Every process generation has usable diagnostic RSS evidence: 28 fitting samples in the control,
+and 14/13 before/after each restart, with no missing RSS after the configured warmup. These short
+fits do **not** establish an RSS plateau; the positive slopes and latency tails remain workload
+qualification concerns. Numerical limits were unset and all reports retain `s12_qualified: false`.
+
+The two immutable bundles are under `target/s12-recovery-resources/native/{steady,recovery}`;
+`native/resources-verified-summary.json` records independent verification. `final-verification.json`
+checks all 1,102 selected source/manifest files and confirms only the three workload Rust files
+and its README differ from the prior smoke source snapshot. The production executable remains
+byte-identical (`d174602bcf096dd97d3a7362eb7adc604099c904b3169e391683dac39666f4ef`). The disposable
+broker was stopped; topics, checkpoints and evidence were retained.
+
+**Next S12 work:** slow/failed sinks, corrupt cuts, expired replay and G9 durable saturation/restart
+external-ledger cases remain unexecuted in this workload. Production targets, three hour-long
+repetitions across the declared matrix, internal queue/capacity evidence and other mode/composition
+qualifications remain open. S4 still blocks release; S13 has not started.
