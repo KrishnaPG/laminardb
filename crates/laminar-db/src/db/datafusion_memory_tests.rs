@@ -79,6 +79,20 @@ async fn datafusion_memory_configuration_is_enforced_for_direct_and_builder_entr
 }
 
 #[test]
+fn operator_context_preserves_the_root_optimizer_sequence_once() {
+    let db = bounded_db(1024);
+    let state = db.ctx.state();
+    db.ctx
+        .add_optimizer_rule(Arc::clone(&state.optimizers()[0]));
+    let root = db.ctx.state();
+    let operator = db.create_operator_context().state();
+    assert_eq!(operator.optimizers().len(), root.optimizers().len());
+    for (actual, expected) in operator.optimizers().iter().zip(root.optimizers()) {
+        assert!(Arc::ptr_eq(actual, expected));
+    }
+}
+
+#[test]
 fn datafusion_memory_contexts_share_a_budget_across_generations_but_not_databases() {
     let db = bounded_db(1024);
     let other = bounded_db(1024);

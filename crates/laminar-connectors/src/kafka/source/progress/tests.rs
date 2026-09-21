@@ -541,6 +541,40 @@ async fn failed_lookup_is_unavailable_and_in_flight_shutdown_is_bounded() {
         .expect("retired native work must eventually release its generation");
 }
 
+#[tokio::test]
+async fn failed_consumer_creation_releases_progress_registration() {
+    let registry = Registry::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut source = KafkaSource::new(schema, KafkaSourceConfig::default(), Some(&registry));
+    let mut config = ConnectorConfig::new("kafka");
+    config.set("bootstrap.servers", "localhost:9092");
+    config.set("group.id", "progress-failed-startup");
+    config.set("topic", "events");
+    config.set("laminar.source.name", "failed-input");
+    config.set("kafka.laminar.invalid.setting", "true");
+    let error = source
+        .start(
+            SourceStart::new(
+                config,
+                SourcePosition::Initial,
+                DeliveryGuarantee::BestEffort,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("laminar.invalid.setting"),
+        "{error}"
+    );
+    assert_eq!(source.state, super::super::ConnectorState::Failed);
+    assert!(source.progress.is_none());
+    assert!(source.consumer.is_none());
+    let replacement = KafkaProgress::register(&registry, "failed-input").unwrap();
+    drop(replacement);
+    source.close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn named_source_start_and_close_own_progress_registration_and_task() {
     let cluster = MockCluster::new(1).unwrap();

@@ -174,7 +174,11 @@ impl SourceConnector for KafkaSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        self.start_inner(request).await
+        let result = self.start_inner(request).await;
+        if result.is_err() && self.state == ConnectorState::Initializing {
+            self.fail_startup();
+        }
+        result
     }
     async fn discover_schema(
         &mut self,

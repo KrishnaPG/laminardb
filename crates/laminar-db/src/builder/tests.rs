@@ -1003,14 +1003,27 @@ async fn builder_preserves_custom_function_registry_for_graph_contexts() {
     let result = db.execute("SELECT forty_two()").await;
     assert!(result.is_ok(), "UDF should be callable: {result:?}");
 
-    let graph_ctx = laminar_sql::create_session_context();
-    laminar_sql::register_streaming_functions(&graph_ctx);
-    db.register_custom_functions_into(&graph_ctx);
-    let graph_state = graph_ctx.state();
-    assert_eq!(graph_state.scalar_functions()["abs"].name(), "forty_two");
-    assert!(graph_state
-        .aggregate_functions()
-        .contains_key("custom_json_agg"));
+    for context in [db.create_operator_context(), db.create_auxiliary_context()] {
+        let state = context.state();
+        assert_eq!(state.scalar_functions()["abs"].name(), "forty_two");
+        assert!(state.scalar_functions().contains_key("tumble"));
+        assert!(state.aggregate_functions().contains_key("custom_json_agg"));
+        let batches = context
+            .sql("SELECT forty_two(), abs()")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        for column in batches[0].columns() {
+            let values = column
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            assert_eq!(values.value(0), 42);
+        }
+    }
 }
 
 #[tokio::test]

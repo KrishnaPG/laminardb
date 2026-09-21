@@ -51,14 +51,12 @@ impl LaminarDB {
             .with_config(session_config)
             .with_runtime_env(self.ctx.runtime_env())
             .with_default_features()
+            .with_optimizer_rules(state.optimizers().to_vec())
             .with_query_planner(Arc::clone(state.query_planner()));
         for rule in self.physical_optimizer_rules.iter() {
             state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
         }
         let context = SessionContext::new_with_state(state_builder.build());
-        for rule in state.optimizers() {
-            context.add_optimizer_rule(Arc::clone(rule));
-        }
         laminar_sql::register_streaming_functions(&context);
         self.register_custom_functions_into(&context);
         context
@@ -66,9 +64,12 @@ impl LaminarDB {
 
     // Keep temporary filter/diagnostic catalogs separate while retaining the DB's budget.
     pub(crate) fn create_auxiliary_context(&self) -> SessionContext {
-        SessionContext::new_with_config_rt(
+        let context = SessionContext::new_with_config_rt(
             laminar_sql::datafusion::base_session_config(),
             self.ctx.runtime_env(),
-        )
+        );
+        laminar_sql::register_streaming_functions(&context);
+        self.register_custom_functions_into(&context);
+        context
     }
 }

@@ -56,7 +56,6 @@ impl KafkaSource {
                                     avro_deser.register_schema(cached.id, &cached.schema_str)
                                 {
                                     let error = ConnectorError::Serde(error);
-                                    self.fail_startup();
                                     return Err(error);
                                 }
                                 // Keep the catalog schema pinned — planner
@@ -71,7 +70,6 @@ impl KafkaSource {
                             warn!(%subject, error = %e, "SR unavailable at start(), will resolve lazily");
                         }
                         Ok(Err(e)) => {
-                            self.fail_startup();
                             return Err(e);
                         }
                         Err(_elapsed) => {

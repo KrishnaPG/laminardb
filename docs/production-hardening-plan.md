@@ -2026,3 +2026,42 @@ broker was stopped; topics, checkpoints and evidence were retained.
 external-ledger cases remain unexecuted in this workload. Production targets, three hour-long
 repetitions across the declared matrix, internal queue/capacity evidence and other mode/composition
 qualifications remain open. S4 still blocks release; S13 has not started.
+
+### PR #540 — confirmed review fixes (2026-09-21)
+
+Reviewed all 40 Cubic inline comments against source and existing evidence. Six additional
+findings have scoped fixes, alongside the S12 RSS correction committed as `fb76edd5`:
+
+- Cluster DDL rejects ordinary SQL with multiple source frontiers before catalog mutation.
+  A two-source `UNION ALL` reproduced the admission bug before the fix. Managed joins retain
+  their separate validation; embedded and single-node query admission is unchanged.
+- Kafka startup has one failed-start cleanup owner at the connector lifecycle boundary. Consumer
+  creation, assignment and schema-prefetch errors release progress registration and retire
+  consumer work consistently. This applies to all deployment modes.
+- Operator contexts inherit the root logical optimizer sequence once; auxiliary contexts register
+  streaming and custom functions, including aliases. Both retain the DB's shared runtime/budget.
+- Reference-table quota errors retain their public Query classification and detailed message.
+- Helm ServiceMonitor uses the service application-name label as its scrape job, so the default
+  `job="laminardb"` alert selector is independent of the Helm release name. A custom `nameOverride`
+  also changes this application label and requires corresponding custom alert selectors.
+
+The CI failures are actual S4 dependency findings: the two quick-xml advisories, RSA, unmaintained
+paste and proc-macro-error2; audit additionally rejects unmaintained instant in the broader locked
+graph. Cargo Deny's bans, licenses and sources pass. Current registry metadata still offers no
+compatible object_store 0.13/OpenDAL 0.57 repair, and RSA has no patched release listed. No dependency
+exception, scanner suppression or analytical-generation upgrade is included in this follow-up.
+
+Comment-by-comment verdicts and the downloaded CI/review evidence are retained locally under
+`target/pr540-followup/`. Temporary MV staging remains unbounded by its retained-state quota;
+unchecked upsert input schemas and other confirmed findings in that report also remain open.
+Historical baseline findings and intentional evidence floors were not rewritten as defects.
+No coordinator-cycle or core-operator code changed. S4 and production qualification remain open.
+
+Validation: the two-source admission regression failed before the fix. The final workspace library
+and server-binary suite, with `laminar-db/cluster` enabled, passed **6,136 tests, zero failed,
+one existing ignored**. This includes the startup cleanup, custom-function, optimizer-sequence
+and API-error regressions. Helm lint and rendered service/monitor/alert label checks pass for two
+different release names. Startup cleanup preserves pre-I/O validation retryability and running-source
+state while releasing failed `Initializing` attempts.
+Both Clippy configurations, nightly formatting, readability, analytical dependency consistency and
+whitespace checks pass. The CI security/advisory findings above remain release-blocking.
