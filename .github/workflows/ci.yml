@@ -417,6 +417,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Verify dependency exception policy and security backport
+        run: |
+          python3 tools/check_dependency_exceptions.py
+          python3 -m unittest discover -s tools -p 'test_dependency_exceptions.py'
+      - name: Test XML security backport
+        run: cargo test --manifest-path vendor/quick-xml/Cargo.toml --all-features --lib --locked
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit --deny warnings
 
@@ -428,6 +434,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Verify dependency exception policy and security backport
+        run: python3 tools/check_dependency_exceptions.py
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --locked --workspace

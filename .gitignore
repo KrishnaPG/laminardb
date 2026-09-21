@@ -50,6 +50,8 @@ checkpoints/
 wal/
 /tools/*
 !/tools/check_analytical_dependencies.py
+!/tools/check_dependency_exceptions.py
+!/tools/test_dependency_exceptions.py
 !/tools/run_workload_qualification.py
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
@@ -87,6 +89,7 @@ gha-creds-*.json
 
 # Vendored library packages use the workspace lockfile.
 /vendor/*/Cargo.lock
+!/vendor/quick-xml/Cargo.lock
 /examples/binance-ws/target
 /examples/binance-ws/target/debug
 /examples/binance-ws/target
