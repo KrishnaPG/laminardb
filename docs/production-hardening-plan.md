@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 dependency findings still block CI/release. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix, RSS evidence per process generation and passing local release diagnostics; production workload qualification remains open. S13 remains unimplemented.
+**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 workspace audit/deny checks pass locally with temporary exceptions expiring 2026-10-21; registry crate publication remains blocked while the XML fix requires a workspace patch. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix, RSS evidence per process generation and passing local release diagnostics; production workload qualification remains open. S13 remains unimplemented.
 **Date:** 2026-09-21. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -1950,7 +1950,7 @@ each additional mode/composition separately, including applicable leader/rejoin/
 These remain required evidence; neither the new observer nor the existing correctness soaks close
 them. S4 dependency findings still block release. S12 remains the active session; S13 is not started.
 
-### S12 — RSS evidence across process loss (2026-09-21)
+#### RSS evidence across process loss (2026-09-21)
 
 **Status:** measurement correction implemented and validated locally; S12 remains open.
 **Starting SHA:** `c6f3dbb429dd9a60e0f8d0f7b5160489e31faaf3`. The selected scope remains
@@ -2065,3 +2065,89 @@ different release names. Startup cleanup preserves pre-I/O validation retryabili
 state while releasing failed `Initializing` attempts.
 Both Clippy configurations, nightly formatting, readability, analytical dependency consistency and
 whitespace checks pass. The CI security/advisory findings above remain release-blocking.
+
+### S4/S11 — dependency remediation and bounded MV staging (2026-09-21)
+
+This follow-up supersedes the open XML, temporary MV staging and input-schema findings above.
+The two quick-xml 0.39.4 security fixes are backported from upstream without migrating the
+Arrow/DataFusion/object_store generation. Provenance, compatibility adjustments and exact source
+verification are recorded in `vendor/quick-xml/SECURITY-BACKPORT.md`. The backport applies to all
+three modes built from this workspace. Published embedded-library consumers must apply the patch
+in their application's root manifest: Cargo does not propagate this workspace patch to them.
+Registry crate publication is consequently blocked before upload while the backport is required;
+the release guard prevents a green workspace scan from publishing an unfixed XML dependency.
+
+The four residual findings (RSA, paste, proc-macro-error2 and instant) were explicitly accepted on
+2026-09-21 until **2026-10-21 UTC**, owned by the LaminarDB maintainers responsible for PR #540.
+RSA remains a real residual confidentiality risk; signing-only reachability does not prove the
+absence of timing leakage. The two XML version exceptions require the verified patched source.
+See [`security/dependency-exceptions.md`](../security/dependency-exceptions.md). Both required CI
+scanner jobs now reject expiry, package/source/checksum drift, backport modification and ignore-list
+disagreement before scanning. There is no severity relaxation or automatic renewal.
+
+Embedded and single-node MV preflight now validates declared column names, order, types and
+non-null values before key indexing or scalar conversion, including empty batches. Keyed inputs
+require exactly one Int64 `__weight` column; upsert keys index the plain columns even when the
+weight appears first. All affected views remain unchanged on any schema or quota rejection.
+Cluster MV admission remains closed.
+
+Keyed staging admits at most twice the live row and byte limits plus bounded entry metadata,
+allowing replacement and retraction before final-state admission. Replacement releases the old
+staged charge and a cancelled multiset delta is removed immediately. A separate conservative
+input estimate rejects oversized batches and repeated dictionary/view expansion before Arrow
+row conversion. View lengths and the largest dictionary value are charged without multiplying
+descriptor/key buffers per row; ordinary 16,384-row dictionary/view batches remain admissible.
+Oversized net-neutral cycles can now fail even when their final state would fit.
+This remains a per-view charge, not a whole-process RSS bound: live stores, staged views, input
+batches, one candidate scalar row, converter scratch, map spare capacity and publication or
+checkpoint materialization can coexist.
+
+Security validation: cargo-audit 0.22.2 with `--deny warnings` and cargo-deny 0.20.2 pass using
+RustSec revision `57ad4063bb49c1deb04b6fcee30cfbac6b508474`. Seven policy fault tests cover expiry,
+scanner disagreement, version/source/checksum/duplicate drift, source tampering and rejection
+of registry publication with a workspace-only patch. The XML
+backport passes 1,450 upstream/local unit tests (six existing ignores), including the default
+256/257 namespace boundary through both reader APIs and Serde response deserialization.
+All 43 Cubic comments were classified in `target/security-mv-fixes/cubic-validation.md`.
+The latest three follow-ups correct the backlog-window wording, clarify the RSS section heading
+and independently test the RSS duration floor. All 14 qualification tests pass. Other confirmed
+findings outside this follow-up retain their prior open status.
+The full workspace library and server-binary suite with `laminar-db/cluster` enabled passes
+6,142 tests, zero failures and one existing ignore. Both Clippy configurations, nightly formatting,
+readability, analytical dependency consistency and whitespace checks pass. The 52 MV tests include
+schema and multi-view atomicity, staging bounds, ordinary dictionary/view batches and aliased
+payload rejection. A focused Arrow probe reproduced the earlier overestimate before its correction.
+Performance validation compares `90151cd8` with the final source using Rust 1.95.0 in WSL,
+CPU affinity `0,2,4,6`, 100 Criterion samples, two-second warmup and ten-second measurement.
+Each update measurement contains two 1,024-row cycles. Final means in microseconds:
+
+| Mode | 16-byte values, before → after | 4,096-byte values, before → after |
+| --- | --- | --- |
+| Aggregate | 0.256 → 0.284 (+11.09%) | 0.251 → 0.282 (+12.56%) |
+| Append | 0.293 → 0.307 (+4.86%) | 0.292 → 0.308 (+5.65%) |
+| Upsert | 1,049.090 → 1,075.586 (+2.53%) | 2,761.553 → 2,590.633 (-6.19%) |
+| Multiset | 1,276.241 → 1,278.428 (+0.17%) | 38,410.663 → 33,599.206 (-12.53%) |
+
+The changes above 5% are explained by mandatory per-batch schema preflight: Aggregate adds
+28–32 ns per pair of cycles across both widths; wide Append adds about 16 ns. The Aggregate
+CPU profile shows preflight self time increasing from 4.24% to 8.35%, with schema datatype
+comparison appearing in the final profile. This closes malformed-input admission without
+adding per-row work to those two modes. Their profiled peak heap remains 21.79 MB.
+The earlier wide Upsert snapshot outlier reverses to -7.29%; narrow Aggregate checkpoint
+changes by +2.51%. The broader initial run also covered core latency and four coordinator
+query controls, all within 5%; those unchanged controls were not repeated.
+
+Final CPU/allocation profiles cover all four modes. Final IPC is 3.77 Append, 3.57 Aggregate,
+1.32 wide Upsert and 2.71 wide Multiset. Wide Upsert was already below the 2.0 rule of thumb
+(1.35 baseline), with scalar conversion/allocation prominent in both profiles; this remains
+an optimization opportunity despite the lower measured update time. Its peak heap changes
+from 26.45 to 26.49 MB, including bounded staging metadata; Multiset remains 39.53 MB.
+Heap profiles include fixture setup and are not a production RSS envelope. The existing Append
+fixture retains eight batches before snapshot cases, so its 1,024-row label is not an isolated
+snapshot size. No benchmark fixture was changed for this comparison.
+
+All 43 profile commands passed. Commands, binary/source hashes, comparisons, CPU samples,
+allocation summaries and the Cubic verdicts are retained under `target/security-mv-fixes/`.
+Dictionary-typed Multiset snapshot reconstruction still has a pre-existing schema mismatch;
+the staging regression checks retained state directly and does not qualify that materializer.
+S12 production qualification remains open.

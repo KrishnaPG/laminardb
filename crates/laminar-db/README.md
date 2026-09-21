@@ -204,11 +204,22 @@ Replacements, deletes and append eviction release the corresponding live charge.
 
 These are per-view live-state limits, not an RSS limit. Hash-map spare capacity,
 schema/converter/allocator overhead, unreported external ownership and caller-held inputs are
-separate. Cycle preflight retains staged keyed deltas for every affected MV at once, plus the
-existing output batches. It does not clone live row maps or old append batches. Delta scratch
-scales with input rows and their scalar/key widths, so configure source and graph admission
-as well. Recovery may hold the old stores, decoded checkpoint batches and private quota-checked
-replacement stores together. Query/subscriber materialization and pinned checkpoint captures
+separate. Keyed cycle staging is bounded to twice the configured row and byte limits, plus
+fixed metadata for at most that many staged entries. This permits full replacement and old-row
+retractions before final live-state admission. Replaced values and cancelled multiset deltas
+release their staging charge. Each input batch must also fit a conservative Arrow row-encoding
+estimate under those staging limits before conversion. String/binary views charge their logical
+lengths; dictionaries reserve the largest value per row as well as conversion scratch. Large
+net-neutral cycles, complex dictionary values or heavily aliased inputs can therefore
+be rejected even if their final live state would fit. All modes validate input column names,
+types and nullability before staging; keyed input requires exactly one Int64 weight column.
+
+Cycle preflight retains staged deltas for every affected MV at once, plus existing output
+batches, one candidate scalar row and conversion scratch. These separate per-view charges do not
+establish a combined process bound; configure source and graph admission and reserve headroom as
+well. It does not clone live row maps or old append batches. Recovery may hold old stores, decoded
+checkpoint batches and private quota-checked replacement stores together. Query/subscriber
+materialization and pinned checkpoint captures
 need additional headroom and retain their existing separate guards.
 
 ## Feature Flags

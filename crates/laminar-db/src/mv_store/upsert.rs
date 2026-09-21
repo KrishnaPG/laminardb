@@ -1,6 +1,7 @@
 //! Keyed MV snapshots with quota-checked replacement and deletion deltas.
 
 use super::admission::{size_overflow, MvLimits};
+use super::staging::StagingBudget;
 use super::weight_and_plain_cols;
 use crate::error::DbError;
 use arrow::array::{Array, ArrayRef, RecordBatch};
@@ -20,9 +21,17 @@ pub(super) struct UpsertState {
 }
 
 pub(super) struct UpsertDelta {
-    rows: HashMap<OwnedRow, Option<Vec<ScalarValue>>>,
+    rows: HashMap<OwnedRow, StagedRow>,
     bytes: usize,
 }
+
+struct StagedRow {
+    values: Option<Vec<ScalarValue>>,
+    bytes: usize,
+}
+
+const STAGED_ROW_OVERHEAD: usize =
+    std::mem::size_of::<StagedRow>() - std::mem::size_of::<Vec<ScalarValue>>();
 
 impl UpsertState {
     pub(super) fn new(schema: &SchemaRef, key_cols: &[usize]) -> Result<Self, DbError> {
@@ -48,11 +57,11 @@ impl UpsertState {
         })
     }
 
-    fn keys(&self, batch: &RecordBatch) -> Result<arrow::row::Rows, DbError> {
+    fn keys(&self, batch: &RecordBatch, plain_cols: &[usize]) -> Result<arrow::row::Rows, DbError> {
         let key_arrays: Vec<ArrayRef> = self
             .key_cols
             .iter()
-            .map(|&c| Arc::clone(batch.column(c)))
+            .map(|&c| Arc::clone(batch.column(plain_cols[c])))
             .collect();
         self.key_converter
             .convert_columns(&key_arrays)
@@ -75,14 +84,17 @@ impl UpsertState {
     /// Stage `+weight` upserts and `-weight` deletes without touching live state.
     fn stage_batch(
         &self,
+        name: &str,
         batch: &RecordBatch,
-        staged: &mut HashMap<OwnedRow, Option<Vec<ScalarValue>>>,
+        staged: &mut HashMap<OwnedRow, StagedRow>,
+        budget: &mut StagingBudget,
     ) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
         let (weights, plain_cols) = weight_and_plain_cols(batch)?;
-        let keys = self.keys(batch)?;
+        budget.validate_input(name, batch)?;
+        let keys = self.keys(batch, &plain_cols)?;
 
         for row_idx in 0..batch.num_rows() {
             if weights.is_null(row_idx) {
@@ -90,9 +102,12 @@ impl UpsertState {
                     "upsert MV weight is null at row {row_idx}"
                 )));
             }
-            let key = keys.row(row_idx).owned();
             let w = weights.value(row_idx);
-            if w > 0 {
+            if w == 0 {
+                continue;
+            }
+            let key = keys.row(row_idx).owned();
+            let values = if w > 0 {
                 let mut vals = Vec::with_capacity(plain_cols.len());
                 for &c in &plain_cols {
                     vals.push(
@@ -100,9 +115,27 @@ impl UpsertState {
                             .map_err(|e| DbError::Storage(format!("upsert MV scalar: {e}")))?,
                     );
                 }
-                staged.insert(key, Some(vals));
-            } else if w < 0 {
-                staged.insert(key, None);
+                Some(vals)
+            } else {
+                None
+            };
+            let bytes = match &values {
+                Some(values) => Self::row_size(&key, values)?
+                    .checked_add(STAGED_ROW_OVERHEAD)
+                    .ok_or_else(size_overflow)?,
+                None => std::mem::size_of::<(OwnedRow, StagedRow)>()
+                    .checked_add(key.as_ref().len())
+                    .ok_or_else(size_overflow)?,
+            };
+            match staged.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    budget.replace(name, Some(entry.get().bytes), Some(bytes))?;
+                    entry.insert(StagedRow { values, bytes });
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    budget.replace(name, None, Some(bytes))?;
+                    entry.insert(StagedRow { values, bytes });
+                }
             }
         }
         Ok(())
@@ -115,8 +148,9 @@ impl UpsertState {
         limits: MvLimits,
     ) -> Result<UpsertDelta, DbError> {
         let mut staged = HashMap::new();
+        let mut budget = StagingBudget::new(limits, STAGED_ROW_OVERHEAD);
         for batch in batches {
-            self.stage_batch(batch, &mut staged)?;
+            self.stage_batch(name, batch, &mut staged, &mut budget)?;
         }
         let (mut rows, mut removed, mut added) = (self.rows.len(), 0usize, 0usize);
         for (key, replacement) in &staged {
@@ -126,9 +160,9 @@ impl UpsertState {
                     .ok_or_else(size_overflow)?;
                 rows -= 1;
             }
-            if let Some(values) = replacement {
+            if replacement.values.is_some() {
                 added = added
-                    .checked_add(Self::row_size(key, values)?)
+                    .checked_add(replacement.bytes - STAGED_ROW_OVERHEAD)
                     .ok_or_else(size_overflow)?;
                 rows = rows.checked_add(1).ok_or_else(size_overflow)?;
             }
@@ -147,7 +181,7 @@ impl UpsertState {
 
     pub(super) fn apply_prepared(&mut self, delta: UpsertDelta) {
         for (key, replacement) in delta.rows {
-            if let Some(values) = replacement {
+            if let Some(values) = replacement.values {
                 self.rows.insert(key, values);
             } else {
                 self.rows.remove(&key);
@@ -166,7 +200,8 @@ impl UpsertState {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let keys = self.keys(batch)?;
+        let plain_cols: Vec<usize> = (0..batch.num_columns()).collect();
+        let keys = self.keys(batch, &plain_cols)?;
         for row_idx in 0..batch.num_rows() {
             let key = keys.row(row_idx).owned();
             let mut vals = Vec::with_capacity(batch.num_columns());

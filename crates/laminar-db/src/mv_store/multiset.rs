@@ -1,6 +1,7 @@
 //! Counted MV rows with live quotas and cached snapshot expansion admission.
 
 use super::admission::{size_overflow, MvLimits};
+use super::staging::StagingBudget;
 use super::weight_and_plain_cols;
 use crate::error::DbError;
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
@@ -71,6 +72,9 @@ pub(super) struct MultisetDelta {
     expansion: Expansion,
 }
 
+const STAGED_ROW_OVERHEAD: usize =
+    std::mem::size_of::<(OwnedRow, i128)>() - std::mem::size_of::<(OwnedRow, i64)>();
+
 fn row_size(key: &OwnedRow) -> Result<usize, DbError> {
     std::mem::size_of::<(OwnedRow, i64)>()
         .checked_add(key.as_ref().len())
@@ -98,13 +102,16 @@ impl MultisetState {
 
     fn stage_batch(
         &self,
+        name: &str,
         batch: &RecordBatch,
         deltas: &mut HashMap<OwnedRow, i128>,
+        budget: &mut StagingBudget,
     ) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
         let (weights, plain_indices) = weight_and_plain_cols(batch)?;
+        budget.validate_input(name, batch)?;
         let plain_cols: Vec<ArrayRef> = plain_indices
             .iter()
             .map(|&c| Arc::clone(batch.column(c)))
@@ -125,11 +132,26 @@ impl MultisetState {
                 continue;
             }
             let key = rows.row(row_idx).owned();
-            let prior = deltas.get(&key).copied().unwrap_or(0);
-            let delta = prior.checked_add(i128::from(w)).ok_or_else(|| {
-                DbError::Storage("multiset MV staged multiplicity overflow".into())
-            })?;
-            deltas.insert(key, delta);
+            let bytes = row_size(&key)?
+                .checked_add(STAGED_ROW_OVERHEAD)
+                .ok_or_else(size_overflow)?;
+            match deltas.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let delta = entry.get().checked_add(i128::from(w)).ok_or_else(|| {
+                        DbError::Storage("multiset MV staged multiplicity overflow".into())
+                    })?;
+                    if delta == 0 {
+                        budget.replace(name, Some(bytes), None)?;
+                        entry.remove();
+                    } else {
+                        entry.insert(delta);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    budget.replace(name, None, Some(bytes))?;
+                    entry.insert(i128::from(w));
+                }
+            }
         }
         Ok(())
     }
@@ -143,8 +165,9 @@ impl MultisetState {
         snapshot: bool,
     ) -> Result<MultisetDelta, DbError> {
         let mut deltas = HashMap::new();
+        let mut budget = StagingBudget::new(limits, STAGED_ROW_OVERHEAD);
         for batch in batches {
-            self.stage_batch(batch, &mut deltas)?;
+            self.stage_batch(name, batch, &mut deltas, &mut budget)?;
         }
 
         let mut resolved = Vec::with_capacity(deltas.len());

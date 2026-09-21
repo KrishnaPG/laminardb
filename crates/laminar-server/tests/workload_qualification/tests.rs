@@ -313,7 +313,13 @@ fn qualification_declared_rss_growth_needs_sample_count_and_duration_per_generat
         checkpoint_p99_ms: 1.0,
         recovery_ms: 1.0,
     });
-    for (count, interval, expected) in [(200, 1.0, Some(2.0)), (100, 1.0, None), (80, 10.0, None)] {
+    for (count, interval, expected) in [
+        (200, 1.0, Some(2.0)),
+        (100, 1.0, None),
+        (80, 10.0, None),
+        // 180 growth samples span only 44.75 seconds: duration alone rejects the fit.
+        (600, 0.25, None),
+    ] {
         evidence.samples = (0..count)
             .map(|second| {
                 let mut sample = restart_samples().remove(0);

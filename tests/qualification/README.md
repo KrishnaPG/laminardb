@@ -59,7 +59,7 @@ object containing every field below, using workload-approved values:
 | `visibility_ms` | Ordered array of p50, p95, p99, p99.9 ceilings, applied to each pipeline |
 | `rss_bytes` | Maximum sampled server RSS |
 | `rss_growth_bytes_per_second` | Maximum fitted RSS slope across process generations; each fit uses the latter half of that generation's sampled post-warmup offered-load interval |
-| `backlog_growth_rows_per_second` | Maximum fitted offered-minus-observed backlog slope over the same window |
+| `backlog_growth_rows_per_second` | Maximum fitted offered-minus-observed backlog slope over the global second half of offered load, across all process generations |
 | `checkpoint_p99_ms` | Maximum final cumulative checkpoint p99 upper bound across process generations |
 | `recovery_ms` | Kill to a continuous externally visible prefix including a post-death scheduled input, plus a checkpoint completed by the restarted process |
 

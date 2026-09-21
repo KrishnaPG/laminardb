@@ -1,5 +1,5 @@
 use super::*;
-use arrow::array::{Int64Array, StringArray, StringViewArray};
+use arrow::array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 fn batch(ids: &[i64], width: usize) -> RecordBatch {
@@ -37,6 +37,221 @@ fn modes() -> [MvStorageMode; 4] {
         MvStorageMode::Upsert { key_cols: vec![0] },
         MvStorageMode::Multiset,
     ]
+}
+
+#[test]
+fn schema_mismatches_are_rejected_before_any_view_changes() {
+    let original = batch(&[1], 1);
+    let malformed = [
+        RecordBatch::try_from_iter(vec![(
+            "wrong",
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+        )])
+        .unwrap(),
+        RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+        )])
+        .unwrap(),
+        RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from(vec![2])) as ArrayRef),
+            ("value", Arc::new(Int64Array::from(vec![3])) as ArrayRef),
+        ])
+        .unwrap(),
+        RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from(vec![None])) as ArrayRef),
+            ("value", Arc::new(StringArray::from(vec!["x"])) as ArrayRef),
+        ])
+        .unwrap(),
+        RecordBatch::new_empty(Arc::new(Schema::empty())),
+    ];
+    for mode in modes()
+        .into_iter()
+        .chain([MvStorageMode::Upsert { key_cols: vec![1] }])
+    {
+        let mut store = store(64, 64 * 1024);
+        store
+            .create_mv("first", original.schema(), MvStorageMode::Aggregate)
+            .unwrap();
+        store
+            .create_mv("second", original.schema(), mode.clone())
+            .unwrap();
+        store
+            .update_cycle("first", std::slice::from_ref(&original))
+            .unwrap();
+        store
+            .update_cycle("second", &[input(&original, &mode, 1)])
+            .unwrap();
+        let bytes = store.total_bytes();
+        for invalid in &malformed {
+            let first = [batch(&[7], 1)];
+            let second = [input(invalid, &mode, 1)];
+            assert!(matches!(
+                store.update_views([("first", first.as_slice()), ("second", second.as_slice())]),
+                Err(DbError::MaterializedView(_))
+            ));
+            assert_eq!(ids(&store, "first"), [1]);
+            assert_eq!(ids(&store, "second"), [1]);
+            assert_eq!(store.total_bytes(), bytes);
+        }
+    }
+}
+
+#[test]
+fn upsert_keys_follow_plain_columns_when_weight_is_first() {
+    let mode = MvStorageMode::Upsert { key_cols: vec![0] };
+    let data = batch(&[2, 3], 1);
+    let weighted = input(&data, &mode, 1);
+    let reordered = weighted.project(&[2, 0, 1]).unwrap();
+    let mut store = store(4, 64 * 1024);
+    store.create_mv("v", data.schema(), mode).unwrap();
+    store.update_cycle("v", &[reordered]).unwrap();
+    assert_eq!(ids(&store, "v"), [2, 3]);
+}
+
+#[test]
+fn keyed_staging_is_bounded_across_batches_even_when_final_state_would_fit() {
+    for mode in [
+        MvStorageMode::Upsert { key_cols: vec![0] },
+        MvStorageMode::Multiset,
+    ] {
+        for (rows, bytes, width, count) in [(2, 65536, 1, 5), (64, 1024, 512, 12)] {
+            let original = batch(&[0], 1);
+            let mut store = store(rows, bytes);
+            store
+                .create_mv("first", original.schema(), MvStorageMode::Aggregate)
+                .unwrap();
+            store
+                .create_mv("second", original.schema(), mode.clone())
+                .unwrap();
+            store
+                .update_cycle("first", std::slice::from_ref(&original))
+                .unwrap();
+            store
+                .update_cycle("second", &[input(&original, &mode, 1)])
+                .unwrap();
+            let old_bytes = store.total_bytes();
+            let values: Vec<_> = (1..=count).map(|id| batch(&[id], width)).collect();
+            let updates: Vec<_> = values
+                .iter()
+                .map(|value| input(value, &mode, 1))
+                .chain(values.iter().map(|value| input(value, &mode, -1)))
+                .collect();
+            let first = [batch(&[9], 1)];
+            assert!(
+                matches!(
+                    store.update_views([
+                        ("first", first.as_slice()),
+                        ("second", updates.as_slice())
+                    ]),
+                    Err(DbError::MaterializedViewQuotaExceeded { .. })
+                ),
+                "{mode:?}"
+            );
+            assert_eq!(ids(&store, "first"), [0]);
+            assert_eq!(ids(&store, "second"), [0]);
+            assert_eq!(store.total_bytes(), old_bytes);
+        }
+    }
+}
+
+#[test]
+fn repeated_dictionary_and_view_values_are_bounded_before_row_encoding() {
+    use arrow::array::{DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+    let array = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![0; 512]),
+        Arc::new(StringArray::from(vec!["x".repeat(4096)])),
+    )
+    .unwrap();
+    let seed = StringViewArray::from(vec!["x".repeat(4096)]);
+    let views = StringViewArray::new(
+        vec![seed.views()[0]; 512].into(),
+        seed.data_buffers().to_vec(),
+        None,
+    );
+    for payload in [Arc::new(array) as ArrayRef, Arc::new(views)] {
+        let data = RecordBatch::try_from_iter(vec![("value", payload)]).unwrap();
+        for mode in [
+            MvStorageMode::Upsert { key_cols: vec![0] },
+            MvStorageMode::Multiset,
+        ] {
+            let mut store = store(1024, 64 * 1024);
+            store.create_mv("v", data.schema(), mode.clone()).unwrap();
+            assert!(matches!(
+                store.update_cycle("v", &[input(&data, &mode, 1)]),
+                Err(DbError::MaterializedViewQuotaExceeded { .. })
+            ));
+            assert_eq!(store.total_bytes(), 0);
+            assert_eq!(store.to_record_batch("v").unwrap().unwrap().num_rows(), 0);
+        }
+    }
+}
+
+#[test]
+fn ordinary_dictionary_and_view_batches_fit_staging_budget() {
+    use arrow::array::{DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+    let dictionary = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from_iter_values(0..16_384),
+        Arc::new(StringArray::from(vec!["ordinary value"; 16_384])),
+    )
+    .unwrap();
+    let views = StringViewArray::from(vec!["ordinary value"; 16_384]);
+    for payload in [Arc::new(dictionary) as ArrayRef, Arc::new(views)] {
+        let data = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..16_384)) as ArrayRef,
+            ),
+            ("value", payload),
+        ])
+        .unwrap();
+        for mode in [
+            MvStorageMode::Upsert { key_cols: vec![0] },
+            MvStorageMode::Multiset,
+        ] {
+            let mut store = store(32_768, 64 * 1024 * 1024);
+            store.create_mv("v", data.schema(), mode.clone()).unwrap();
+            store.update_cycle("v", &[input(&data, &mode, 1)]).unwrap();
+            let entry = &store.entries["v"];
+            let retained = if let Some(upsert) = &entry.upsert {
+                upsert.rows.len()
+            } else {
+                entry.multiset.as_ref().unwrap().counts.len()
+            };
+            assert_eq!(retained, 16_384);
+        }
+    }
+}
+
+#[test]
+fn keyed_staging_releases_replaced_values_and_cancelled_deltas() {
+    let plain = batch(&[1], 64);
+    let upsert = MvStorageMode::Upsert { key_cols: vec![0] };
+    let mut keyed = store(1, 1024);
+    keyed
+        .create_mv("v", plain.schema(), upsert.clone())
+        .unwrap();
+    let updates: Vec<_> = (1..=20)
+        .map(|width| input(&batch(&[1], width * 4), &upsert, 1))
+        .collect();
+    keyed.update_cycle("v", &updates).unwrap();
+    assert_eq!(ids(&keyed, "v"), [1]);
+
+    let mut counted = store(1, 1024);
+    counted
+        .create_mv("v", plain.schema(), MvStorageMode::Multiset)
+        .unwrap();
+    let updates: Vec<_> = (1..=20)
+        .flat_map(|id| {
+            let data = batch(&[id], 64);
+            [1, -1].map(|weight| input(&data, &MvStorageMode::Multiset, weight))
+        })
+        .collect();
+    counted.update_cycle("v", &updates).unwrap();
+    assert!(ids(&counted, "v").is_empty());
+    assert_eq!(counted.total_bytes(), 0);
 }
 
 fn store(rows: usize, bytes: usize) -> MvStore {

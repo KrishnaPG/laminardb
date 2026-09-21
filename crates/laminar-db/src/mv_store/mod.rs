@@ -14,6 +14,7 @@ use crate::error::DbError;
 mod admission;
 mod checkpoint;
 mod multiset;
+mod staging;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
 use multiset::MultisetState;
@@ -61,7 +62,7 @@ impl MvStorageMode {
 /// Split a `__weight` changelog batch into its Int64 weight column and the non-weight column indices.
 fn weight_and_plain_cols(batch: &RecordBatch) -> Result<(&Int64Array, Vec<usize>), DbError> {
     let weight_idx = batch
-        .schema()
+        .schema_ref()
         .index_of(WEIGHT_COLUMN)
         .map_err(|e| DbError::Storage(format!("MV changelog missing weight: {e}")))?;
     let weights = batch

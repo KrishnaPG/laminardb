@@ -49,6 +49,51 @@ pub(super) fn size_overflow() -> DbError {
 }
 
 impl MvEntry {
+    fn validate_input_schema(&self, name: &str, batch: &RecordBatch) -> Result<(), DbError> {
+        let weighted = matches!(
+            self.mode,
+            MvStorageMode::Upsert { .. } | MvStorageMode::Multiset
+        );
+        let schema = batch.schema_ref();
+        if !weighted && std::sync::Arc::ptr_eq(&self.schema, schema) {
+            return Ok(());
+        }
+        let mut expected = self.schema.fields().iter();
+        let mut weights = 0;
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            if weighted && field.name() == super::WEIGHT_COLUMN {
+                weights += 1;
+                if field.data_type() != &arrow::datatypes::DataType::Int64 {
+                    return Err(DbError::MaterializedView(format!(
+                        "MV '{name}' weight must be Int64"
+                    )));
+                }
+                continue;
+            }
+            let valid = expected.next().is_some_and(|expected| {
+                expected.name() == field.name()
+                    && expected.data_type() == field.data_type()
+                    && (expected.is_nullable() || column.null_count() == 0)
+            });
+            if !valid {
+                return Err(DbError::MaterializedView(format!(
+                    "MV '{name}' input schema does not match its declared schema"
+                )));
+            }
+        }
+        if weighted && weights == 0 {
+            return Err(DbError::MaterializedView(format!(
+                "MV '{name}' changelog is missing weight"
+            )));
+        }
+        if expected.next().is_some() || weights != usize::from(weighted) {
+            return Err(DbError::MaterializedView(format!(
+                "MV '{name}' input schema does not match its declared schema"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_cycle<'a>(
         &self,
         name: &str,
@@ -56,6 +101,9 @@ impl MvEntry {
         limits: MvLimits,
         snapshot: bool,
     ) -> Result<PreparedUpdate<'a>, DbError> {
+        for batch in batches {
+            self.validate_input_schema(name, batch)?;
+        }
         if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(PreparedUpdate::Unchanged);
         }

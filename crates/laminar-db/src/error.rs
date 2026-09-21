@@ -182,17 +182,17 @@ pub enum DbError {
     /// Materialized view error
     MaterializedView(String),
 
-    /// A local materialized-view update or restore exceeded its live quota before mutation.
+    /// A local materialized-view update or restore exceeded its live or staging quota.
     MaterializedViewQuotaExceeded {
         /// View whose projected state was rejected.
         view: String,
-        /// Projected live row count (distinct rows for multisets).
+        /// Projected live or staged row count (distinct rows for multisets).
         rows: usize,
         /// Projected retained-memory charge.
         bytes: usize,
-        /// Configured per-view row limit.
+        /// Effective per-view row limit for the rejected phase.
         max_rows: usize,
-        /// Configured per-view byte limit.
+        /// Effective per-view byte limit for the rejected phase.
         max_bytes: usize,
     },
 
