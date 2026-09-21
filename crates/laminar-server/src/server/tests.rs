@@ -1,5 +1,22 @@
 use super::*;
 
+#[tokio::test]
+async fn graph_input_limit_is_validated_before_server_mode_routing() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.mode = mode;
+        config.server.pipeline_max_input_buf_bytes = Some(0);
+        let error = run_server(config, PathBuf::from("unused.toml"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("pipeline_max_input_buf_bytes"),
+            "{error}"
+        );
+    }
+}
+
 use crate::config::*;
 
 #[tokio::test]

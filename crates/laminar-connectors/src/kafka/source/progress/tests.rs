@@ -117,6 +117,82 @@ fn run_sampler(
 }
 
 #[test]
+fn numbered_sources_share_registry_without_collector_identity_collisions() {
+    let registry = Registry::new();
+    let mut sources = Vec::new();
+    for index in 0..4 {
+        let progress = KafkaProgress::register(&registry, &format!("input_{index}")).unwrap();
+        progress.metrics.last_batch.set(f64::from(index));
+        sources.push(progress);
+    }
+    let rendered = scrape(&registry);
+    for index in 0..4 {
+        assert!(rendered.contains(&format!(
+            "kafka_source_last_batch_timestamp_seconds{{source=\"input_{index}\"}} {index}"
+        )));
+    }
+    drop(sources.remove(1));
+    assert!(!scrape(&registry).contains("source=\"input_1\""));
+    let replacement = KafkaProgress::register(&registry, "input_1").unwrap();
+    replacement.metrics.last_batch.set(10.0);
+    assert!(scrape(&registry)
+        .contains("kafka_source_last_batch_timestamp_seconds{source=\"input_1\"} 10"));
+    drop(replacement);
+    drop(sources);
+    assert!(registry.gather().is_empty());
+}
+
+#[test]
+fn registration_conflicts_roll_back_only_this_attempt() {
+    for conflict_index in 0..4 {
+        let registry = Registry::new();
+        let existing = ProgressMetrics::new("input");
+        existing
+            .reader_lag
+            .with_label_values(&["events", "0"])
+            .set(3);
+        existing
+            .available
+            .with_label_values(&["events", "0"])
+            .set(1);
+        existing
+            .sampled_at
+            .with_label_values(&["events", "0"])
+            .set(10.0);
+        existing.last_batch.set(20.0);
+        registry
+            .register(
+                existing
+                    .collectors()
+                    .into_iter()
+                    .nth(conflict_index)
+                    .unwrap(),
+            )
+            .unwrap();
+        let unaffected = KafkaProgress::register(&registry, "unaffected").unwrap();
+        let before = scrape(&registry);
+
+        assert!(KafkaProgress::register(&registry, "input").is_err());
+        assert_eq!(scrape(&registry), before);
+        registry
+            .unregister(
+                existing
+                    .collectors()
+                    .into_iter()
+                    .nth(conflict_index)
+                    .unwrap(),
+            )
+            .unwrap();
+        let replacement = KafkaProgress::register(&registry, "input").unwrap();
+        drop(replacement);
+        assert!(scrape(&registry).contains("source=\"unaffected\""));
+        assert!(!scrape(&registry).contains("source=\"input\""));
+        drop(unaffected);
+        assert!(registry.gather().is_empty());
+    }
+}
+
+#[test]
 fn named_sources_share_registry_and_restart_without_stale_collectors() {
     let registry = Registry::new();
     let first = KafkaProgress::register(&registry, "first").unwrap();

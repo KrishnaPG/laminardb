@@ -154,6 +154,25 @@ pub struct ServerSection {
     /// Shared connector FIFO Arrow-byte limit per DB/node, including parked input.
     #[serde(default = "default_source_queue_max_bytes")]
     pub source_queue_max_bytes: usize,
+    /// Maximum live rows in each local reference table; must be nonzero.
+    #[serde(default = "default_reference_table_max_rows")]
+    pub reference_table_max_rows: usize,
+    /// Maximum retained-memory charge in each local reference table; must be nonzero.
+    #[serde(default = "default_reference_table_max_bytes")]
+    pub reference_table_max_bytes: usize,
+    /// Live row limit per local MV (distinct multiset rows); must be nonzero.
+    #[serde(default = "default_materialized_view_max_rows")]
+    pub materialized_view_max_rows: usize,
+    /// Retained-memory charge limit per local MV; must be nonzero.
+    #[serde(default = "default_materialized_view_max_bytes")]
+    pub materialized_view_max_bytes: usize,
+    /// Per-graph-port batch limit. `None` uses 256; zero disables the count limit.
+    #[serde(default)]
+    pub pipeline_max_input_buf_batches: Option<usize>,
+    /// Per-graph-port retained Arrow-byte limit, including priming and fan-out.
+    /// `None` disables byte admission; configured limits must be greater than zero.
+    #[serde(default)]
+    pub pipeline_max_input_buf_bytes: Option<usize>,
     /// Right-side history retained while a temporal join input is idle.
     #[serde(default, with = "humantime_serde")]
     pub temporal_join_idle_history_retention: Option<Duration>,
@@ -228,6 +247,12 @@ impl Default for ServerSection {
             incremental_emit: default_incremental_emit(),
             datafusion_memory_limit_bytes: default_datafusion_memory_limit_bytes(),
             source_queue_max_bytes: default_source_queue_max_bytes(),
+            reference_table_max_rows: default_reference_table_max_rows(),
+            reference_table_max_bytes: default_reference_table_max_bytes(),
+            materialized_view_max_rows: default_materialized_view_max_rows(),
+            materialized_view_max_bytes: default_materialized_view_max_bytes(),
+            pipeline_max_input_buf_batches: None,
+            pipeline_max_input_buf_bytes: None,
             temporal_join_idle_history_retention: None,
             source_idle_timeout: None,
             event_time_max_future_skew: default_event_time_max_future_skew(),
@@ -248,7 +273,38 @@ impl Default for ServerSection {
 }
 
 impl ServerSection {
+    pub(crate) fn apply_memory_limits(
+        &self,
+        mut builder: laminar_db::LaminarDbBuilder,
+    ) -> laminar_db::LaminarDbBuilder {
+        builder = builder
+            .reference_table_max_rows(self.reference_table_max_rows)
+            .reference_table_max_bytes(self.reference_table_max_bytes)
+            .materialized_view_max_rows(self.materialized_view_max_rows)
+            .materialized_view_max_bytes(self.materialized_view_max_bytes)
+            .datafusion_memory_limit_bytes(self.datafusion_memory_limit_bytes)
+            .source_queue_max_bytes(self.source_queue_max_bytes);
+        if let Some(batches) = self.pipeline_max_input_buf_batches {
+            builder = builder.pipeline_max_input_buf_batches(batches);
+        }
+        if let Some(bytes) = self.pipeline_max_input_buf_bytes {
+            builder = builder.pipeline_max_input_buf_bytes(bytes);
+        }
+        builder
+    }
+
     pub(crate) fn validate_memory_limits(&self) -> Result<(), &'static str> {
+        laminar_db::validate_materialized_view_limits(
+            self.materialized_view_max_rows,
+            self.materialized_view_max_bytes,
+        )?;
+        laminar_db::validate_reference_table_limits(
+            self.reference_table_max_rows,
+            self.reference_table_max_bytes,
+        )?;
+        if self.pipeline_max_input_buf_bytes == Some(0) {
+            return Err("pipeline_max_input_buf_bytes must be greater than zero when configured");
+        }
         if self.datafusion_memory_limit_bytes == 0 {
             return Err("datafusion_memory_limit_bytes must be greater than zero");
         }
@@ -304,6 +360,22 @@ fn default_event_time_max_future_skew() -> Duration {
 
 fn default_datafusion_memory_limit_bytes() -> usize {
     laminar_db::DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES
+}
+
+fn default_reference_table_max_rows() -> usize {
+    laminar_db::DEFAULT_REFERENCE_TABLE_MAX_ROWS
+}
+
+fn default_materialized_view_max_rows() -> usize {
+    laminar_db::DEFAULT_MATERIALIZED_VIEW_MAX_ROWS
+}
+
+fn default_materialized_view_max_bytes() -> usize {
+    laminar_db::DEFAULT_MATERIALIZED_VIEW_MAX_BYTES
+}
+
+fn default_reference_table_max_bytes() -> usize {
+    laminar_db::DEFAULT_REFERENCE_TABLE_MAX_BYTES
 }
 
 fn default_source_queue_max_bytes() -> usize {

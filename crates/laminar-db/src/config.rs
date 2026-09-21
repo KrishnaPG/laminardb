@@ -21,6 +21,44 @@ pub const DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// Default shared connector-to-coordinator Arrow-byte budget (64 MiB).
 pub const DEFAULT_SOURCE_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default maximum number of live rows in each local reference table.
+pub const DEFAULT_REFERENCE_TABLE_MAX_ROWS: usize = 1_000_000;
+
+/// Default retained-memory charge limit for each local reference table (256 MiB).
+pub const DEFAULT_REFERENCE_TABLE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default live row limit per local materialized view (distinct rows for multisets).
+pub const DEFAULT_MATERIALIZED_VIEW_MAX_ROWS: usize = 1_000_000;
+
+/// Default retained-memory charge limit per local materialized view (256 MiB).
+pub const DEFAULT_MATERIALIZED_VIEW_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Validate the live row and retained-memory limits for each local materialized view.
+///
+/// # Errors
+/// Returns an error if either limit is zero.
+pub fn validate_materialized_view_limits(rows: usize, bytes: usize) -> Result<(), &'static str> {
+    if rows == 0 || bytes == 0 {
+        return Err(
+            "materialized_view_max_rows and materialized_view_max_bytes must be greater than zero",
+        );
+    }
+    Ok(())
+}
+
+/// Validate per-table live row and retained-memory limits.
+///
+/// # Errors
+/// Returns an error if either limit is zero.
+pub fn validate_reference_table_limits(rows: usize, bytes: usize) -> Result<(), &'static str> {
+    if rows == 0 || bytes == 0 {
+        return Err(
+            "reference_table_max_rows and reference_table_max_bytes must be greater than zero",
+        );
+    }
+    Ok(())
+}
+
 /// Largest source queue budget supported by byte-sized semaphore reservations.
 pub const MAX_SOURCE_QUEUE_BYTES: usize = if tokio::sync::Semaphore::MAX_PERMITS < u32::MAX as usize
 {
@@ -82,7 +120,9 @@ pub(crate) fn temporal_join_idle_history_retention_ms(
 /// What to do when an operator's input buffer exceeds its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackpressurePolicy {
-    /// Defer the producer; sources block on `send`. No data loss.
+    /// Defer producers before execution when a downstream port cannot accept input.
+    /// An executed result that exceeds a port's prospective limit halts the pipeline;
+    /// it cannot safely be retried against already mutated operator state.
     #[default]
     Backpressure,
     /// Drop oldest batches; counted in `shed_records_total`.
@@ -142,6 +182,23 @@ impl Default for RestartPolicy {
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
+    /// Live row limit per local MV; multiset mode counts distinct rows (default 1,000,000).
+    /// Applies to embedded and single-node execution; must be nonzero.
+    pub materialized_view_max_rows: usize,
+    /// Per-MV retained-memory charge limit (default 256 MiB); must be nonzero.
+    /// Counts Arrow backing capacity, owned scalar/key storage and fixed entry metadata.
+    /// Shared buffers are conservatively charged per stored batch/scalar. Map spare capacity,
+    /// schema/converter/allocator overhead, staged deltas, snapshots and checkpoint scratch
+    /// are separate. Append mode evicts oldest batches; an oversized single batch fails.
+    pub materialized_view_max_bytes: usize,
+    /// Maximum live rows in each reference table (default 1,000,000).
+    /// Applies to embedded and single-node tables; must be nonzero.
+    pub reference_table_max_rows: usize,
+    /// Per-table encoded-key, row metadata and retained Arrow capacity charge (default 256 MiB).
+    /// Shared buffers count once per table, using Arrow-reported allocation capacity.
+    /// Hash-map spare capacity, schema/allocator/opaque-owner overhead, caller-held data, prepared
+    /// replacements, query snapshots and checkpoint scratch are separate from this live limit.
+    pub reference_table_max_bytes: usize,
     /// Shared limit for participating `DataFusion` reservations across this DB's contexts.
     /// Must be greater than zero; defaults to [`DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES`].
     /// DB-owned contexts cannot spill to disk. Direct Arrow allocations, managed state,
@@ -149,6 +206,11 @@ pub struct LaminarConfig {
     pub datafusion_memory_limit_bytes: usize,
     /// Streaming channel buffer size.
     pub default_buffer_size: usize,
+    /// Per-source Arrow-byte limit for in-process push rings and queued broadcast data.
+    /// Each source's snapshot history has a separate cap of the same size (default 64 MiB).
+    /// Applies to typed handles after Arrow conversion. Caller-held batches, conversion
+    /// scratch, query snapshots and downstream buffers are outside these two limits.
+    pub push_source_max_bytes: usize,
     /// Backpressure strategy.
     pub default_backpressure: BackpressureStrategy,
     /// Checkpoint directory. `None` = in-memory only.
@@ -181,7 +243,8 @@ pub struct LaminarConfig {
     pub pipeline_query_budget_ns: Option<u64>,
     /// Per-port operator input-buffer cap (batches). `None` = 256.
     pub pipeline_max_input_buf_batches: Option<usize>,
-    /// Per-port operator input-buffer cap (bytes). `None` = disabled.
+    /// Per-port retained Arrow-byte cap, including source priming. `None` = disabled.
+    /// Slices charge their backing storage; each fan-out port charges independently.
     pub pipeline_max_input_buf_bytes: Option<usize>,
     /// Pipeline-wide managed working-state budget in charged bytes. `None` resolves to
     /// [`DEFAULT_MAX_MANAGED_STATE_BYTES`] when the database is constructed.
@@ -206,6 +269,16 @@ pub struct LaminarConfig {
 
 impl LaminarConfig {
     pub(crate) fn validate_and_normalize(&mut self) -> Result<(), DbError> {
+        validate_materialized_view_limits(
+            self.materialized_view_max_rows,
+            self.materialized_view_max_bytes,
+        )
+        .map_err(|error| DbError::Config(error.into()))?;
+        validate_reference_table_limits(
+            self.reference_table_max_rows,
+            self.reference_table_max_bytes,
+        )
+        .map_err(|error| DbError::Config(error.into()))?;
         if self.datafusion_memory_limit_bytes == 0 {
             return Err(DbError::Config(
                 "datafusion_memory_limit_bytes must be greater than zero".into(),
@@ -213,6 +286,8 @@ impl LaminarConfig {
         }
         validate_source_queue_max_bytes(self.source_queue_max_bytes)
             .map_err(|error| DbError::Config(error.into()))?;
+        laminar_core::streaming::validate_source_max_queued_bytes(self.push_source_max_bytes)
+            .map_err(|error| DbError::Config(format!("push_source_max_bytes: {error}")))?;
         self.source_idle_timeout = source_idle_timeout_ms(self.source_idle_timeout)
             .map_err(|error| DbError::Config(error.to_string()))?
             .map(std::time::Duration::from_millis);
@@ -245,6 +320,11 @@ impl LaminarConfig {
     }
 
     pub(crate) fn validate_backpressure_policy(&self) -> Result<(), DbError> {
+        if self.pipeline_max_input_buf_bytes == Some(0) {
+            return Err(DbError::Config(
+                "pipeline_max_input_buf_bytes must be greater than zero when configured".into(),
+            ));
+        }
         let policy = self.pipeline_backpressure_policy;
         if policy == BackpressurePolicy::Backpressure {
             return Ok(());
@@ -275,8 +355,13 @@ impl LaminarConfig {
 impl Default for LaminarConfig {
     fn default() -> Self {
         Self {
+            reference_table_max_rows: DEFAULT_REFERENCE_TABLE_MAX_ROWS,
+            reference_table_max_bytes: DEFAULT_REFERENCE_TABLE_MAX_BYTES,
+            materialized_view_max_rows: DEFAULT_MATERIALIZED_VIEW_MAX_ROWS,
+            materialized_view_max_bytes: DEFAULT_MATERIALIZED_VIEW_MAX_BYTES,
             datafusion_memory_limit_bytes: DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES,
             default_buffer_size: 65536,
+            push_source_max_bytes: laminar_core::streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES,
             default_backpressure: BackpressureStrategy::Block,
             storage_dir: None,
             checkpoint: None,
@@ -307,7 +392,157 @@ impl Default for LaminarConfig {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn materialized_view_limits_apply_through_config_and_builder() {
+        use super::*;
+        assert_eq!(
+            LaminarConfig::default().materialized_view_max_rows,
+            1_000_000
+        );
+        assert_eq!(
+            LaminarConfig::default().materialized_view_max_bytes,
+            256 * 1024 * 1024
+        );
+        for (rows, bytes) in [(0, 1024), (1, 0)] {
+            assert!(matches!(
+                crate::LaminarDB::open_with_config(LaminarConfig {
+                    materialized_view_max_rows: rows,
+                    materialized_view_max_bytes: bytes,
+                    ..Default::default()
+                }),
+                Err(DbError::Config(_))
+            ));
+            assert!(matches!(
+                crate::LaminarDB::builder()
+                    .materialized_view_max_rows(rows)
+                    .materialized_view_max_bytes(bytes)
+                    .build()
+                    .await,
+                Err(DbError::Config(_))
+            ));
+        }
+        let db = crate::LaminarDB::builder()
+            .materialized_view_max_rows(1)
+            .materialized_view_max_bytes(8192)
+            .build()
+            .await
+            .unwrap();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            ])),
+            vec![std::sync::Arc::new(arrow::array::Int64Array::from(vec![
+                1, 2,
+            ]))],
+        )
+        .unwrap();
+        let mut store = db.mv_store.write();
+        store
+            .create_mv(
+                "v",
+                batch.schema(),
+                crate::mv_store::MvStorageMode::Aggregate,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.update_cycle("v", &[batch]),
+            Err(DbError::MaterializedViewQuotaExceeded { max_rows: 1, .. })
+        ));
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn reference_table_limits_apply_through_config_and_builder() {
+        assert_eq!(LaminarConfig::default().reference_table_max_rows, 1_000_000);
+        assert_eq!(
+            LaminarConfig::default().reference_table_max_bytes,
+            256 * 1024 * 1024
+        );
+        for (rows, bytes) in [(0, 1024), (1, 0)] {
+            let error = crate::LaminarDB::open_with_config(LaminarConfig {
+                reference_table_max_rows: rows,
+                reference_table_max_bytes: bytes,
+                ..Default::default()
+            })
+            .err()
+            .unwrap();
+            assert!(matches!(error, DbError::Config(_)));
+            let error = crate::LaminarDB::builder()
+                .reference_table_max_rows(rows)
+                .reference_table_max_bytes(bytes)
+                .build()
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(error, DbError::Config(_)));
+        }
+        let db = crate::LaminarDB::builder()
+            .reference_table_max_rows(1)
+            .reference_table_max_bytes(8192)
+            .build()
+            .await
+            .unwrap();
+        db.execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY, value VARCHAR)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO dimensions VALUES (1, 'first')")
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.execute("INSERT INTO dimensions VALUES (1, 'changed'), (2, 'new')")
+                .await,
+            Err(DbError::ReferenceTableQuotaExceeded {
+                rows: 2,
+                max_rows: 1,
+                ..
+            })
+        ));
+        let result = db.execute("SELECT value FROM dimensions").await.unwrap();
+        let crate::ExecuteResult::Query(mut query) = result else {
+            panic!("expected query");
+        };
+        let mut subscription = query.subscribe_raw().unwrap();
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
+        let value = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(value.value(0), "first");
+    }
+
+    #[tokio::test]
+    async fn push_source_limits_are_validated_at_db_entry() {
+        assert_eq!(
+            LaminarConfig::default().push_source_max_bytes,
+            64 * 1024 * 1024
+        );
+        for bytes in [0, laminar_core::streaming::MAX_SOURCE_QUEUED_BYTES + 1] {
+            let error = crate::LaminarDB::open_with_config(LaminarConfig {
+                push_source_max_bytes: bytes,
+                ..Default::default()
+            })
+            .err()
+            .unwrap();
+            assert!(
+                matches!(error, DbError::Config(ref message) if message.contains("push_source_max_bytes"))
+            );
+            let error = crate::LaminarDB::builder()
+                .push_source_max_bytes(bytes)
+                .build()
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(error, DbError::Config(ref message) if message.contains("push_source_max_bytes"))
+            );
+        }
+    }
 
     #[tokio::test]
     async fn source_queue_limits_are_validated_at_db_entry() {

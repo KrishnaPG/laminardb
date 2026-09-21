@@ -10,7 +10,7 @@
 //! Run with: `cargo bench --bench stream_executor_bench -p laminar-db`
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
@@ -19,6 +19,72 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use laminar_db::LaminarDB;
+
+#[derive(Clone)]
+struct PushPayload(String);
+
+impl laminar_core::streaming::Record for PushPayload {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]))
+    }
+
+    fn to_record_batch(&self) -> RecordBatch {
+        RecordBatch::try_new(
+            Self::schema(),
+            vec![Arc::new(StringArray::from(vec![self.0.as_str()]))],
+        )
+        .unwrap()
+    }
+}
+
+fn bench_embedded_push(c: &mut Criterion) {
+    use laminar_core::streaming::Record;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let mut group = c.benchmark_group("embedded_push");
+    for width in [16, 4096] {
+        let record = PushPayload("x".repeat(width));
+        let batch = record.to_record_batch();
+        for typed in [false, true] {
+            let label = if typed { "typed" } else { "arrow" };
+            group.throughput(criterion::Throughput::Elements(32));
+            group.bench_function(format!("{label}_{width}"), |b| {
+                let db = rt.block_on(async {
+                    let db = LaminarDB::builder().build().await.unwrap();
+                    db.execute("CREATE SOURCE input (payload VARCHAR) WITH ('buffer_size' = '64')")
+                        .await
+                        .unwrap();
+                    db
+                });
+                let source = db.source::<PushPayload>("input").unwrap();
+                b.iter(|| {
+                    for _ in 0..32 {
+                        if typed {
+                            source.push(record.clone()).unwrap();
+                        } else {
+                            source.push_arrow(batch.clone()).unwrap();
+                        }
+                    }
+                    // Drain into the broadcast with no subscribers; snapshot history remains.
+                    rt.block_on(async {
+                        while source.pending() != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    });
+                });
+            });
+        }
+    }
+    group.finish();
+}
 
 /// Schema: id (Int64), region (Utf8), price (Float64), quantity (Int64), ts (Int64)
 fn bench_schema() -> SchemaRef {
@@ -265,6 +331,23 @@ fn bench_query_chain(c: &mut Criterion) {
     group.finish();
 }
 
+fn push_when_ready(
+    source: &laminar_db::UntypedSourceHandle,
+    batch: &RecordBatch,
+    deadline: Instant,
+) {
+    loop {
+        match source.push_arrow(batch.clone()) {
+            Ok(()) => return,
+            Err(laminar_core::streaming::StreamingError::ChannelFull) => {
+                assert!(Instant::now() < deadline, "source admission timed out");
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("source admission failed: {error}"),
+        }
+    }
+}
+
 /// Exercise source handoff in bursts, including variable-width storage and a shared
 /// channel with four producers. Time admission through complete output consumption.
 fn bench_source_queue(c: &mut Criterion) {
@@ -322,9 +405,10 @@ fn bench_source_queue(c: &mut Criterion) {
                 })
                 .collect();
             let mut burst = || {
+                let deadline = Instant::now() + Duration::from_secs(2);
                 for _ in 0..64 {
                     for source in &sources {
-                        source.push_arrow(batch.clone()).unwrap();
+                        push_when_ready(source, &batch, deadline);
                     }
                 }
                 rt.block_on(async {
@@ -424,6 +508,90 @@ fn bench_agg_high_cardinality(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bounded graph-port admission and shared-buffer fan-out, through complete consumption.
+fn bench_graph_admission(c: &mut Criterion) {
+    use laminar_core::streaming::Record;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("graph_admission");
+    for (label, width, fanout, source_count) in [
+        ("single", 16, 1, 1usize),
+        ("fanout_four", 16, 4, 1),
+        ("wide_fanout_four", 4096, 4, 1),
+        ("two_input_union", 16, 1, 2),
+    ] {
+        let payload = "x".repeat(width);
+        let batch = RecordBatch::try_new(
+            PushPayload::schema(),
+            vec![Arc::new(StringArray::from(vec![payload.as_str(); 256]))],
+        )
+        .unwrap();
+        let expected_rows = 256 * 16 * source_count;
+        group.throughput(criterion::Throughput::Elements(
+            u64::try_from(expected_rows).unwrap(),
+        ));
+        group.bench_function(label, |b| {
+            let db = rt.block_on(async {
+                let db = LaminarDB::builder()
+                    .pipeline_max_input_buf_batches(64)
+                    .pipeline_max_input_buf_bytes(32 * 1024 * 1024)
+                    .build()
+                    .await
+                    .unwrap();
+                for index in 0..source_count {
+                    db.execute(&format!("CREATE SOURCE input_{index} (payload VARCHAR)")).await.unwrap();
+                }
+                let query = (0..source_count).map(|index| format!("SELECT payload FROM input_{index}"))
+                    .collect::<Vec<_>>().join(" UNION ALL ");
+                db.execute(&format!("CREATE STREAM middle AS {query} WITH ('retain_history' = '32mb')"))
+                    .await.unwrap();
+                for index in 0..fanout {
+                    db.execute(&format!(
+                        "CREATE STREAM output_{index} AS SELECT payload FROM middle WITH ('retain_history' = '32mb')"
+                    )).await.unwrap();
+                }
+                db.start().await.unwrap();
+                db
+            });
+            let sources: Vec<_> = (0..source_count).map(|index| db.source_untyped(&format!("input_{index}")).unwrap()).collect();
+            let mut subscriptions: Vec<_> = (0..fanout)
+                .map(|index| rt.block_on(db.subscribe::<RowCount>(&format!("output_{index}"))).unwrap())
+                .collect();
+            let mut burst = || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                for _ in 0..16 {
+                    for source in &sources {
+                        push_when_ready(source, &batch, deadline);
+                    }
+                }
+                rt.block_on(async {
+                    for subscription in &mut subscriptions {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let mut received = 0;
+                            while received < expected_rows {
+                                if let laminar_db::TypedSubscriptionFrame::Rows { rows, .. } =
+                                    subscription.next_frame().await.unwrap().unwrap()
+                                {
+                                    received += rows.iter().map(|count| count.0).sum::<usize>();
+                                }
+                            }
+                            assert_eq!(received, expected_rows);
+                        }).await.expect("graph fanout did not drain");
+                    }
+                });
+            };
+            burst();
+            b.iter(&mut burst);
+            rt.block_on(db.shutdown()).unwrap();
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_plain_select,
@@ -432,5 +600,7 @@ criterion_group!(
     bench_sort_limit,
     bench_query_chain,
     bench_source_queue,
+    bench_embedded_push,
+    bench_graph_admission,
 );
 criterion_main!(benches);

@@ -192,7 +192,8 @@ async fn backpressure_cap_validation_matches_all_constructors() {
         BackpressurePolicy::Fail,
     ] {
         for (batches, bytes, has_effective_cap) in caps {
-            let accepted = policy == BackpressurePolicy::Backpressure || has_effective_cap;
+            let accepted = bytes != Some(0)
+                && (policy == BackpressurePolicy::Backpressure || has_effective_cap);
             let mut builder = LaminarDbBuilder::new().pipeline_backpressure_policy(policy);
             if let Some(batches) = batches {
                 builder = builder.pipeline_max_input_buf_batches(batches);
@@ -217,10 +218,12 @@ async fn backpressure_cap_validation_matches_all_constructors() {
                 );
                 if let Err(error) = result {
                     assert!(matches!(&error, DbError::Config(_)), "{error}");
-                    assert!(
-                        error.to_string().contains("requires at least one"),
-                        "{error}"
-                    );
+                    let expected = if bytes == Some(0) {
+                        "pipeline_max_input_buf_bytes must be greater than zero"
+                    } else {
+                        "requires at least one"
+                    };
+                    assert!(error.to_string().contains(expected), "{error}");
                 }
             }
         }

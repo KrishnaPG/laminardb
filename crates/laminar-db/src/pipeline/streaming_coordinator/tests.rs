@@ -938,6 +938,7 @@ struct MockCallback {
     aborted_subscription_cuts: Arc<Mutex<Vec<CheckpointAttempt>>>,
     publish_barrier_error: Arc<Mutex<Option<String>>>,
     publication_error: Arc<Mutex<Option<String>>>,
+    mv_store: Option<Mutex<crate::mv_store::MvStore>>,
     sink_publication_error: Arc<Mutex<Option<String>>>,
     #[cfg(feature = "cluster")]
     subscription_output_commits: Arc<AtomicU64>,
@@ -1038,6 +1039,7 @@ impl MockCallback {
             aborted_subscription_cuts: Arc::new(Mutex::new(Vec::new())),
             publish_barrier_error: Arc::new(Mutex::new(None)),
             publication_error: Arc::new(Mutex::new(None)),
+            mv_store: None,
             sink_publication_error: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cluster")]
             subscription_output_commits: Arc::new(AtomicU64::new(0)),
@@ -1383,6 +1385,23 @@ impl PipelineCallback for MockCallback {
             Some(error) => Err(CycleError::Recovery(error)),
             None => Ok(()),
         }
+    }
+
+    fn update_mv_stores(
+        &self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<(), CycleError> {
+        if let Some(store) = &self.mv_store {
+            store
+                .lock()
+                .update_views(
+                    results
+                        .iter()
+                        .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
+                )
+                .map_err(|error| CycleError::Recovery(error.to_string()))?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]
@@ -9571,6 +9590,65 @@ async fn sink_publication_failure_does_not_advance_source_cursor() {
         Some("3")
     );
     assert_eq!(callback.written_rows.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mv_quota_failure_discards_source_cursors_and_faults_every_delivery_mode() {
+    for guarantee in [
+        DeliveryGuarantee::BestEffort,
+        DeliveryGuarantee::AtLeastOnce,
+        DeliveryGuarantee::ExactlyOnce,
+    ] {
+        let (tx, rx) = test_source_channel(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::new(tokio::sync::Notify::new()),
+            guarantee,
+            None,
+        );
+        coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(checkpoint_at(7)));
+        let mut callback = MockCallback::new();
+        let mut store = crate::mv_store::MvStore::from_config(&crate::LaminarConfig {
+            materialized_view_max_bytes: 1,
+            ..Default::default()
+        });
+        store
+            .create_mv(
+                "test_source",
+                int_batch(1).schema(),
+                crate::mv_store::MvStorageMode::Aggregate,
+            )
+            .unwrap();
+        callback.mv_store = Some(Mutex::new(store));
+        let written_rows = Arc::clone(&callback.written_rows);
+        let mut results = FxHashMap::default();
+        results.insert(Arc::from("test_source"), vec![int_batch(1)]);
+        let error = coordinator
+            .publish_cycle_outputs(&mut callback, &CycleOutcome::clean(results))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
+        );
+        assert!(coordinator.pending_offsets[0].is_none());
+        assert!(coordinator.committed_offsets[0].is_none());
+        assert_eq!(written_rows.load(Ordering::SeqCst), 0);
+
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(7)),
+        })
+        .await
+        .unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), coordinator.run(callback))
+            .await
+            .expect("MV admission must fault the pipeline");
+        assert!(matches!(exit, ExitReason::Fault(ref reason) if reason.contains("quota exceeded")));
+        assert_eq!(written_rows.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[cfg(feature = "cluster")]

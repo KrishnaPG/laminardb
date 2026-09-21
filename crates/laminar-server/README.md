@@ -65,6 +65,12 @@ console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
 datafusion_memory_limit_bytes = 268435456 # shared per DB/node; 256 MiB default, must be > 0
 source_queue_max_bytes = 67108864 # shared connector FIFO per DB/node; 64 MiB default
+reference_table_max_rows = 1000000 # independently per local reference table; must be > 0
+reference_table_max_bytes = 268435456 # retained-memory charge per local table; 256 MiB default
+materialized_view_max_rows = 1000000 # per local MV; distinct rows for multiset storage
+materialized_view_max_bytes = 268435456 # retained-memory charge per local MV; must be > 0
+# pipeline_max_input_buf_batches = 256 # per graph input port; 0 disables count limit
+# pipeline_max_input_buf_bytes = 33554432 # optional per-port Arrow bytes; unset disables
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -308,6 +314,27 @@ see the [memory scope](../laminar-db/README.md#datafusion-memory-limit).
 and requires a restart to change. It also caps each individual source batch; oversized input
 faults before its cursor is settled. See the [queue ownership scope](../laminar-db/README.md#connector-source-queue-limit)
 for producer scratch, parked messages and downstream retention.
+
+`server.pipeline_max_input_buf_batches` and `server.pipeline_max_input_buf_bytes` configure
+prospective graph-port limits in both server modes. The count default is 256; the byte cap is
+unset by default and must be greater than zero when supplied. Fan-out charges each port
+independently. Output that cannot fit after execution halts before routing; see the
+[graph input contract](../laminar-db/README.md#graph-input-limits). These startup settings are
+not hot-reloaded and do not bound total process RSS.
+
+`server.reference_table_max_rows` and `server.reference_table_max_bytes` bound each local
+reference table's final state. Both must be greater than zero and require a restart to change.
+Over-limit updates, multi-table refreshes and checkpoint restores fail before live installation.
+Cluster reference-table admission remains restricted. See the
+[table accounting and staging scope](../laminar-db/README.md#reference-table-memory-limits)
+for shared Arrow buffers, external ownership, checkpoint captures and memory headroom.
+
+`server.materialized_view_max_rows` and `server.materialized_view_max_bytes` apply to every
+local MV storage mode. Both must be nonzero. Aggregate, upsert and multiset growth fails
+before any affected MV changes or publishes cycle output. Append storage evicts oldest
+complete batches, but rejects a single batch that cannot fit. Restore fails instead of
+truncating committed state. Cluster MV admission remains rejected. See the
+[MV accounting and publication scope](../laminar-db/README.md#materialized-view-memory-limits).
 
 ## Tuning the Allocator (`MALLOC_CONF`)
 

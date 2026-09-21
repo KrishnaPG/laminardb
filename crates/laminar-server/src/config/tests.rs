@@ -1720,3 +1720,107 @@ fn source_queue_limit_default_override_and_invalid_validation() {
             .contains("source_queue_max_bytes"));
     }
 }
+
+#[test]
+fn graph_input_limit_default_override_and_zero_validation() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.pipeline_max_input_buf_bytes, None);
+    assert_eq!(default.server.pipeline_max_input_buf_batches, None);
+    let configured: ServerConfig = toml::from_str(
+        "[server]\npipeline_max_input_buf_bytes = 65536\npipeline_max_input_buf_batches = 32",
+    )
+    .unwrap();
+    assert_eq!(configured.server.pipeline_max_input_buf_bytes, Some(65536));
+    assert_eq!(configured.server.pipeline_max_input_buf_batches, Some(32));
+    validate_config(&configured).unwrap();
+    let invalid: ServerConfig =
+        toml::from_str("[server]\npipeline_max_input_buf_bytes = 0").unwrap();
+    assert!(validate_config(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("pipeline_max_input_buf_bytes"));
+}
+#[tokio::test]
+async fn reference_table_memory_limits_parse_validate_and_reach_database() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.reference_table_max_rows, 1_000_000);
+    assert_eq!(default.server.reference_table_max_bytes, 256 * 1024 * 1024);
+    for field in ["reference_table_max_rows", "reference_table_max_bytes"] {
+        let invalid: ServerConfig = toml::from_str(&format!("[server]\n{field} = 0")).unwrap();
+        assert!(validate_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("reference_table"));
+    }
+    let configured: ServerConfig =
+        toml::from_str("[server]\nreference_table_max_rows = 1\nreference_table_max_bytes = 8192")
+            .unwrap();
+    validate_config(&configured).unwrap();
+    let db = configured
+        .server
+        .apply_memory_limits(laminar_db::LaminarDB::builder())
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.execute("INSERT INTO dimensions VALUES (1), (2)").await,
+        Err(laminar_db::DbError::ReferenceTableQuotaExceeded { max_rows: 1, .. })
+    ));
+}
+
+#[test]
+fn materialized_view_memory_limits_parse_and_validate() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.materialized_view_max_rows, 1_000_000);
+    assert_eq!(
+        default.server.materialized_view_max_bytes,
+        256 * 1024 * 1024
+    );
+    for field in ["materialized_view_max_rows", "materialized_view_max_bytes"] {
+        let invalid: ServerConfig = toml::from_str(&format!("[server]\n{field} = 0")).unwrap();
+        assert!(validate_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("materialized_view"));
+    }
+    let configured: ServerConfig = toml::from_str(
+        "[server]\nmaterialized_view_max_rows = 42\nmaterialized_view_max_bytes = 8192",
+    )
+    .unwrap();
+    validate_config(&configured).unwrap();
+    assert_eq!(configured.server.materialized_view_max_rows, 42);
+    assert_eq!(configured.server.materialized_view_max_bytes, 8192);
+}
+
+#[tokio::test]
+async fn materialized_view_memory_limits_reach_server_database() {
+    let configured: ServerConfig =
+        toml::from_str("[server]\nmaterialized_view_max_bytes = 1").unwrap();
+    let db = configured
+        .server
+        .apply_memory_limits(laminar_db::LaminarDB::builder())
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, value VARCHAR NOT NULL) FROM GENERATOR ('rows.per.second' = '1000', 'max.rows' = '1')").await.unwrap();
+    db.execute("CREATE MATERIALIZED VIEW stored AS SELECT seq FROM generated")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while db.last_fault().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("MV quota must reach the production callback");
+    assert!(db.last_fault().unwrap().contains("quota exceeded"));
+    let error = db
+        .shutdown()
+        .await
+        .expect_err("shutdown must report the pipeline fault");
+    assert!(error.to_string().contains("quota exceeded"));
+}

@@ -170,6 +170,16 @@ name = "recovery_bench"
 harness = false
 
 [[bench]]
+name = "reference_table_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[bench]]
+name = "materialized_view_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[bench]]
 name = "stream_executor_bench"
 harness = false
 

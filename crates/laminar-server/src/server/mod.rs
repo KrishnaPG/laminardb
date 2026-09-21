@@ -236,8 +236,7 @@ pub async fn run_server(
     }
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
-    builder = builder.datafusion_memory_limit_bytes(config.server.datafusion_memory_limit_bytes);
-    builder = builder.source_queue_max_bytes(config.server.source_queue_max_bytes);
+    builder = config.server.apply_memory_limits(builder);
     if let Some(retention) = config.server.temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);
     }

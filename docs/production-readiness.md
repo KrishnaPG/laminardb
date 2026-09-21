@@ -13,8 +13,23 @@ sort latency has a documented 4–23% cost across diagnostic comparisons. S6b no
 DataFusion reservations across DB contexts and disables their disk spilling. Correctness gates
 and matched local performance checks pass. This does not close G2's wider memory scope.
 S7 now bounds connector queue bytes through parking, with a configurable 64 MiB default;
-correctness gates and matched local performance checks pass. Embedded push rings,
-staged/graph retention and the remaining G2/G3 memory owners still require their planned work.
+correctness gates and matched local performance checks pass. S8 bounds embedded Arrow/DB-handle
+push queues and source snapshot retention; its local gates pass with measured admission and
+concurrent-burst costs recorded in the plan. S9 prospective graph-port admission and deferred-input
+ownership pass correctness/static checks. Its wide-fan-out measurements remain placement-sensitive
+(+17% unrestricted, +3.9% in a longer fixed-core run), with the full performance caveat recorded
+in the plan. S10 adds atomic per-table row/retained-byte quotas for embedded and single-node
+reference tables, including incremental snapshot admission and restore. S11 implements quotas for
+every local MV storage mode and preflights all affected views before mutation or MV publication.
+Its correctness/static gates pass; measured preflight/staging costs and variable snapshot/checkpoint
+timings are recorded in the plan. G3's workload memory envelope still requires S12 qualification.
+S12 now has a single-node Kafka ALO workload observer for continuous external visibility,
+per-pipeline p99.9, offered-load/backlog accounting, sampled RSS and process recovery. The local
+release smoke matrix found and fixed a Kafka metric-registration collision that prevented four
+sources from starting. Eight diagnostic cases now pass with 134,000 expected unique records,
+verified routing and no gaps; test and static gates pass. Production workload qualification and
+the required long-run/fault matrix remain open, including declared targets and memory/capacity evidence.
+See [S12 execution evidence](production-hardening-plan.md#s12--workload-observer-and-release-smoke-matrix-2026-09-21).
 Findings below describe the reviewed baseline. See the execution plan for validation and remaining work.
 
 LaminarDB already has a substantial streaming execution, checkpoint, fencing, recovery, and
@@ -128,7 +143,7 @@ operator is allocation-free or nonblocking.
 | C2 — event time and windows | P1 / IMPLEMENTED | Late rows are checked against the prior watermark before the current batch advances it. Managed direct-source TUMBLE/HOP/SESSION windows support final/window-close emission, including cluster mode. Watermarks, idle-input handling, closed-window state cleanup, replay/frontier state, and checkpoint round trips exist. [Cycle](../crates/laminar-db/src/pipeline/streaming_coordinator/cycle.rs), [window state](../crates/laminar-db/src/core_window_state/mod.rs), [cluster checks](../crates/laminar-db/src/ddl/cluster_checks.rs), lines 349–444. |
 | C3 — bounded joins | P1 / IMPLEMENTED | One bounded watermarked interval-join stage and managed direct-source temporal ASOF execution are admitted in cluster. Interval joins preflight input/output growth; watermarks free history. Temporal history uses finite retention and preserves needed predecessors; old revival probes and source-order regressions fail explicitly. Named join output can feed a separate keyed aggregate. [Interval join](../crates/laminar-db/src/interval_join/mod.rs), [temporal state](../crates/laminar-db/src/temporal_join_state/mod.rs). |
 | C4 — fault/recovery invariants | P1 / IMPLEMENTED | Selected-cut corruption is fatal; recovery does not choose an older convenient checkpoint. Prepared sink artifacts are settled, manifests and frame digests validated, then exact state restored. Generation-bound Prepare/Start/Release rounds keep intake fenced; durable terminal faults survive process/leader changes. [Recovery authority](../crates/laminar-db/src/checkpoint_coordinator/recovery.rs), [coordinated recovery](../crates/laminar-db/src/coordinated_recovery/mod.rs), [lifecycle recovery tests](../crates/laminar-db/src/pipeline_lifecycle/). |
-| C5 — local tables/MVs | P1 / PARTIAL | Reference-table snapshots and aggregate/append/upsert/multiset MVs exist and recover locally. Upsert and multiset cycles stage validation before mutation; multiplicity underflow/overflow is rejected. Append MVs evict older batches (default 1,000 batches/256 MiB), but retain at least one batch even if it is oversized. Live keyed table/MV growth is not comprehensively quota-controlled. [Table store](../crates/laminar-db/src/table_store/mod.rs), [MV store](../crates/laminar-db/src/mv_store/mod.rs), G3. |
+| C5 — local tables/MVs | P1 / PARTIAL | Reference-table snapshots and aggregate/append/upsert/multiset MVs exist and recover locally. S10 caps reference tables by rows and retained bytes before upsert, refresh or restore; failures preserve the prior installation. S11 adds per-MV row/byte quotas, all-view cycle preflight and atomic restore rejection, with passing correctness/static gates and documented performance costs. Append MVs evict oldest complete batches and reject any single batch that cannot fit. Workload memory and delivery qualification remain open. [Table store](../crates/laminar-db/src/table_store/mod.rs), [MV store](../crates/laminar-db/src/mv_store/mod.rs), G3. |
 | C6 — local subscriptions | P1 / IMPLEMENTED | Shared byte-bounded logs, a process budget, reader cap (64 per object), monotonically checked sequence numbers, epoch markers, retained replay, explicit lag/pruning errors, and generation invalidation exist. A slow reader can be closed; it is not an unbounded per-client queue. [Registry](../crates/laminar-db/src/subscription/registry/), [portal](../crates/laminar-db/src/subscription/portal/mod.rs). |
 | C7 — durable cluster subscriptions | P1 / IMPLEMENTED | Checkpointed output segments, per-partition sequence continuity, distribution certificates, retention pins, digest verification, and AS-OF replay exist. Output is exposed from committed cuts. The runtime only admits certified non-windowed managed keyed-aggregate streams; other SQL support does not imply subscription support. [Admission](../crates/laminar-db/src/db/cluster_subscription.rs), [reader authority](../crates/laminar-db/src/subscription/cluster/reader/authority.rs), [output state](../crates/laminar-db/src/subscription/cluster/output_state.rs). |
 | C8 — operations | P1 / IMPLEMENTED | Prometheus cycle/operator/checkpoint/recovery/state/subscription metrics, tracing, health/readiness, configuration validation, secret redaction, bounded connector shutdown, HTTP/WS, and pgwire exist. Readiness checks serving authority and running state, not business freshness. Pgwire rejects remote trust and supports MD5/TLS/mTLS. [Metrics](../crates/laminar-db/src/engine_metrics.rs), [HTTP ops](../crates/laminar-server/src/http/ops.rs), [pgwire](../crates/laminar-server/src/pgwire/mod.rs). G1/G4/G7 qualify operational readiness. |
@@ -319,22 +334,34 @@ checkpoint ABI bug. No recommendation to overwrite it from workspace version is 
 
 **P1 / PARTIAL. Modes:** embedded and single-node; keep cluster rejection.
 
-- **Problem/evidence:** `TableStore::upsert` inserts each new key and a one-row `batch.slice` without
-  a live row/byte quota; a surviving slice can retain a large backing array. MV upsert/multiset maps
-  also grow without a live quota. Multiset's count-times-32 estimate is not variable-width key
-  accounting. Snapshot materialization and checkpoint-capture caps happen too late to bound the
-  retained maps. Append mode's minimum-one-batch rule admits one oversized batch.
-  [Table insertion](../crates/laminar-db/src/table_store/mod.rs), lines 751–778;
-  [table rows](../crates/laminar-db/src/table_rows.rs);
-  [MV update](../crates/laminar-db/src/mv_store/mod.rs), lines 161, 282–319, 456–513.
-- **Reuse:** atomic staged MV deltas, existing checkpoint retained-buffer accounting, managed-state
-  growth-preflight patterns, Arrow buffer sharing, and current row/byte snapshot safeguards.
-- **Smallest solution:** enforce per-object retained row/byte quotas before applying a cycle or
-  table refresh; account encoded keys and owned scalar data. Reject an oversized append batch
-  explicitly. Measure slice amplification and compact retained rows only where that measurement
-  justifies the copy. Checkpoint estimates are not a drop-in exact live-memory counter. Preflight
-  quota failures across all affected MVs before publishing any of their updates. Do not evict
-  live SQL keys as if they were a cache.
+- **S10 progress (2026-09-20):** reference tables now reject growth beyond configurable per-table
+  limits (default 1,000,000 rows / 256 MiB). Admission charges encoded keys, conservative row
+  metadata and Arrow-reported allocation capacity, with sharing deduplicated within each table.
+  A surviving slice retains the full backing-allocation charge until its last live reference is
+  replaced. Upsert, incremental snapshot preparation and complete-inventory restore validate
+  before publication; failed multi-table installation preserves all old values and readiness.
+  Checkpoint capture estimates cover at least the live retention charge. Candidate state, incoming
+  batches, query/checkpoint scratch and unreported owner/allocator overhead require separate
+  headroom; these quotas do not cap process RSS. See the [accounting contract](../crates/laminar-db/README.md#reference-table-memory-limits)
+  and [S10 execution evidence](production-hardening-plan.md#s10--reference-table-live-quotas-2026-09-20).
+  [Table insertion](../crates/laminar-db/src/table_store/mod.rs);
+  [table rows](../crates/laminar-db/src/table_rows/mod.rs).
+- **S11 progress (2026-09-21; locally validated):** all four MV modes have configurable
+  live limits (default 1,000,000 rows / 256 MiB per view). Aggregate/append modes charge retained
+  Arrow capacity, upserts include owned keys and scalars, and multisets charge distinct encoded
+  rows and counts. Append eviction preserves complete batches; any oversized single batch fails.
+  All affected views pass quota, multiplicity and multiset expansion checks before MV mutation
+  or publication, reusing staged deltas under the existing lock. Restore validates private
+  candidates without truncating committed state. Correctness/static gates pass. Paired timings
+  show added preflight work and larger simultaneous staging (wide two-view peaks increase
+  4.46 MB for upserts and 8.78 MB for multisets); materialization/encoding timings also vary
+  with benchmark history. These are recorded costs, not regression-free execution. See the [MV accounting contract](../crates/laminar-db/README.md#materialized-view-memory-limits)
+  and [S11 execution evidence](production-hardening-plan.md#s11--local-materialized-view-quotas-and-cycle-preflight-2026-09-21).
+- **Remaining qualification:** live quotas exclude map spare capacity, schema/converter/allocator
+  overhead, staged input/deltas, query/subscriber snapshots and pinned checkpoint captures.
+  S11's simultaneous per-view staging and S10's private replacement candidates require measured
+  headroom. S12 must establish stable RSS and latency for the declared table/MV workload on target
+  hardware; per-object accounting alone does not establish a process memory ceiling.
 - **Tests:** unique-key growth, wide keys, replacements/deletes, an oversized single batch, atomic
   failed refresh, snapshot restore over the limit, and one surviving row from a large old batch.
 - **Acceptance:** all four live storage modes remain within declared quotas; rejected updates leave

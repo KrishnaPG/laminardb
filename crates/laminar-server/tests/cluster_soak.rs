@@ -91,6 +91,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "kafka")]
+mod workload_qualification;
+
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 use arrow_array::{Array as _, Int64Array, TimestampMillisecondArray};
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]

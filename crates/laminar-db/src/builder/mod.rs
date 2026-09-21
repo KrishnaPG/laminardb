@@ -349,6 +349,16 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Per-source Arrow-byte cap for embedded push queues (default 64 MiB).
+    /// Each source's snapshot history has an independent cap of the same size.
+    /// Typed handles are checked after Arrow conversion. Zero and values above
+    /// [`laminar_core::streaming::MAX_SOURCE_QUEUED_BYTES`] are rejected at build time.
+    #[must_use]
+    pub fn push_source_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.push_source_max_bytes = bytes;
+        self
+    }
+
     /// Source → coordinator channel capacity (default 64).
     #[must_use]
     pub fn pipeline_channel_capacity(mut self, capacity: usize) -> Self {
@@ -396,6 +406,39 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Set the maximum live row count of each local reference table (default 1,000,000).
+    /// Zero is rejected at build time. Over-limit updates and snapshots fail atomically.
+    #[must_use]
+    pub fn reference_table_max_rows(mut self, rows: usize) -> Self {
+        self.config.reference_table_max_rows = rows;
+        self
+    }
+
+    /// Set each local reference table's retained-memory charge limit (default 256 MiB).
+    /// See [`LaminarConfig::reference_table_max_bytes`] for the accounting boundary.
+    /// Zero is rejected at build time.
+    #[must_use]
+    pub fn reference_table_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.reference_table_max_bytes = bytes;
+        self
+    }
+
+    /// Set the live row limit for each local materialized view; must be nonzero.
+    /// Multisets count distinct rows. Defaults to 1,000,000.
+    #[must_use]
+    pub fn materialized_view_max_rows(mut self, rows: usize) -> Self {
+        self.config.materialized_view_max_rows = rows;
+        self
+    }
+
+    /// Set each local MV's retained-memory charge limit; must be nonzero.
+    /// See [`LaminarConfig::materialized_view_max_bytes`] for the accounting boundary.
+    #[must_use]
+    pub fn materialized_view_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.materialized_view_max_bytes = bytes;
+        self
+    }
+
     /// Per-port operator input-buffer cap in batches (default 256).
     #[must_use]
     pub fn pipeline_max_input_buf_batches(mut self, batches: usize) -> Self {
@@ -403,7 +446,9 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Per-port operator input-buffer cap in bytes.
+    /// Per-port retained Arrow-byte cap, including source priming (disabled by default).
+    /// Each fan-out port charges shared backing storage independently. An executed result
+    /// that cannot fit halts the pipeline before publication; it is never rerun in place.
     #[must_use]
     pub fn pipeline_max_input_buf_bytes(mut self, bytes: usize) -> Self {
         self.config.pipeline_max_input_buf_bytes = Some(bytes);

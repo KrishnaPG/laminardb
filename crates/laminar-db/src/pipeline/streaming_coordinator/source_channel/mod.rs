@@ -54,18 +54,7 @@ impl SourceMsgTx {
     fn batch_bytes(&self, batch: &RecordBatch) -> Result<u32, SourceQueueError> {
         // Arrow reports retained capacities, including backing storage for slices, nested arrays
         // and views. Charge aliases independently; deduplicating would add hot-path bookkeeping.
-        let bytes =
-            batch
-                .columns()
-                .iter()
-                .try_fold(std::mem::size_of::<RecordBatch>(), |total, column| {
-                    total.checked_add(
-                        column
-                            .get_array_memory_size()
-                            .saturating_add(std::mem::size_of::<arrow_array::ArrayRef>()),
-                    )
-                });
-        let bytes = bytes.unwrap_or(usize::MAX);
+        let bytes = laminar_core::streaming::retained_arrow_bytes(batch);
         if bytes > self.max_bytes {
             return Err(SourceQueueError::Oversized {
                 bytes,

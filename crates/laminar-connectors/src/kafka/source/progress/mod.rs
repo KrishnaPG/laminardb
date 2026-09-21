@@ -1,11 +1,12 @@
 //! Source-owned Kafka reader lag sampling, independent of intake backpressure.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use prometheus::core::{Collector, Desc};
-use prometheus::{proto::MetricFamily, Gauge, GaugeVec, IntGaugeVec, Opts, Registry};
+use prometheus::core::Collector;
+use prometheus::{Gauge, GaugeVec, IntGaugeVec, Opts, Registry};
 use rdkafka::Offset;
 
 use super::{
@@ -46,6 +47,15 @@ impl ProgressMetrics {
                 "Unix timestamp of the last nonempty successful source poll; zero until observed",
             )).expect("static Kafka metric descriptors are valid"),
         }
+    }
+
+    fn collectors(&self) -> [Box<dyn Collector>; 4] {
+        [
+            Box::new(self.reader_lag.clone()),
+            Box::new(self.available.clone()),
+            Box::new(self.sampled_at.clone()),
+            Box::new(self.last_batch.clone()),
+        ]
     }
 
     fn reconcile(&self, previous: &mut KafkaPartitionSet, current: &KafkaPartitionSet) {
@@ -93,31 +103,6 @@ impl ProgressMetrics {
     }
 }
 
-impl Collector for ProgressMetrics {
-    fn desc(&self) -> Vec<&Desc> {
-        let collectors: [&dyn Collector; 4] = [
-            &self.reader_lag,
-            &self.available,
-            &self.sampled_at,
-            &self.last_batch,
-        ];
-        collectors.into_iter().flat_map(Collector::desc).collect()
-    }
-
-    fn collect(&self) -> Vec<MetricFamily> {
-        let collectors: [&dyn Collector; 4] = [
-            &self.reader_lag,
-            &self.available,
-            &self.sampled_at,
-            &self.last_batch,
-        ];
-        collectors
-            .into_iter()
-            .flat_map(Collector::collect)
-            .collect()
-    }
-}
-
 pub(super) struct KafkaProgress {
     registry: Registry,
     metrics: ProgressMetrics,
@@ -128,14 +113,21 @@ pub(super) struct KafkaProgress {
 impl KafkaProgress {
     pub(super) fn register(registry: &Registry, source: &str) -> Result<Self, ConnectorError> {
         let metrics = ProgressMetrics::new(source);
-        // Register the family together so failure cannot leave a partial registration behind.
-        registry
-            .register(Box::new(metrics.clone()))
-            .map_err(|error| {
-                ConnectorError::ConfigurationError(format!(
-                    "register Kafka progress metrics for source '{source}': {error}"
-                ))
-            })?;
+        // Prometheus sums descriptor IDs for composite collectors; distinct source labels can
+        // collide in that sum. Register families separately and roll back only this attempt.
+        for (registered, collector) in metrics.collectors().into_iter().enumerate() {
+            let Err(error) = registry.register(collector) else {
+                continue;
+            };
+            let mut message =
+                format!("register Kafka progress metrics for source '{source}': {error}");
+            for previous in metrics.collectors().into_iter().take(registered) {
+                if let Err(cleanup_error) = registry.unregister(previous) {
+                    let _ = write!(message, "; registration rollback failed: {cleanup_error}");
+                }
+            }
+            return Err(ConnectorError::ConfigurationError(message));
+        }
         Ok(Self {
             registry: registry.clone(),
             metrics,
@@ -170,7 +162,9 @@ impl Drop for KafkaProgress {
         }
         // Only this source-owned registration can unregister. Worker clones never own cleanup,
         // so a late sample cannot remove or overwrite a replacement source's collectors.
-        let _ = self.registry.unregister(Box::new(self.metrics.clone()));
+        for collector in self.metrics.collectors() {
+            let _ = self.registry.unregister(collector);
+        }
     }
 }
 

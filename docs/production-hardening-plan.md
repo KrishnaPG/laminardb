@@ -1,7 +1,7 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e and S5–S7 verified locally; S4 dependency findings still block CI/release; S6a has an explained sort-latency cost; S6b shared reservation limits and S7 source queue bounds pass the local gates; S8–S13 remain unimplemented.
-**Date:** 2026-09-20. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
+**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 dependency findings still block CI/release. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix and a passing local release smoke matrix; production workload qualification remains open. S13 remains unimplemented.
+**Date:** 2026-09-21. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
 Implement the smallest correctness fixes first. Establish performance evidence before changing
@@ -182,6 +182,9 @@ existing bounded errors. This session alone does not close the whole G2 memory b
 
 ### S8 — close the embedded push-queue bypass (G2)
 
+**Progress (2026-09-20):** implemented and verified locally, with documented admission and
+concurrent-burst costs. See the dated S8 record below for ownership, compatibility and evidence.
+
 **Owns:** public core streaming source admission and its DB configuration plumbing.
 **Modes:** embedded/in-process sources. **Risk:** high API/performance. **Depends on:** S7 + fresh B0.
 
@@ -198,6 +201,11 @@ without leaked charges; unsuccessful admission leaves sequence/snapshot state un
 state the standalone generic-record API's accounting scope. Push/streaming benchmarks pass the gate.
 
 ### S9 — enforce prospective graph-buffer limits (G2)
+
+**Progress (2026-09-20):** implemented and locally validated. Prospective source/output admission,
+deferred input/frontier ownership and terminal failure handling pass correctness/static gates.
+Matched timings and profiles retain a wide-fan-out caveat: +17% in an unrestricted comparison,
+versus +3.9% in the longer fixed-core comparison. See the dated S9 record below.
 
 **Owns:** source priming, graph-port admission, output fan-out and deferred input ownership.
 **Modes:** all. **Risk:** high correctness/performance. **Depends on:** S7/S8 + fresh B0.
@@ -216,6 +224,9 @@ benchmark queueing and output admission as well as the core execution loop.
 
 ### S10 — quota live reference-table state (G3)
 
+**Progress (2026-09-20):** implemented and validated locally, with measured write/refresh costs.
+See the S10 execution evidence below for the accounting contract, tests and performance caveats.
+
 **Owns:** table storage/refresh/restore and quota configuration.
 **Modes:** embedded and single-node; retain cluster rejection.
 **Risk:** high accounting/atomicity. **Depends on:** S9 + fresh B0 for any hot-path changes.
@@ -225,6 +236,8 @@ retained Arrow storage with explicit treatment of shared buffers and capacity. A
 retain its original large allocation; existing checkpoint capture estimates are not an exact
 live counter. Avoid a whole-map clone per update. Measure retention amplification before choosing
 compaction; no eviction of live SQL keys or generic state-backend layer.
+Reuse `TableStore::prepare_snapshot`, `install_prepared_snapshots` and the existing staged
+checkpoint replacement, validating quota changes before their atomic installation boundary.
 
 **Exit:** growth and over-limit restore fail atomically; replacements/deletes release the expected
 retention; wide/nested/dictionary/view arrays and one surviving slice of a large batch are covered.
@@ -232,6 +245,11 @@ Failed multi-table refresh preserves the previous complete installation and read
 refresh and checkpoint-under-load measurements remain acceptable.
 
 ### S11 — quota all local MV storage modes (G3)
+
+**Progress (2026-09-21):** implemented and validated locally, with measured MV preflight/staging
+costs and variable snapshot/checkpoint timings documented in the S11 execution evidence below.
+Fresh baseline source, binaries and measurements are recorded under ignored `target/s11-mv/`;
+prior uncommitted S8–S10 work is preserved. S12 workload qualification remains outstanding.
 
 **Owns:** MV storage, publication preflight and restore.
 **Modes:** embedded and single-node; retain cluster rejection.
@@ -251,6 +269,11 @@ state clone or lock needs bounded transient memory and benchmark evidence. MV up
 and coordinator benchmarks/profiles pass.
 
 ### S12 — qualify the integrated workload (G5)
+
+**Status (2026-09-21):** the workload observer and local release smoke matrix pass, including
+the Kafka multi-source startup fix found during preparation. No production workload has been
+qualified. See the S12 execution evidence and the
+[workload harness instructions](../tests/qualification/README.md).
 
 **Owns:** extensions to existing soak/oracle tooling and immutable evidence bundles.
 **Depends on:** S1–S9, and S10/S11 when tables/MVs are advertised.
@@ -369,8 +392,9 @@ A passing PR closes its scoped gap only; production readiness requires the corre
 evidence. S1–S3, S4a–S4e and S5 are **implemented and verified locally**. S4 is **partially
 implemented**; the enforced scans still fail on unresolved dependency findings. B0 now has local
 diagnostic timings and CPU/allocation profiles. S6a repairs cached-plan retention; S6b reservation
-limits and S7 source queue byte bounds are **implemented and verified locally**. S8–S13 remain
-**not implemented**. Production
+limits, S7 source queue byte bounds and S8 embedded push bounds are **implemented and verified
+locally**. S8's admission and concurrent-burst regressions are characterized below; this is not
+a blanket latency or RSS qualification. S9–S13 remain **not implemented**. Production
 qualification is open.
 
 ## Implementation progress
@@ -805,7 +829,8 @@ The memory ownership contract for the later serial work is deliberately limited 
 | Parked/staged cycles | The coordinator retains parked messages and cycle buffers until execution, retry, recovery or cleanup resolves them. Cursor settlement follows successful publication. | These retained references outlive dequeue; a released queue permit cannot serve as their memory budget. |
 | Graph ports | `OperatorGraph` admits and retains input/output batches, then releases port ownership when consumed or cleared. | Existing Backpressure/Fail/BestEffort shedding applies; pre-route current-usage checks can overshoot on the next batch. S9 owns prospective admission and fan-out treatment. |
 | DataFusion reservations | The per-DB runtime pool owns participating reservations until the consumer releases/drops them; main, graph and auxiliary contexts share it. | S6b adds a 256 MiB configurable fallible-reservation limit and disables DB-context spilling. Direct Arrow/expression allocations remain outside reservations. |
-| Tables/MVs | Stores retain live keys/rows through upsert, refresh, publication and restore; replacement/delete or configured append retention releases them. | No general live-byte quota; shared Arrow slices can retain large allocations. S10/S11 own preflight and failure atomicity. |
+| Reference tables (S10) | Stores retain live keys/rows through upsert, refresh and restore; replacement or drop releases ownership. | Per-table row/retained-byte preflight counts shared Arrow capacity once per table and preserves the previous installation on failure. Prepared replacements, input scratch and pinned checkpoint/query snapshots have separate ownership and need headroom. |
+| MVs | Stores retain aggregate/append/upsert/multiset results through publication and restore; replacement/delete or configured append retention releases them. | No comprehensive live-byte quota across storage modes. S11 owns preflight and failure atomicity. |
 | Checkpoint scratch | Capture retains immutable frames while background serialization/persistence overlaps live state, then releases them on completion/cleanup. | Existing checkpoint data limits do not establish a whole-process or transient scratch-memory allowance. |
 
 No values in this ownership inventory are an additive RSS guarantee. Establish measured headroom
@@ -1108,3 +1133,818 @@ since the correctness gates; formatting and all-target Clippy passed again after
 The final diff review found no dependencies, readability exceptions, per-row bookkeeping or
 unrelated changes. The next serial session is S8. S4 dependency findings and production
 release/upgrade qualification remain open.
+
+
+### S8 — bound embedded push queues and snapshot history (2026-09-20)
+
+**Status:** implemented and verified locally; admission and concurrent-burst costs are recorded below.
+Starting HEAD: `3688fab2ad8282cad8f7c1f2cc7270ed54ec361e`. Changes are uncommitted.
+**Modes:** embedded/in-process source admission, including those handles where admitted by other
+runtime modes. Cluster SQL/delivery admission and checkpoint formats are unchanged.
+
+`SourceConfig::max_queued_bytes` gives each core source a **64 MiB** Arrow-byte budget shared
+by all producer clones, its input ring and queued broadcast references. A private batch owner
+retains one semaphore reservation until the last queued reference is delivered, evicted or
+dropped. Single-subscriber delivery can move the original batch instead of cloning its column
+vector. Count saturation and byte saturation return `ChannelFull`; an individually oversized
+batch returns `BatchTooLarge { bytes, limit }`. Both are nonblocking with respect to capacity.
+Closed drain tasks return `Disconnected`. Failed pushes do not advance sequence or watermark.
+Core constructors remain infallible; invalid byte limits reject Arrow pushes with `InvalidConfig`.
+
+`LaminarConfig::push_source_max_bytes` and the corresponding builder method configure each
+registered source. DB construction rejects zero and values above the core semaphore/u32 maximum.
+Typed handles convert records to Arrow before admission, so variable-width records cannot bypass
+the limit. Raw handles, SQL inserts and API writers share the same admission path. Handles and
+source metrics include byte saturation in `is_backpressured`; utilization remains count based.
+
+Snapshot history is a separate owner capped by the **same byte limit**, plus its existing count
+limit. Admission and snapshot publication share the source's history mutex; rejected pushes leave
+history and notifications unchanged, and concurrent successful pushes preserve broadcast/history
+order. Successful pushes evict oldest history until both bounds fit, without dropping queued input.
+The accounting helper reuses S7's retained-array calculation, now shared from core; S7's charge
+and admission semantics are unchanged. Aliases are charged independently, and slices/views/nested
+arrays retain their backing-storage charge.
+
+Each caller can hold input/conversion scratch before admission. Snapshot readers and returned
+subscription batches have separate ownership and may outlive queue/history release. Schema metadata,
+allocator overhead, downstream graph/state/sink retention and process RSS are outside these caps.
+The standalone generic `Record` API remains count bounded without arbitrary heap-size estimation.
+The query-result bridge also retains its separate count-bounded output ownership; a regression
+verifies that a query result larger than 64 MiB is not silently truncated by an input budget.
+Existing broadcast lag/eviction semantics remain; this is not a new delivery guarantee.
+
+Cancellation follows actual ownership. Dropping a subscriber releases its queued references;
+writer flush is still a no-op and writer close does not release another owner's data. If the core
+drain task is cancelled, Crossfire retains unread ring values while producer handles survive.
+Those values keep their charges until the last producer drops, while further pushes fail closed.
+The cancellation test checks this lifetime rather than clearing a counter while storage remains.
+
+**Compatibility:** synchronous push signatures and infallible core constructors are preserved.
+Existing exhaustive `SourceConfig`/`LaminarConfig` literals must supply the new field or use
+`..Default::default()`; exhaustive `StreamingError` matches must handle `BatchTooLarge`.
+Callers that previously queued more than the new default must configure a suitable limit, retry
+`ChannelFull` after consumers progress, or split an individually oversized batch. Snapshot history
+can now evict by bytes before reaching its count limit.
+
+**Correctness:** before the change, the new regression admitted a 72 MiB Arrow batch. Twenty new
+tests cover exact limits, wide slices/views/nested arrays, shared concurrent producers, count/byte
+saturation, schema/configuration errors, failed watermark updates, broadcast eviction, cancelled
+receives, closed runtimes, final-producer cleanup, typed conversions, snapshot ordering/eviction,
+writer flush/close and query-output scope. Focused runs passed **52 core streaming tests** and
+**65 DB admission tests**. All **6,078 workspace library/server tests passed, zero failed, one
+existing ignored** ONNX test. Both Clippy configurations with `-D warnings`, nightly formatting,
+readability, analytical-dependency and whitespace checks passed. Validation used one Cargo job,
+two test threads and `RUST_MIN_STACK=8388608`; existing cached OpenSSL symbol warnings did not
+prevent linking. No dependencies or readability baseline allowances were added.
+
+**Performance:** matched optimized builds use the same B0 Ryzen 9 7900X / WSL2 host, Rust 1.95.0,
+the combined core/DB no-default-features build, thin LTO, one codegen unit and debug symbols.
+Builds, timings and profiles ran serially. Final cases run in separate processes, candidate then
+baseline, with 100 Criterion samples, a three-second warmup and a twenty-second measurement
+target. The table reports means, not slopes or event-latency percentiles. Setup/shutdown are
+untimed and repeated per Criterion sample; profiling includes them.
+
+Core focused cases enqueue and deliver 32 messages to a subscriber: Arrow batches contain 256
+rows, generic records one row. DB-handle cases enqueue 32 one-row batches, drain intake with no
+broadcast subscriber and retain snapshot history. Both DB fixtures explicitly configure 64 history
+entries in source DDL; the earlier builder-only setting was overridden by the DDL default. Original
+runs remain in the evidence but are superseded by the matching corrected fixtures.
+
+The existing wide pipeline burst can exceed 64 MiB once Arrow metadata is charged. It now retries
+only `ChannelFull`, with a deadline, and still verifies every output row. Both versions use this
+same fixture and its existing 128 MiB output-history allowance. The initial unhandled rejection
+is retained as invalid evidence. No input budget was widened and no accepted work was omitted.
+
+| Criterion mean | Before | After | Change |
+|---|---:|---:|---:|
+| Window-assignment control | 5.18 ns | 5.23 ns | +0.94% |
+| Core Arrow, 16-byte values, 32 batches | 3.588 µs | 5.417 µs | +50.97% |
+| Core Arrow, 4 KiB values, 32 batches | 3.596 µs | 5.425 µs | +50.87% |
+| Core generic records, 16-byte values, 32 records | 9.675 µs | 8.085 µs | −16.43% |
+| Core generic records, 4 KiB values, 32 records | 15.351 µs | 14.490 µs | −5.60% |
+| DB Arrow, 16-byte values, 32 batches | 3.543 µs | 4.541 µs | +28.17% |
+| DB Arrow, 4 KiB values, 32 batches | 3.523 µs | 4.601 µs | +30.58% |
+| DB typed handles, 16-byte values, 32 records | 10.653 µs | 9.883 µs | −7.22% |
+| DB typed handles, 4 KiB values, 32 records | 14.766 µs | 16.680 µs | +12.96% |
+| Plain SELECT, 1,024 rows | 142.815 µs | 141.424 µs | −0.97% |
+| GROUP BY, 1,024 rows / 4 groups | 156.795 µs | 155.048 µs | −1.11% |
+| Sort / top 10, 1,024 rows | 188.514 µs | 184.906 µs | −1.91% |
+| Three-query chain, longer confirmation | 172.015 µs | 170.791 µs | −0.71% |
+| Narrow burst | 179.610 µs | 175.955 µs | −2.03% |
+| Four-source burst, longer confirmation | 1.028 ms | 1.176 ms | +14.37% |
+| Wide burst, matched linear sampling | 6.470 ms | 5.954 ms | −7.96% |
+
+The Arrow microbenchmarks add about **57 ns per core batch**, **31–34 ns per DB Arrow batch**,
+and **60 ns per wide record converted by a DB handle**. Retained-byte measurement, semaphore
+reservation, a shared queued owner and final-release work are deliberate additions. CPU samples
+attribute 8.4% inclusive time to core admission and 16.9% to batch ownership transfer/release in
+the wide core case. In the wide typed DB case, admission contributes 5.2%, queued-owner destruction
+3.7%, and overall source publication grows from 29.0% to 32.9% of sampled CPU. Parent/child
+percentages overlap and must not be summed. These profiles explain the fixed per-batch cost;
+there is no per-row bookkeeping loop. An initial generic-record slowdown prompted isolated runs
+and a profile-guided inlining hint on the existing typed send helper. Final generic cases show
+no regression; their observed improvements are diagnostic, not promised speedups.
+
+The first query-chain result (+4.71%, approximate change interval +0.20% to +10.21%) was uncertain.
+A 45-second confirmation, baseline then candidate, measured −0.71% (−2.44% to +1.04%). The
+four-source slowdown persisted: +13.16% initially and **+14.37%** in the longer run (approximate
+interval +4.19% to +25.59%). This concurrent-ingestion cost is retained, not described as noise.
+
+A separate counter diagnostic records warmup and measured iteration counts, including each
+sample's untimed initial burst. Both versions completed exactly **29,457 bursts** per four-source
+run. Unrestricted execution added **3.16% instructions** and **8.62% user cycles** per burst;
+its mean latency increased 8.29%. Restricting both processes to virtual CPUs `0,2,4,6` (distinct
+reported cores) retained the additional work (+3.34% instructions), while cycles rose 1.93% and
+mean latency changed −9.27%. This supports additional per-batch accounting work with scheduling
+and cache effects amplifying the concurrent result; it does not establish a universal 14% cost
+or remove the unrestricted regression. The diagnostic uses the same binaries, inputs and limits,
+100 samples and 1,000 bootstrap resamples, with profiling/harness work included in the counters.
+No host-wide affinity or power setting was changed.
+
+Wide-burst timing remains variable. Shorter repeats changed sign and some adaptive runs selected
+different flat/linear sampling modes. The final pair uses a 120-second target, 100 samples and
+verified linear sampling with **20,200 measured bursts in each version**. Its −7.96% mean change
+still has an approximate interval of −25.92% to +14.98%; it is not evidence of a speedup or a
+less-than-5% worst-case change. The unchanged catalog bridge opportunistically concatenates
+available batches and skips copying when only one is available, so arrival/poll timing matters.
+CPU captures attribute about 55–56% of four-source CPU and 92–94% of wide-burst CPU to Arrow
+concatenation. The ingress ownership cost and this batching/scheduling sensitivity are recorded
+as a performance tradeoff of bounded admission, not hidden by dropping the wide workload.
+
+| Profile | IPC before → after | Peak allocated heap before → after |
+|---|---:|---:|
+| Core Arrow, 4 KiB | 2.75 → 2.01 | 3.43 → 2.89 MB |
+| Core generic records, 16 bytes | 3.43 → 3.16 | 3.43 → 2.88 MB |
+| DB typed handles, 4 KiB | 2.59 → 2.51 | 1.73 → 1.73 MB |
+| Four-source burst | 0.61 → 0.62 | 20.06 → 19.19 MB |
+| Wide burst | 0.19 → 0.20 | 157.63 → 144.88 MB |
+
+CPU sampling used 49 Hz DWARF stacks with no lost samples; reports disable inline-symbol lookup.
+Grouped user cycles/instructions ran for 100% of their requested time. Virtualized counters include
+runtime/harness work. Kernel scheduling counters were not used; no zero-context-switch claim is
+made. Some frames remain unresolved, so attribution is qualitative.
+The memory-heavy pipeline profiles remain below the IPC > 2 heuristic in both versions. Heaptrack
+runs execute differing work counts and include setup, concatenation, output history and runtime
+allocations. Wide-burst instrumented RSS increased **334.43 → 399.79 MB**, despite lower peak
+intercepted heap allocation. This observation remains in the evidence: profiler/allocator overhead
+and other owners are outside the source caps, and these captures do not qualify a process RSS bound.
+
+The 64 MiB default accommodates the focused core 32-batch burst (256 rows per batch, up to 4 KiB
+per row; about 32 MiB conservatively charged), while the regression rejects a 72 MiB batch.
+This is a diagnostic configuration choice, not production workload qualification. The >5% ingress
+and concurrent-burst costs above are explained and retained as the bounded-ownership tradeoff.
+S12 must qualify throughput, latency and RSS for the selected production composition.
+
+All **106 final build/smoke/timing/profile commands passed**. Source hashes match the final
+correctness/static-gate run; no runtime changes followed it. Commands, failed pre-change regression,
+raw samples, confidence intervals, CPU/heap reports and identities are under `target/s8-push/`,
+including `final-summary.json`, `confirm-summary.json`, `wide-linear-summary.json`,
+`diagnostic-summary.json`, `final-profiles-summary.json` and `final-source-hashes.json`.
+The baseline snapshot and identical fixtures are preserved there; native binaries/profiles remain
+under `/home/sujit/.cache/laminardb-b0-9bb1e996/s8-push`. Final SQL benchmark SHA-256:
+`0be35ab4be65ddb5e0157a7352c16e37075492279508b467c38c3deae1c4e9e3`.
+Final diff review found no dependencies, readability exceptions or unrelated edits. The next
+serial session is **S9**. Remaining memory owners, S4 dependency findings and production
+release/upgrade qualification remain open.
+
+### S9 — enforce prospective graph-buffer limits (2026-09-20)
+
+**Status:** implemented and locally validated, with a documented wide-fan-out performance caveat.
+**Applies to:** embedded, single-node and cluster graph execution. Cluster SQL and delivery
+admission are unchanged. Starting HEAD was `3688fab2ad8282cad8f7c1f2cc7270ed54ec361e`, with the
+verified S8 working-tree changes retained. The before snapshot includes S8 and an identical
+S9 benchmark fixture; `.zcode/` remains unrelated and untouched.
+
+**Ownership and failure contract.** Source priming and every output destination now validate
+the prospective per-port batch count and conservative retained Arrow charge before retaining
+input or publishing the producer's result. All source views and all fan-out destinations are
+preflighted before any of that admission mutates the graph. Charges reuse S8's backing-storage
+accounting, including slices, nested/view arrays and fixed metadata. Each port pays the full
+charge even when buffers are shared; these limits do not measure unique process heap or RSS.
+Exact duplicate edge registration is normalized while building the graph.
+
+A source passthrough can know its output size before execution, so Backpressure defers it when
+the destination cannot fit the accepted input. The input, per-source progress and watermark
+remain held until consumption. A general operator can change state before its output size is
+known. If its result cannot fit, the typed `GraphBufferBudgetExceeded` poisons that generation,
+halts normal/checkpoint execution, and prevents retry or capture of the mutated state. Startup
+error capture preserves that terminal disposition. Ordinary stop/start cannot clear it; cluster
+terminal authority also survives process replacement. Recovery requires explicit terminal-fault
+resolution and a valid committed cut after changing the batch size or configured capacity.
+
+Cached SQL providers bind the exact accepted inputs immediately before their consumer runs,
+including input retained across cycles. Separate dynamic sources have separate graph ports;
+static/reference lookup providers remain separate. An empty port clears an earlier branch's
+provider view. This prevents both losing deferred data when cycle cleanup clears providers and
+rereading another branch's input. Single-input execution borrows its existing batch roster;
+multi-input local SQL retains its existing combined input semantics.
+
+Best-effort `ShedOldest` removes the oldest existing/incoming batches before retaining the
+suffix, including an individually oversized batch. Existing discarded-row metrics account for
+that loss; durable delivery continues to reject shedding. The default count cap remains 256;
+zero disables the count cap. The byte cap remains optional (`None`), and a configured zero-byte
+cap is rejected. Embedded configuration and both server startup paths apply the same limits;
+the server TOML options are startup settings, not hot-reloaded limits. A finite graph byte cap
+must be selected for a bounded workload; S9 does not establish a default process-memory envelope.
+
+The cap covers graph-held input only. Caller/source ownership, staged coordinator input, operator
+working/output construction, result publication, live DataFusion provider snapshots, subscription
+history and checkpoint scratch have separate lifetimes and may overlap. S7/S8 and shared
+DataFusion reservations remain separate controls, not additive proofs of total memory usage.
+
+**Correctness evidence.** The added source-priming regression fails against the pre-change graph.
+Coverage includes atomic multi-source/visible/positioned admission, exact and nearly-full limits,
+wide slices and nested/view arrays, prospective count limits, multi-port fan-out, duplicate edge
+normalization, shedding, source/frontier deferral, cached multi-input SQL and branch isolation.
+A stateful SUM test compares results with an independent expected value, rejects output after
+mutation, verifies retry/drain/capture fencing, restores the prior cut in a fresh graph, and
+replays once. Public stop/start, startup error round trips and normal/checkpoint callback mapping
+exercise the terminal fault boundary.
+
+Final Windows correctness gates pass: **6,097 workspace/server tests**, with one existing ONNX
+model-download test ignored; all **eight** checkpoint/recovery/source-isolation integration
+tests pass. The workspace run explicitly enables `laminar-db/cluster` and the `laminardb` binary.
+Both workspace Clippy configurations (`--all-features --all-targets` and `--no-default-features`,
+with `-D warnings`), nightly formatting, analytical dependency checks and whitespace validation
+pass. Readability reports 19 module / 194 function exceptions; the now-smaller error formatter's
+obsolete exception was removed. Windows builds use one Cargo job, two test threads and an 8 MiB
+test stack. Existing cached OpenSSL debug-symbol and proc-macro future-compatibility notices are
+unchanged. The 1,005 recorded source/manifest hashes match the final passing run.
+
+Final commands, raw benchmark samples, profiles and source/binary identities are recorded under
+ignored `target/s9-graph/`; native Linux binaries and captures are under
+`/home/sujit/.cache/laminardb-b0-9bb1e996/s9-graph`. Performance results and their limits follow.
+
+**Measurement protocol.** Before/after optimized binaries use the same B0 Ryzen 9 7900X / WSL2
+host, Rust 1.95.0, no default features, thin LTO, one codegen unit and debug symbols. Existing
+SELECT, GROUP BY, sort/Top-K and query-chain cases exercise execution alongside core assignment,
+grouping and checkpoint-manifest controls. The new graph cases send sixteen 256-row batches per
+source through an intermediate stream and then one or four consumers. Payloads are 16 bytes or
+4 KiB; a two-source UNION case checks distinct SQL input providers. Each burst consumes and
+asserts every expected output row. Graph ports use 64 batches / 32 MiB, with 32 MiB output history
+per stream. Setup and shutdown are untimed; profiles include runtime/setup costs.
+
+The initial fan-out fixture mistakenly reserved five 64 MiB output histories against the existing
+256 MiB process subscription budget. That warmup failure remains in the evidence. Both final
+fixtures use 32 MiB histories, enough for the complete 16 MiB wide burst; graph and ingress limits
+were not enlarged to make it run. The public terminal-fault test also retains its initial failure
+logs: it now joins the compute thread before reading the diagnostic and asserts the existing
+shutdown error after a terminal halt.
+
+CPU/heap profiles cover all four graph cases in both versions. Sampling uses 49 Hz DWARF stacks
+with inline-symbol lookup disabled; all captures report zero lost samples. Grouped user cycles
+and instructions ran for 100% of their requested time. IPC includes the harness and runtimes on
+this virtualized host. Some frames remain unresolved; inclusive parent/child percentages overlap
+and cannot be summed. Wide fan-out spends about 86–87% of sampled CPU in existing Arrow
+concatenation in both versions.
+
+| Graph profile | IPC before → after | Peak allocated heap before → after | Instrumented RSS before → after |
+|---|---:|---:|---:|
+| Single input | 0.580 → 0.571 | 35.27 → 35.27 MB | 105.56 → 104.52 MB |
+| Four-way fan-out | 0.735 → 0.725 | 35.93 → 35.99 MB | 108.09 → 107.49 MB |
+| Wide four-way fan-out | 0.283 → 0.286 | 44.22 → 44.23 MB | 137.44 → 148.13 MB |
+| Two-input UNION | 0.671 → 0.681 | 35.46 → 35.43 MB | 120.46 → 110.17 MB |
+
+All profiles remain below the IPC > 2 heuristic in both versions. These measurements include
+asynchronous ingress, copying, output history and runtime work; they do not qualify hardware
+efficiency for a production workload. Heaptrack runs perform different work counts and include
+profiler/setup overhead. Wide-burst instrumented RSS rises about 7.8% despite nearly unchanged
+peak intercepted heap; this is retained in the evidence, not treated as proof of an RSS bound.
+
+Timings use 100 Criterion samples and three-second warmup targets. Initial control measurements
+target ten seconds, pipeline measurements twenty seconds. Four cases whose approximate change
+interval reached above 5% were repeated for 45 seconds in reversed order (baseline then candidate).
+The table reports Criterion means, not slopes or event-latency percentiles. All original samples
+and individual confidence intervals remain in the evidence.
+
+| Criterion mean | Before | After | Change |
+|---|---:|---:|---:|
+| Window assignment | 5.25 ns | 5.25 ns | +0.13% |
+| Owned grouping keys | 22.977 µs | 23.238 µs | +1.14% |
+| Borrowed grouping keys | 7.135 µs | 7.011 µs | −1.73% |
+| Manifest load, 2 sources | 110.989 µs | 112.691 µs | +1.53% |
+| Manifest load, 10 sources | 115.415 µs | 117.929 µs | +2.18% |
+| Manifest load, 50 sources | 154.193 µs | 154.962 µs | +0.50% |
+| SELECT, 1,024 rows | 146.031 µs | 146.935 µs | +0.62% |
+| GROUP BY, 1,024 rows / 4 groups | 157.365 µs | 157.670 µs | +0.19% |
+| Sort / top 10, 1,024 rows | 187.500 µs | 183.931 µs | −1.90% |
+| Three-query chain, 45-second confirmation | 172.894 µs | 172.101 µs | −0.46% |
+| Graph single-input burst, confirmation | 160.209 µs | 160.619 µs | +0.26% |
+| Graph four-way fan-out, confirmation | 188.054 µs | 182.420 µs | −3.00% |
+| Graph two-input UNION | 173.254 µs | 174.703 µs | +0.84% |
+| Wide four-way fan-out, unrestricted confirmation | 1.098 ms | 1.286 ms | +17.04% |
+| Wide four-way fan-out, fixed cores / 120 seconds | 1.138 ms | 1.182 ms | +3.91% |
+
+The unrestricted wide case cannot be called regression-free: its initial result was +11.24%
+(approximate interval −1.84% to +28.31%), and the longer comparison was +17.04% (+8.49% to +26.47%).
+The other three confirmations have upper interval bounds below 1.8%. Wide-case allocation
+captures show almost identical concatenation allocations per admitted input batch (1.7507 vs
+1.7506) and nearly identical retained heap. Provider rebinding does add small roster/Arc
+allocations per consumer; it is necessary for deferred-input and branch correctness.
+
+To isolate the wide-case gap, matched 45-second runs also recorded hardware counters per
+completed burst, including warmup and setup bursts. With CPU affinity fixed to `0,2,4,6`,
+the latency mean changes +1.73%, instructions/burst +1.57%, cycles/burst −0.29%, and user CPU
+time/burst +1.62%. A separate unrestricted diagnostic changes the latency mean +3.96%,
+instructions/burst +2.11%, cycles/burst +3.97%, and CPU time/burst +2.94%. These diagnostics
+support sensitivity to execution placement and the memory-copy-heavy workload; they do not
+erase the earlier +17% result or establish a production latency guarantee. A longer fixed-core
+confirmation targets 120 seconds per version, using the original bootstrap settings and the
+same 105,207 completed bursts in both processes. It measures +3.91% latency, +1.59% instructions,
++4.14% cycles and +2.61% CPU time per burst. Its approximate latency-change interval is
++0.36% to +7.59%; it does not prove a universal below-5% bound.
+
+The extra work is at batch/port boundaries: prospective charges and exact provider bindings
+add fixed bookkeeping and roster/Arc ownership. Cached SQL needs those bindings even on its
+compiled path because evaluation can fall back to a cached plan within the same call. The
+profiles and controlled counters explain a small added execution cost alongside substantial
+placement sensitivity in a workload dominated by Arrow copying. They do not isolate a single
+cause of the entire unrestricted +17% gap. That observed slowdown is retained as a capacity
+tradeoff of the correctness fix and must be included in S12's workload qualification; it is
+not represented as a regression-free result. No byte limit, workload width or regression
+threshold was increased to obtain the later measurements.
+
+All **88 final build/smoke/timing/profile/diagnostic commands passed**. The performance verdict
+is qualified as above. Raw samples, confidence intervals, allocation counts, profiles and
+identities are in `target/s9-graph/`, including `final-summary.json`, `confirm-summary.json`,
+`diagnostic-summary.json`, `pinned-long-summary.json`, `final-profiles-summary.json`,
+`performance-verdict.json` and `final-source-hashes.json`. Both benchmark fixtures are
+byte-identical (SHA-256 `01f955a6de5f7dcfa14caa7cf1d0a417c61cd3b0d8b3b27d6da4a35b0cc4ff70`).
+Candidate SQL benchmark SHA-256:
+`1f1111f3e50b28cbc088dc8c851c3eac8168fcd7065a3f48c796196a546f921f`.
+
+The next serial implementation session is **S10**, using the existing prepared table-snapshot
+installation and restore boundaries, then S11 for local MVs. S4 dependency findings still block
+release. S12 must select and qualify throughput, latency, RSS and recovery bounds on target
+hardware, including this wide-input case; S13 must verify the chosen release upgrade pair.
+These local tests and no-default-features embedded benchmarks do not certify a native cluster
+or external-broker/cloud workload. Changes remain uncommitted.
+
+### S10 — reference-table live quotas (2026-09-20)
+
+**Implemented and validated locally, with the performance qualifications below.** Embedded
+and single-node tables now have independent per-table limits, configured through
+`reference_table_max_rows` (default 1,000,000) and `reference_table_max_bytes` (default 256 MiB).
+Both must be nonzero; the server validates and passes them through its shared builder path.
+Cluster table admission remains fail-closed.
+
+Upsert preparation retains only the incoming distinct keys and affected allocation deltas.
+It charges encoded keys, conservative row/array descriptors and original Arrow allocation
+capacity. Shared allocations count once per table across columns, rows and admitted batches;
+replacing the last live reference releases the allocation charge. Last-key-wins upserts and
+unique-key snapshots keep their existing semantics. There is no whole-map clone, live-key
+eviction, buffer compaction or alternate backend. Nested children, dictionary/view storage and
+validity buffers use the same recursive accounting. Custom buffers use the allocation extent
+reported by the pinned Arrow implementation; an opaque owner's unreported memory is excluded.
+
+Startup snapshot loading now validates each polled batch into a bounded candidate, stops on
+failure and closes every source. Restore validates the declared row limit before decoding and
+checks each decoded batch before reading the next. Both paths preserve their existing atomic
+installation boundaries; a failing second table cannot change either table or its readiness.
+Installation rechecks current limits and captured table identities before any replacement.
+The checkpoint format remains version 2. A selected checkpoint that exceeds current limits is
+rejected without falling back to another cut.
+
+Checkpoint capture estimates now cover at least the live retained-memory charge, so a small
+surviving row cannot pin an uncharged large allocation after replacement. Live, candidate and
+checkpoint ownership remain separate: refresh/restore may retain the old installation plus
+one quota-checked candidate per table and one incoming decoded batch. Encoded checkpoint
+storage, input/key/delta scratch, query snapshots, hash-map spare capacity, schema/allocator
+overhead and opaque external owners require separate headroom. These are not process RSS caps.
+
+The regression suite covers exact byte-boundary replacement, duplicate upserts, encoded wide
+keys, shared columns/batches, spare capacity, empty slices, nested/dictionary/view/validity
+buffers, multi-table quota failures, readiness preservation, bounded snapshot polling and
+source cleanup. A deterministic sequence of accepted/rejected updates is compared with an
+independent ordered map. Streaming restore brought `restore_checkpoint` below the readability
+exception threshold; its obsolete baseline entry was removed.
+
+**Correctness and static validation.** The final Windows run passed **6,112 workspace library
+and server-binary tests**, with one existing ignored model-download test, plus **8 checkpoint,
+process-crash/restart and shared-source integration tests**. It enabled `laminar-db/cluster`
+to retain cluster rejection/recovery coverage. Focused table, source-cleanup and public
+configuration regressions also pass. Both required workspace Clippy configurations pass
+(`--all-features --all-targets` and `--no-default-features`, warnings denied), as do nightly
+formatting, readability, analytical-dependency consistency and whitespace checks. Readability
+now retains 19 module and 193 function exceptions. No dependency versions changed.
+
+Performance uses the same Ryzen 9 7900X / WSL2 host, Rust 1.95.0, optimized thin-LTO profile
+and fixed virtual CPUs `0,2,4,6` for both versions. The baseline is the starting S9 working
+tree with the new table benchmark fixture added; candidate runtime changes are S10 only.
+Both fixtures execute the same operations; their source differs only in formatting. The
+`benchmark-internals` feature implies cluster support, but these measurements exercise local
+tables, not distributed table admission. Final timings run without concurrent compilation
+or tests, using 100 Criterion samples, three-second warmup targets and fifteen-second table
+measurement targets. They measure means, not event-latency percentiles or production SLOs.
+
+| Operation, 1,024 rows | Before | After | Change |
+|---|---:|---:|---:|
+| Upsert, 16-byte payload | 92.400 µs | 136.494 µs | +47.72% |
+| Upsert, 4-KiB payload | 89.559 µs | 135.183 µs | +50.94% |
+| Scan, 16-byte payload | 30.519 µs | 25.884 µs | −15.19% |
+| Scan, 4-KiB payload | 112.998 µs | 111.015 µs | −1.75% |
+| Refresh, 16-byte payload | 166.432 µs | 207.328 µs | +24.57% |
+| Refresh, 4-KiB payload | 164.562 µs | 194.598 µs | +18.25% |
+| Capture/update/encode, 16-byte payload | 444.694 µs | 496.618 µs | +11.68% |
+| Capture/update/encode, 4-KiB payload, initial | 5.620 ms | 6.951 ms | +23.68% |
+| Capture/update/encode, 4-KiB payload, longer confirmation | 5.579 ms | 5.029 ms | −9.86% |
+| Refresh/replace/scan with one surviving old row, 16-byte payload | 306.419 µs | 382.464 µs | +24.82% |
+| Refresh/replace/scan with one surviving old row, 4-KiB payload | 292.830 µs | 377.064 µs | +28.77% |
+
+The update/refresh costs are real. Atomic admission stages distinct keys and checks affected
+row/allocation deltas before mutating the existing map; each stored row also retains its batch
+descriptor. This adds approximately 44–46 µs per 1,024-row upsert in these cases, with similar
+cost for narrow and wide payloads. No payload-compaction copy was added. Public table writes
+and snapshot loading run outside the coordinator record path; the table-scan measurements
+exercise the changed representation used by query materialization. The checkpoint case
+captures a cut, applies an update, then encodes the pinned cut in one benchmark iteration.
+It does not establish a concurrent ingestion or external-storage checkpoint SLO.
+
+The longer checkpoint comparison targets 45 seconds per version, reversing the initial order
+to baseline then candidate. Its −9.86% result does not erase the initial +23.68% result or prove
+a universal below-5% bound. The encoding-heavy workload is variable on this host; neither a
+stable checkpoint regression nor a stable speedup is established. Both comparisons and their
+individual mean confidence intervals remain in the evidence.
+
+Window assignment changes +0.16%. The lookup controls range from −2.92% to +16.47% initially,
+but the complete lookup executables have identical SHA-256 hashes before and after S10:
+`d178bf80ed6404bf023130709bc3976fcc3deddd4149dc3846c3e068fd647057`.
+They generate fresh random key sets in each process. Reversed-order, 45-second confirmations
+change the ten-key batch from +16.47% to −1.83%, and the nominal 1%-hit case from +13.07% to
++0.56%. These differences between identical executables cannot establish an S10 code regression.
+
+CPU and heap profiles cover narrow upserts, wide refreshes, wide capture/update/encoding and
+the wide surviving-slice case in both versions. All eight 49-Hz DWARF captures have zero lost
+samples; grouped user cycles/instructions ran for 100% of the requested time. Inclusive
+stack percentages overlap and some frames remain unresolved. Upsert profiles show admission,
+row slicing, map growth and cleanup; checkpoint encoding dominates its wide case in both
+versions (approximately 75% candidate / 87% baseline of sampled CPU).
+
+| Profile | IPC, before → after | Peak intercepted heap, before → after | Instrumented RSS, before → after |
+|---|---:|---:|---:|
+| Narrow upsert | 2.87 → 2.92 | 10.62 → 10.62 MB | 15.72 → 21.24 MB |
+| Wide refresh | 3.24 → 2.99 | 10.60 → 10.60 MB | 24.13 → 24.31 MB |
+| Wide capture/update/encode | 0.68 → 0.99 | 25.82 → 25.84 MB | 38.18 → 38.45 MB |
+| Wide surviving slice | 3.00 → 2.89 | 10.60 → 10.60 MB | 24.46 → 24.66 MB |
+
+Upsert/refresh profiles exceed the IPC > 2 heuristic; wide checkpoint encoding remains below
+it in both versions. Peak intercepted heap is almost unchanged, while narrow-upsert
+instrumented RSS rises about 35%. This is retained as a capacity consideration. These captures
+include fixture input/setup and profiler overhead, perform different work counts and do not
+prove an RSS bound or a reduction in allocations per operation. Buffer retention is deliberate:
+one surviving wide row keeps the original large allocation charged until its last reference
+is replaced. Query/checkpoint ownership can outlive that live-table charge.
+
+Existing `recovery_bench` binaries were built for both versions with the same feature/profile
+settings; every smoke case passed. Matched selected-manifest and verified-state-range controls
+target fifteen seconds per case, with 100 samples for manifests and the existing ten-sample
+override for state reads. These are local filesystem measurements with warmup, separate from
+the table-specific capture/update benchmark and the passing process-crash/restart tests.
+
+| Recovery control | Before | After | Change |
+|---|---:|---:|---:|
+| Exact manifest load, 2 sources | 111.540 µs | 106.050 µs | −4.92% |
+| Exact manifest load, 10 sources | 116.677 µs | 117.253 µs | +0.49% |
+| Exact manifest load, 50 sources | 153.352 µs | 155.244 µs | +1.23% |
+| Verified state read, 1 KiB | 154.087 µs | 157.154 µs | +1.99% |
+| Verified state read, 1 MiB | 679.223 µs | 663.445 µs | −2.32% |
+| Verified state read, 10 MiB | 5.865 ms | 5.756 ms | −1.85% |
+
+The final timing/profile run (**64 commands**) and follow-up run (**17 commands**) passed.
+Raw commands, logs, source/binary hashes, samples, confidence intervals and profiles are under
+ignored `target/s10-tables/`, including `final-summary.json`, `followup-summary.json`,
+`profiles-summary.json`, `performance-verdict.json`, `final-review.json` and
+`final-source-hashes.json`. Native artifacts use the existing WSL B0 build directory.
+Benchmark production source matches the final correctness/static-gate source; the only later
+source edit was a semicolon in a test, included in the final validation run.
+
+The local S10 verdict retains the 48–51% upsert and 18–25% refresh costs as the cost of atomic
+admission. It does not claim regression-free writes, a stable wide-checkpoint speedup or a
+process RSS guarantee. No quota, workload width or hot-path regression threshold was relaxed.
+S12 must qualify the resulting table workload and its input/candidate/checkpoint headroom on
+target hardware. The next serial session is **S11**, covering all local MV storage modes.
+S4 dependency findings still block release, and S12/S13 qualification remains outstanding.
+Changes remain uncommitted.
+
+### S11 — local materialized-view quotas and cycle preflight (2026-09-21)
+
+**Implemented and validated locally, with the performance costs recorded below.** Embedded and
+single-node MVs have independent defaults of **1,000,000 live rows / 256 MiB** through
+`LaminarConfig`, builder methods and the server's shared `[server]` construction path.
+Both limits must be nonzero. Cluster MV admission remains rejected.
+
+Aggregate mode admits an entire replacement snapshot; upsert mode accounts for final keyed
+replacements/deletes; multiset mode charges distinct encoded full rows and their counts.
+Append mode keeps its oldest-batch eviction policy within batch, row and byte limits, but
+rejects an individual batch that cannot fit. Empty aggregate cycles preserve the prior
+snapshot. Restore checks a private candidate and rejects oversized committed images instead
+of evicting rows. `MaterializedViewQuotaExceeded` carries the view, projected usage and limits.
+
+`update_mv_stores` now preflights every affected MV under its existing write lock before
+installing any store or publishing any MV output. Aggregate/append candidates borrow input
+batches; upsert and multiset candidates retain their existing staged deltas. Up to four
+prepared entries use inline storage. There is no full live-map clone or additional lock.
+All cycle publications also preflight the multiset's existing expansion guards, even when
+no subscriber is currently attached; cached expanded row/byte totals avoid scanning untouched
+rows for admission. Counted checkpoint encoding and guarded snapshot reads are preserved.
+The existing recovery fault path still prevents cursor settlement and downstream publication.
+
+The accounting contract is per MV. Arrow modes conservatively charge Arrow-reported backing
+capacity and batch/column metadata, including slices, nested arrays, dictionaries and views.
+Upserts include owned scalar allocations, vector capacity, encoded keys and row metadata;
+multisets include complete encoded rows and counts. Shared Arrow storage is charged per
+stored batch/scalar. Replacements, deletes and append eviction release the corresponding
+live charge. Hash-map spare capacity, schema/converter/allocator and opaque-owner overhead
+are outside this charge. Preflight simultaneously holds touched-key deltas for all affected
+MVs, proportional to the cycle's output rows and widths; source/graph admission bounds
+remain separate. Restore holds old state, decoded input and private candidates together.
+Query/subscriber materialization and pinned checkpoint captures require additional headroom.
+These quotas are not an RSS bound or production capacity qualification.
+
+The starting source is `3688fab2ad8282cad8f7c1f2cc7270ed54ec361e` plus the preserved S8–S10
+working tree. The source snapshot and binary identities are under ignored `target/s11-mv/`.
+A standalone regression linked against that starting build fails because it admits a
+1,000,001-row aggregate snapshot. The baseline Criterion suite exercises two MVs across
+all four storage modes, with 1,024-row inputs and 16/4,096-byte strings. Each update iteration
+applies two alternating cycles to both views. Snapshot reads materialize one view (1,024
+rows, or 8,192 retained rows for append mode); checkpoint cases capture both views, update,
+encode the old cut and apply the reverse cycle. These are local operation timings.
+
+Fresh controls cover `latency_bench`, all `lookup_join_bench` cases, selected graph/SQL
+`stream_executor_bench` cases, owned-row grouping in `hot_path_micro`, and exact-manifest /
+verified-state-read `recovery_bench` cases. All benchmark targets pass their smoke cases.
+Before/after builds use the existing WSL Rust 1.95.0 cache, the same optimized profile with
+debug symbols, no default features, and `laminar-db/benchmark-internals` (which includes
+cluster). Timings use CPUs 0/2/4/6, two-second warmup, ten-second target measurements and
+100 samples, except the existing ten-sample state-read override. Candidate builds, regression
+probes, benchmark smoke cases, matched timings and CPU/allocation profiles all completed.
+
+**Correctness and static validation.** Native Windows Rust 1.98.0 passed **6,131 workspace
+library/server tests** (one existing ignored test) and all **eight** checkpoint, recovery and
+shared-source integration tests. The targeted runs passed 46 MV-store tests, two publication/
+coordinator fault tests, one configuration/builder test, four MV recovery lifecycle tests and
+two server configuration/runtime tests; these also run in the workspace suite. Coverage includes
+all four modes, row/byte limits, wide and encoded keys, nested/dictionary/view arrays, surviving
+Arrow slices, append eviction and oversized batches, replacement/deletion release, independent
+randomized row oracles, failed second-view publication, multiset expansion and over-limit restore.
+The real coordinator failure test covers all three delivery guarantees, preserved committed
+positions and suppressed sink output. The real restart test leaves both prior MV stores intact
+and refuses to enter Running when the selected cut exceeds the lowered quota.
+
+Both workspace Clippy configurations (`--all-features --all-targets` and `--no-default-features`,
+each with `-D warnings`), nightly formatting, syntax-aware readability, analytical-dependency
+policy and whitespace checks pass. No readability exception was added or enlarged. Exact
+commands, complete logs and the latest passing outcomes are in `target/s11-mv/gates.json`;
+`validated-source-hashes.json` records the 1,129 source/manifest hashes. Earlier server fixture
+failures are retained in the log history: its generator schema and expected shutdown fault were
+corrected before the passing targeted and workspace runs.
+
+**CPU/allocation profiles.** Eight before/after workload pairs completed under user-space
+`perf stat` (cycles/instructions, 100% counter coverage), 49 Hz DWARF CPU sampling and separate
+five-second heaptrack runs. Hardware is an AMD Ryzen 9 7900X, 24 logical CPUs, under WSL2;
+timings and profiles use CPUs 0/2/4/6. Heaptrack values below are whole-fixture peaks in decimal
+MB, including setup and inputs, not live MV charges or production RSS. Narrow/Arrow update
+peaks are dominated by the fixture's other-mode setup and cannot resolve tiny local differences.
+
+| Profile (1,024 rows; string width in bytes) | IPC before → after | Peak heap MB before → after |
+|---|---|---|
+| Aggregate update, 16 | 3.86 → 3.60 | 21.84 → 21.79 |
+| Append update, 4,096 | 3.70 → 3.46 | 21.84 → 21.79 |
+| Upsert update, 16 | 3.41 → 2.85 | 21.84 → 21.79 |
+| Upsert update, 4,096 | 1.64 → 1.26 | 21.99 → 26.45 |
+| Multiset update, 4,096 | 3.06 → 2.84 | 30.75 → 39.53 |
+| Multiset snapshot, 16 | 4.80 → 4.79 | 21.84 → 21.79 |
+| Upsert checkpoint during updates, 4,096 | 0.65 → 0.59 | 38.61 → 38.61 |
+| Append checkpoint during updates, 4,096 | 0.18 → 0.17 | 80.07 → 80.07 |
+
+Wide keyed updates hold both views' staged deltas until all preflight checks succeed. The
+additional peak is **4.46 MB for upserts / 8.78 MB for multisets** in this two-view workload.
+Allocation stacks remain the existing owned scalar strings, row vectors and encoded keys;
+there is no full live-state clone. Upsert sampling includes scalar extraction, allocation,
+hash-map operations and the added prepare phase. Multiset sampling is dominated by hashing
+the wide encoded rows (74% self samples in the candidate's SipHasher write routine). The wider
+working set is consistent with the observed update costs; these samples do not isolate every
+cache effect. Wide upserts and checkpoints remain below the IPC > 2 rule of thumb, including
+the baseline. Wide append checkpoint samples spend over 99% of cycles beneath Arrow IPC
+writing in both builds, with unchanged peak heap; copying/growing encoded buffers dominates.
+No production latency or memory ceiling is inferred from these local profiles.
+
+**Timing evidence and regression review.** The first pass produced **47 matched means**,
+including all 24 MV cases, with raw distributions and 95% confidence intervals retained in
+`timing-summary.json` and `criterion-before` / `criterion-after`. Sixteen selected cases then
+ran in close after→before pairs, with a three-second warmup, twenty-second measurement target
+and 100 samples. This reverses the original order and reduces drift between compared processes.
+`confirmation-summary.json` retains these distributions. Timings, profiles and builds ran
+serially; no workload width, quota or 5% regression threshold was relaxed.
+
+| Confirmed MV case (string width in bytes) | Before → after mean | Change |
+|---|---|---|
+| Aggregate update, 16 | 0.137 → 0.244 µs | +78.8% |
+| Append update, 4,096 | 0.137 → 0.280 µs | +103.8% |
+| Upsert update, 16 | 0.876 → 1.179 ms | +34.6% |
+| Upsert update, 4,096 | 2.042 → 2.515 ms | +23.2% |
+| Multiset update, 16 | 1.116 → 1.165 ms | +4.3% |
+| Multiset update, 4,096 | 34.090 → 37.021 ms | +8.6% |
+| Aggregate checkpoint during updates, 16 | 14.987 → 15.246 µs | +1.7% |
+| Aggregate checkpoint during updates, 4,096 | 4.158 → 4.216 ms | +1.4% |
+| Upsert checkpoint during updates, 16 | 1.445 → 1.622 ms | +12.3% |
+| Upsert checkpoint during updates, 4,096 | 12.584 → 12.934 ms | +2.8% |
+| Multiset checkpoint during updates, 16 | 1.330 → 1.399 ms | +5.2% |
+| Multiset checkpoint during updates, 4,096 | 42.007 → 44.645 ms | +6.3% |
+| Upsert snapshot, 4,096 | 3.388 → 3.252 ms | −4.0% |
+| Append checkpoint during updates, 4,096 | 29.843 → 32.200 ms | +7.9% |
+
+Each update still means two alternating cycles across two 1,024-row views, not one input
+record. Aggregate/append preflight adds about **0.11–0.14 µs** per complete measured operation:
+checks, retained-byte accounting and the prepare/install traversal replace direct mutation.
+Upsert admission adds a pass over the staged map and checked final-state accounting, while
+both keyed modes retain multiple views' deltas simultaneously. These are measured costs of
+the required all-view admission boundary. The upsert increase was 16.6% narrow / 42.3% wide
+in the initial pass and 34.6% / 23.2% in the closer pairs; it is not dismissed as noise.
+Multiset update increases were 5.3% / 12.0% initially and 4.3% / 8.6% in the pairs. The
+remaining keyed checkpoint increases include the same update work as well as capture/encoding.
+
+Isolated filters skip earlier update/snapshot benchmark stages. Their allocator history and
+stored-row layout can therefore differ from the full suite; do not compare absolute means
+across those two protocols. In particular, the initial wide-upsert snapshot was 251.6 →
+308.7 µs (+22.7%), while the isolated pair above reverses direction at a different absolute
+level. This does not establish a stable snapshot regression or improvement. Aggregate checkpoint
+increases of 9.0% / 11.3% in the full pass narrowed to 1.7% / 1.4% in the isolated pairs;
+wide-upsert checkpoint's 11.3% narrowed to 2.8%. These observations and the copy/allocation
+profiles require S12 measurements with the actual sequence of updates, reads and checkpoints.
+
+Control outliers were checked separately. `latency_bench` and `lookup_join_bench` have
+**byte-identical** before/after executables; the lookup deltas up to +8.9% cannot come from
+an S11 code change. Their binary hashes are retained with the results. Plain SELECT changed
+from +6.2% initially to +3.1% in the close pair; four-way graph fan-out changed from +5.2%
+to −2.9%. The other graph, grouping, latency and recovery controls stayed below +5% in the
+first pass. This explains the control outliers without attributing the measured MV costs
+to those controls or claiming an end-to-end latency SLO.
+
+The remaining wide-append checkpoint outlier received two further forty-second/100-sample
+pairs, first before→after and then after→before. Means were **28.856 → 29.712 ms (+3.0%)**
+and **29.581 → 32.011 ms (+8.2%)**, compared with +23.4% in the first full-suite pass and
++7.9% in the twenty-second pair. `append-repeat-summary.json` retains the intervals; none
+of these results was discarded. The small fixed admission cost does not explain millisecond
+changes in a workload whose profiles spend over 99% beneath existing Arrow IPC writes and
+whose peak heap is unchanged. These results are consistent with sensitivity to process/allocation
+history and run conditions; they do not isolate every source of the remaining variation.
+The observed 3–8% longer-pair range remains a checkpoint workload risk for S12, rather than
+a claim of a stable speedup or that every measured checkpoint delta is below 5%.
+
+**Local S11 verdict:** correctness, recovery and static gates pass. The required performance
+review is complete with explicit costs: additional quota/preflight work, simultaneous staged
+deltas and the measured materialization/encoding sensitivity. The larger upsert and multiset
+working sets are retained to establish the required all-view failure boundary; no full-state
+clone, new lock, async boundary, silent eviction of keyed state or relaxed limit was introduced.
+This is not regression-free publication or a qualified production capacity envelope. S12 must
+measure the actual update/read/checkpoint sequence, staging headroom, RSS and tail latency on
+target hardware. `final-source-hashes.json` matches all 1,129 validated source/manifest hashes;
+only documentation changed after the passing gates and candidate build.
+
+The next serial session is **S12**. S4 dependency findings still block release, and S12/S13
+workload and upgrade qualification remain outstanding. Changes remain uncommitted.
+
+### S12 — workload observer and release smoke matrix (2026-09-21)
+
+**Preparation implemented and locally validated; S12 remains open.** The selected scope is single-node
+Kafka → Kafka ALO projection, with one/four independent pipelines and uniform/Zipf/hot-key
+inputs. Production hardware, offered load and numerical acceptance ceilings remain unselected.
+Tables/MVs, stateful SQL, exact delivery and cluster execution are outside this workload.
+The first narrower qualification allowed by this plan would therefore leave G3 open.
+
+The first release matrix exposed a Kafka startup defect before the four-pipeline workload could
+accept input. Prometheus 0.14 identifies a composite collector by the wrapping sum of its
+descriptor IDs; the four progress descriptors for `input_1`, `input_2` and `input_3` have the same
+sum despite distinct descriptors. The earlier two-source test used names that did not collide.
+The failed process evidence is retained under `target/s12-workload/smoke-v4-4-uniform-none`,
+and `kafka-registration-before.log` reproduces the failure without a broker. Progress now registers
+each metric family separately, rolls back only successful registrations on failure, and preserves
+the primary error with any rollback failure attached. Source-owned cleanup still leaves late worker
+clones unable to unregister a replacement. Metric names, labels and sampling semantics are unchanged.
+This cold startup/cleanup fix applies to named Kafka sources sharing a metrics registry in embedded,
+single-node and cluster modes; it does not widen any delivery or SQL admission.
+
+The existing `cluster_soak` target now contains a workload module that reuses its verified
+server executable, process control, Kafka topic setup and checkpoint observations. Its independent
+Kafka reader checks every expected source origin, ID, key, arithmetic result and transformed string; it counts
+ALO duplicates and requires a drained, stable public output boundary. Producer and observer use
+one monotonic clock. Latency starts at the original scheduled arrival, including producer stalls,
+and ends at the first verified external observation. Offered, enqueued, acknowledged and observed
+counts are retained independently. An intentional five-second source pause adjusts only the
+declared offered schedule; a broker or process stall never resets it.
+
+The origin travels through Kafka and the SQL projection as input data. The oracle rejects a record
+whose origin disagrees with its output topic, even when all pipelines share identical IDs, keys and
+payloads. `cross-routing-before.log` demonstrates that the earlier oracle accepted that mismatch;
+the added regression prevents another pipeline's records from satisfying its frontier. The raw
+visibility ledger also retains origin, key and projected arithmetic value for independent checking.
+Earlier `smoke-v4-*` and `smoke-v5-*` observations predate this stronger check and are retained as
+superseded preparation evidence.
+
+The existing Prometheus histogram implementation supplies p50/p95/p99/p99.9 bucket upper bounds
+per pipeline, at one-percent spacing with a 1 μs minimum bucket. Overflow and missing evidence
+cannot satisfy declared limits. Such runs require one hour of offered load after warmup,
+at least 60 seconds of warmup and
+100,000 measured records per pipeline. Full engine scrapes retain compute-cycle and checkpoint
+stall measurements separately. Resource observations report sampled RSS and the second-half
+RSS/backlog slopes; backlog means offered minus externally observed rows, not internal queue
+bytes. Process-kill recovery requires a continuous externally visible prefix including an input
+scheduled after confirmed process death, a newer committed checkpoint, and a completion counter
+from the restarted process. Raw fault-event timestamps permit independent recomputation. Shorter
+runs remain observations.
+
+`tools/run_workload_qualification.py` builds a release server and the existing process test,
+archives exact source files, the dirty diff, SHA, lockfile, features, toolchain and binary hashes,
+then runs the chosen profile serially. Each new evidence directory retains input acknowledgements,
+output observations, config, checkpoints, metric scrapes, logs, report and a final SHA-256 index.
+Existing output directories are rejected. The reports always retain `s12_qualified: false`;
+passing a run's limits cannot certify an unexecuted matrix or another mode/composition.
+See [the harness instructions](../tests/qualification/README.md) for its controls and limitations.
+
+**Starting identity and preservation:** `3688fab2ad8282cad8f7c1f2cc7270ed54ec361e` plus the existing
+uncommitted S8–S11 implementation. Comparing the 1,129 S11 source/manifest hashes finds only Kafka
+progress registration and its tests, plus the `cluster_soak.rs` test entry point changed; the new
+workload modules and runner are additional files. Dependencies, admission boundaries, API/config
+defaults and the S8–S11 implementation remain unchanged. The production edit is limited to connector
+startup/cleanup; no coordinator-cycle or core-operator edit requires another before/after Criterion run.
+
+**Validation:** Windows Rust 1.98 passed 6,133 workspace library/server tests (one pre-existing
+ignored test), all eight checkpoint/recovery/shared-source integration tests, and 84 non-ignored
+soak-harness tests. All nine measurement tests also pass on the final Linux release harness.
+The new measurement regressions cover cross-routing, corrupt/missing output,
+ALO duplicates, separate pipeline frontiers, p99.9 resolution and overflow, stalled schedules,
+explicit source pause, sample floors, post-death recovery targets, mandatory recovery evidence
+even without numerical limits, and growth slopes. Two further connector regressions cover the
+reproduced multi-source registration collision and rollback at
+each metric family, including preservation of existing collectors and later source replacement.
+Both Clippy configurations, nightly formatting, readability, analytical-dependency policy and
+whitespace gates pass. The workspace suite was rerun on the final production source after Clippy
+removed an extra allocation in rollback-error formatting. Logs and command
+history are retained in `target/s12-workload/gates.json`; earlier measurement-test and lint failures
+are retained alongside the corrected passing runs.
+
+**Local release smoke matrix:** all eight `smoke-v6-*` runs passed against real Kafka boundaries.
+Each used a 30-second schedule, two seconds of latency warmup, 200 offered rows/second per pipeline,
+128-byte payloads, 1,024 keys, four input partitions, one output partition and 500 ms checkpoints.
+The pause case includes five seconds without offered input. The independent ledger check found
+all **134,000 expected unique records**, correct source routing and arithmetic, and no gaps.
+It recomputed per-pipeline quantiles from raw timestamps, checked recovery authority and timestamps,
+and verified every indexed artifact plus identical server/harness hashes across all eight bundles.
+
+| Pipelines / distribution | Fault | Unique rows | ALO replays | Peak sampled RSS | Highest pipeline p99.9 upper bound |
+|---|---|---:|---:|---:|---:|
+| 1 / uniform | None | 6,000 | 0 | 56.2 MiB | 90.5 ms |
+| 1 / Zipf | None | 6,000 | 0 | 55.3 MiB | 128.2 ms |
+| 1 / hot key | None | 6,000 | 0 | 55.1 MiB | 79.5 ms |
+| 4 / uniform | None | 24,000 | 0 | 62.9 MiB | 140.2 ms |
+| 4 / Zipf | None | 24,000 | 0 | 62.8 MiB | 118.4 ms |
+| 4 / hot key | None | 24,000 | 0 | 63.4 MiB | 110.4 ms |
+| 4 / Zipf | Process kill | 24,000 | 324 | 64.6 MiB | 956.7 ms |
+| 4 / hot key | Source pause | 20,000 | 0 | 61.8 MiB | 125.7 ms |
+
+The kill case recovered in **2,180.136 ms**, including a post-death input on every pipeline and
+a checkpoint completed by the restarted process. Its 324 duplicates are allowed by the declared
+ALO composition. A metrics scrape was unavailable during restart, so the RSS-growth result is
+explicitly unavailable and cannot pass a declared limit. These short observations do not establish
+tail SLOs, stable queues, an RSS plateau, capacity, or long-term checkpoint behavior. Generation-aware
+RSS growth and internal queue-byte/capacity evidence remain qualification work.
+
+The diagnostic host was an AMD Ryzen 9 7900X with 24 logical CPUs, Ubuntu under WSL2
+6.18.33.2 and about 15 GiB guest RAM. A same-host Docker Redpanda 26.1.13 broker used one CPU and
+1 GiB, plaintext and replication factor one. Linux Rust 1.95.0 built the optimized release with
+`--no-default-features --features cluster,kafka`, debug information retained and the system
+allocator; actual server mode was single-node. This is not broker-HA or cluster qualification.
+The server SHA-256 was `d174602bcf096dd97d3a7362eb7adc604099c904b3169e391683dac39666f4ef`.
+Full toolchains, manifests, configurations and identities are in each bundle.
+
+Evidence is retained in `target/s12-workload/smoke-v6-matrix.json`,
+`smoke-v6-verified-summary.json`, the eight `smoke-v6-*` directories and
+`linux-observer-smoke-v6-tests.json`. All reports retain `status: observed` and
+`s12_qualified: false`. Earlier failed builds, startup failure, source-mutation rejections and
+superseded observations remain available; none was substituted for a passing run.
+
+Final review added a guard against reporting a successful process-kill run with no verified
+post-death recovery when numerical limits are unset. `missing-recovery-before.log` reproduces
+the missing guard, and its regression now passes. The eight-case matrix already satisfies the
+stronger rule, as checked independently. The final guard changes only the workload module and its
+tests; the production server remains byte-identical. The focused `smoke-v7-4-zipf-process_kill`
+release rerun also passed: 24,000 unique records, 466 allowed ALO replays, recovery in 2,395.513 ms,
+64.4 MiB peak sampled RSS and a 1,088.8 ms pipeline p99.9 upper bound. RSS growth was again
+unavailable during restart. `smoke-v7-verified-summary.json` independently checks this run;
+`linux-observer-smoke-v7-tests.json` binds all nine passing measurement tests to its exact harness.
+
+`final-verification.json` confirms all nine bundles' source snapshots, the two-file harness delta,
+the identical production executable, passing gates and preservation of the S8–S11 implementation.
+`final-source-hashes.json` records all 1,102 selected final source/manifest files. Only root
+documentation changed after that source freeze. The disposable broker was stopped; topics,
+volumes, checkpoints and evidence were retained. Changes remain uncommitted.
+
+**Remaining S12 exit work:** select the launch workload and numerical targets, then perform the
+three hour-long repetitions across the declared load/distribution/pipeline matrix on target
+hardware, including sufficient tail samples, usable RSS growth and internal queue/capacity evidence.
+Add the slow/failed-sink, corrupt-cut, expired-replay and G9 durable Backpressure/Fail
+saturation → checkpoint → restart external-ledger cases. Qualify tables/MVs, stateful SQL and
+each additional mode/composition separately, including applicable leader/rejoin/scale scenarios.
+These remain required evidence; neither the new observer nor the existing correctness soaks close
+them. S4 dependency findings still block release. S12 remains the active session; S13 is not started.

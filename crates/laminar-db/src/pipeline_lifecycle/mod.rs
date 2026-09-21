@@ -103,6 +103,13 @@ enum StartupFailureKind {
     Pipeline,
     PipelineTerminal,
     BackpressureFail,
+    GraphBufferBudgetExceeded {
+        port: u8,
+        batches: usize,
+        bytes: usize,
+        max_batches: usize,
+        max_bytes: Option<usize>,
+    },
     ShuffleTerminal,
     ManagedStateBudgetExceeded {
         accounted_bytes: usize,
@@ -129,6 +136,23 @@ impl StartupFailure {
             DbError::Pipeline(message) => (StartupFailureKind::Pipeline, message),
             DbError::PipelineTerminal(message) => (StartupFailureKind::PipelineTerminal, message),
             DbError::BackpressureFail(message) => (StartupFailureKind::BackpressureFail, message),
+            DbError::GraphBufferBudgetExceeded {
+                node,
+                port,
+                batches,
+                bytes,
+                max_batches,
+                max_bytes,
+            } => (
+                StartupFailureKind::GraphBufferBudgetExceeded {
+                    port,
+                    batches,
+                    bytes,
+                    max_batches,
+                    max_bytes,
+                },
+                node,
+            ),
             DbError::ShuffleTerminal(message) => (StartupFailureKind::ShuffleTerminal, message),
             DbError::ManagedStateBudgetExceeded {
                 context,
@@ -160,6 +184,20 @@ impl StartupFailure {
             StartupFailureKind::Pipeline => DbError::Pipeline(message),
             StartupFailureKind::PipelineTerminal => DbError::PipelineTerminal(message),
             StartupFailureKind::BackpressureFail => DbError::BackpressureFail(message),
+            StartupFailureKind::GraphBufferBudgetExceeded {
+                port,
+                batches,
+                bytes,
+                max_batches,
+                max_bytes,
+            } => DbError::GraphBufferBudgetExceeded {
+                node: message,
+                port,
+                batches,
+                bytes,
+                max_batches,
+                max_bytes,
+            },
             StartupFailureKind::ShuffleTerminal => DbError::ShuffleTerminal(message),
             StartupFailureKind::ManagedStateBudgetExceeded {
                 accounted_bytes,

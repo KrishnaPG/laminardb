@@ -263,6 +263,7 @@ impl From<crate::DbError> for ApiError {
             DbError::MaterializedView(msg) => {
                 Self::query(format!("Materialized view error: {msg}"))
             }
+            error @ DbError::MaterializedViewQuotaExceeded { .. } => Self::query(error.to_string()),
 
             other => Self::internal(other.to_string()),
         }

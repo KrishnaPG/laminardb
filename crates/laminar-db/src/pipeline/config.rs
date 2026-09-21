@@ -85,7 +85,9 @@ pub struct PipelineConfig {
     /// Per-input-port batch cap. Default: 256.
     pub max_input_buf_batches: usize,
 
-    /// Per-input-port byte cap. `None` = disabled.
+    /// Per-input-port retained Arrow-byte cap, including source priming. `None` = disabled.
+    /// Shared buffers are charged independently on each port; executed output that would
+    /// exceed a limit halts the pipeline before publication under lossless policies.
     pub max_input_buf_bytes: Option<usize>,
 
     /// What to do when either cap is exceeded.

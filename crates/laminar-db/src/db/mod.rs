@@ -1736,10 +1736,7 @@ impl LaminarDB {
             target_partitions,
         )?;
 
-        let catalog = Arc::new(SourceCatalog::new(
-            config.default_buffer_size,
-            config.default_backpressure,
-        ));
+        let catalog = Arc::new(SourceCatalog::from_config(&config));
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry)?;
@@ -1752,7 +1749,6 @@ impl LaminarDB {
             ctx,
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
-            config,
             config_vars: Arc::new(config_vars),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             coordinator: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1762,8 +1758,12 @@ impl LaminarDB {
             connector_registry,
             mv_registry: parking_lot::Mutex::new(laminar_core::mv::MvRegistry::new()),
             table_store: Arc::new(parking_lot::RwLock::new(
-                crate::table_store::TableStore::new(),
+                crate::table_store::TableStore::from_config(&config),
             )),
+            mv_store: Arc::new(parking_lot::RwLock::new(
+                crate::mv_store::MvStore::from_config(&config),
+            )),
+            config,
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             catalog_cleanup_fenced: std::sync::atomic::AtomicBool::new(false),
@@ -1806,7 +1806,6 @@ impl LaminarDB {
             ai_runtime: None,
             ai_handle: None,
             control_tx: parking_lot::Mutex::new(None),
-            mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
@@ -5657,7 +5656,8 @@ impl LaminarDB {
                     result = stream.next() => {
                         match result {
                             Some(Ok(batch)) => {
-                                if source_clone.push_arrow(batch).is_err() {
+                                // Query output retains its own count-bound ownership, outside input push budgets.
+                                if source_clone.push(crate::catalog::ArrowRecord { batch }).is_err() {
                                     break;
                                 }
                             }
