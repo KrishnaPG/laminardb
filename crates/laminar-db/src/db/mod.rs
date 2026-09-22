@@ -5379,7 +5379,8 @@ impl LaminarDB {
                         earliest_retained,
                     } => {
                         let requested = match start {
-                            crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
+                            crate::subscription::SubscribeStart::AsOfEpoch(n)
+                            | crate::subscription::SubscribeStart::AfterSequence(n) => n,
                             crate::subscription::SubscribeStart::Tail => 0,
                         };
                         DbError::SubscriptionReplayPruned {

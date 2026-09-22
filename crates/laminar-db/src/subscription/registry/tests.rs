@@ -28,6 +28,18 @@ async fn next_update(reader: &mut SubscriptionReader) -> ChargedUpdate {
     }
 }
 
+async fn next_value(reader: &mut SubscriptionReader) -> i64 {
+    match next_update(reader).await.as_ref() {
+        MvUpdate::Batch(batch) => batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        other => panic!("expected a batch update, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn tail_starts_at_atomic_attach_cut() {
     let registry = SubscriptionRegistry::new();
@@ -774,4 +786,91 @@ fn subscriber_cap_is_atomic_across_65_simultaneous_attempts() {
         .count();
     assert_eq!(successes, super::super::MAX_SUBSCRIBERS_PER_MV);
     assert_eq!(capacity_failures, 1);
+}
+
+#[tokio::test]
+async fn after_sequence_replays_retained_entries_strictly_after_cursor() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    registry.send_batch("mv", batch(vec![1])).unwrap();
+    registry.send_batch("mv", batch(vec![2])).unwrap();
+    registry.send_batch("mv", batch(vec![3])).unwrap();
+
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap();
+
+    assert_eq!(next_value(&mut reader).await, 2);
+    assert_eq!(next_value(&mut reader).await, 3);
+    assert!(matches!(reader.try_read(), TryRead::Pending));
+}
+
+#[tokio::test]
+async fn after_sequence_at_head_attaches_live_without_replay() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    registry.send_batch("mv", batch(vec![1])).unwrap();
+    registry.send_batch("mv", batch(vec![2])).unwrap();
+
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(1))
+        .unwrap();
+    assert!(matches!(reader.try_read(), TryRead::Pending));
+
+    registry.send_batch("mv", batch(vec![3])).unwrap();
+
+    assert_eq!(next_value(&mut reader).await, 3);
+}
+
+#[test]
+fn after_sequence_before_retention_floor_is_rejected() {
+    let entry_bytes = approx_size(&MvUpdate::Batch(batch(vec![1])));
+    let registry = SubscriptionRegistry::with_storage_budget(1 << 20);
+    registry.configure("mv", entry_bytes);
+    registry.send_batch("mv", batch(vec![1])).unwrap();
+    registry.send_batch("mv", batch(vec![2])).unwrap();
+    registry.send_batch("mv", batch(vec![3])).unwrap();
+
+    let error = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SubscriptionOpenError::ReplayPruned {
+            earliest_retained: 2
+        }
+    ));
+}
+
+#[tokio::test]
+async fn after_sequence_does_not_require_checkpoint_config() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    registry.send_batch("mv", batch(vec![11])).unwrap();
+    registry.send_batch("mv", batch(vec![12])).unwrap();
+
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap();
+
+    assert_eq!(next_value(&mut reader).await, 12);
+}
+
+#[tokio::test]
+async fn after_sequence_then_live_publish_has_no_gap_or_duplicate() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    registry.send_batch("mv", batch(vec![1])).unwrap();
+    registry.send_batch("mv", batch(vec![2])).unwrap();
+    registry.send_batch("mv", batch(vec![3])).unwrap();
+
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(1))
+        .unwrap();
+
+    assert_eq!(next_value(&mut reader).await, 3);
+    registry.send_batch("mv", batch(vec![4])).unwrap();
+    assert_eq!(next_value(&mut reader).await, 4);
+    assert!(matches!(reader.try_read(), TryRead::Pending));
 }

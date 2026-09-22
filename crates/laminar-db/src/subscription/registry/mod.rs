@@ -129,6 +129,11 @@ pub enum SubscribeStart {
     Tail,
     /// Replay entries strictly after the retained barrier with `epoch == n`.
     AsOfEpoch(u64),
+    /// Replay retained shared-log entries sequenced strictly after `n`, then
+    /// continue live. This is the retained-log coordinate, not a checkpoint
+    /// epoch, so it does not require checkpoint configuration or committed
+    /// epochs. `n` at or beyond the current head attaches live without replay.
+    AfterSequence(u64),
 }
 
 #[derive(Debug)]
@@ -417,6 +422,9 @@ impl StreamLog {
                 let (cursor, barrier_sequence) = cursor_after_retained_epoch(&inner, epoch)?;
                 (cursor, Some((epoch, barrier_sequence)))
             }
+            (false, SubscribeStart::AfterSequence(sequence)) => {
+                (cursor_after_sequence(&inner, sequence)?, None)
+            }
         };
         let wake = self.wake.subscribe();
         let mut reader_id = inner.next_reader_id;
@@ -631,6 +639,30 @@ fn retain_appended_entry(inner: &mut StreamLogInner, sequence: u64, bytes: usize
     if inner.retention_bytes == 0 {
         inner.retention_floor = inner.next_sequence;
     }
+}
+
+/// Resolve the first physical sequence an `AfterSequence(n)` reader replays.
+///
+/// `n` is a retained shared-log sequence. A cursor at or beyond the current
+/// head attaches live with no replay and no future entry skipped. A cursor
+/// behind the earliest retained entry (or any cursor when retention is
+/// disabled) fails closed with the retained floor; a sequence regression must
+/// never silently replay from a stale position.
+fn cursor_after_sequence(
+    inner: &StreamLogInner,
+    requested: u64,
+) -> Result<u64, SubscriptionOpenError> {
+    let cursor = requested.saturating_add(1);
+    if cursor >= inner.next_sequence {
+        return Ok(inner.next_sequence);
+    }
+    let head = head_sequence(inner);
+    if inner.retention_cap == 0 || cursor < head {
+        return Err(SubscriptionOpenError::ReplayPruned {
+            earliest_retained: if inner.entries.is_empty() { 0 } else { head },
+        });
+    }
+    Ok(cursor)
 }
 
 fn cursor_after_retained_epoch(
