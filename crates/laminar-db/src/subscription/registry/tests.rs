@@ -16,6 +16,9 @@ fn earliest_retained(error: SubscriptionOpenError) -> u64 {
         SubscriptionOpenError::EpochNotCommitted { .. } => {
             panic!("expected replay-pruned error")
         }
+        SubscriptionOpenError::SequencePruned { .. } => {
+            panic!("expected epoch replay-pruned error")
+        }
         SubscriptionOpenError::Capacity { .. } => panic!("expected replay-pruned error"),
     }
 }
@@ -837,7 +840,8 @@ fn after_sequence_before_retention_floor_is_rejected() {
 
     assert!(matches!(
         error,
-        SubscriptionOpenError::ReplayPruned {
+        SubscriptionOpenError::SequencePruned {
+            requested: 0,
             earliest_retained: 2
         }
     ));

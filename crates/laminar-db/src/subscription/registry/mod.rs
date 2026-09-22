@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 mod lifecycle;
 mod reader;
+mod start;
 
 pub(crate) use lifecycle::SubscriptionRegistry;
 pub(super) use reader::SubscriptionRead;
@@ -138,6 +139,7 @@ pub enum SubscribeStart {
 
 #[derive(Debug)]
 pub(crate) enum SubscriptionOpenError {
+    /// An `AsOfEpoch(n)` start committed but its checkpoint cut is no longer retained.
     ReplayPruned {
         /// Earliest barrier epoch eligible for replay; `0` if none is retained.
         earliest_retained: u64,
@@ -145,6 +147,13 @@ pub(crate) enum SubscriptionOpenError {
     EpochNotCommitted {
         requested: u64,
         latest_committed: Option<u64>,
+    },
+    /// A `AfterSequence(n)` start is older than the retained shared-log floor.
+    SequencePruned {
+        /// Shared-log sequence requested by the subscriber.
+        requested: u64,
+        /// Earliest shared-log sequence still retained for replay.
+        earliest_retained: u64,
     },
     Capacity {
         attached: usize,
@@ -419,11 +428,11 @@ impl StreamLog {
         let (cursor, skip_barrier) = match (inner.terminal_error.is_some(), start) {
             (true, _) | (false, SubscribeStart::Tail) => (inner.next_sequence, None),
             (false, SubscribeStart::AsOfEpoch(epoch)) => {
-                let (cursor, barrier_sequence) = cursor_after_retained_epoch(&inner, epoch)?;
+                let (cursor, barrier_sequence) = start::cursor_after_retained_epoch(&inner, epoch)?;
                 (cursor, Some((epoch, barrier_sequence)))
             }
             (false, SubscribeStart::AfterSequence(sequence)) => {
-                (cursor_after_sequence(&inner, sequence)?, None)
+                (start::cursor_after_sequence(&inner, sequence)?, None)
             }
         };
         let wake = self.wake.subscribe();
@@ -639,93 +648,6 @@ fn retain_appended_entry(inner: &mut StreamLogInner, sequence: u64, bytes: usize
     if inner.retention_bytes == 0 {
         inner.retention_floor = inner.next_sequence;
     }
-}
-
-/// Resolve the first physical sequence an `AfterSequence(n)` reader replays.
-///
-/// `n` is a retained shared-log sequence. A cursor at or beyond the current
-/// head attaches live with no replay and no future entry skipped. A cursor
-/// behind the earliest retained entry (or any cursor when retention is
-/// disabled) fails closed with the retained floor; a sequence regression must
-/// never silently replay from a stale position.
-fn cursor_after_sequence(
-    inner: &StreamLogInner,
-    requested: u64,
-) -> Result<u64, SubscriptionOpenError> {
-    let cursor = requested.saturating_add(1);
-    if cursor >= inner.next_sequence {
-        return Ok(inner.next_sequence);
-    }
-    let head = head_sequence(inner);
-    if inner.retention_cap == 0 || cursor < head {
-        return Err(SubscriptionOpenError::ReplayPruned {
-            earliest_retained: if inner.entries.is_empty() { 0 } else { head },
-        });
-    }
-    Ok(cursor)
-}
-
-fn cursor_after_retained_epoch(
-    inner: &StreamLogInner,
-    requested_epoch: u64,
-) -> Result<(u64, u64), SubscriptionOpenError> {
-    let Some(latest_committed) = inner.latest_committed_epoch else {
-        return Err(SubscriptionOpenError::EpochNotCommitted {
-            requested: requested_epoch,
-            latest_committed: None,
-        });
-    };
-    if requested_epoch > latest_committed {
-        return Err(SubscriptionOpenError::EpochNotCommitted {
-            requested: requested_epoch,
-            latest_committed: Some(latest_committed),
-        });
-    }
-    if inner.retention_cap == 0 {
-        return Err(SubscriptionOpenError::ReplayPruned {
-            earliest_retained: 0,
-        });
-    }
-
-    let mut cursor = None;
-    let mut earliest_retained = u64::MAX;
-    for entry in inner
-        .entries
-        .iter()
-        .filter(|entry| entry.sequence >= inner.retention_floor)
-    {
-        if let MvUpdate::Barrier {
-            epoch,
-            through_sequence,
-            ..
-        } = entry.update.as_ref()
-        {
-            if *through_sequence < inner.retention_floor {
-                continue;
-            }
-            earliest_retained = earliest_retained.min(*epoch);
-            if *epoch == requested_epoch {
-                cursor = Some((*through_sequence, entry.sequence));
-            }
-        }
-    }
-
-    if let Some(cursor) = cursor {
-        return Ok(cursor);
-    }
-    if earliest_retained == u64::MAX || requested_epoch < earliest_retained {
-        return Err(SubscriptionOpenError::ReplayPruned {
-            earliest_retained: if earliest_retained == u64::MAX {
-                0
-            } else {
-                earliest_retained
-            },
-        });
-    }
-    Err(SubscriptionOpenError::EpochNotCommitted {
-        requested: requested_epoch,
-        latest_committed: Some(latest_committed),
-    })
 }
 
 pub(super) fn approx_size(update: &MvUpdate) -> usize {
