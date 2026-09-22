@@ -1,6 +1,6 @@
 # Production hardening execution plan
 
-**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 workspace audit/deny checks pass locally with temporary exceptions expiring 2026-10-21; registry crate publication remains blocked while the XML fix requires a workspace patch. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix, RSS evidence per process generation and passing local release diagnostics; production workload qualification remains open. S13 remains unimplemented.
+**Status:** S1–S3, S4a–S4e and S5–S11 implemented and validated locally. S4 workspace audit/deny checks pass locally with temporary exceptions expiring 2026-10-21; registry crate publication is permitted under an explicit temporary exception for consumers that do not inherit the XML workspace patch. S6a has a documented sort-latency cost; S8 has admission/concurrent-burst costs; S9 has a measured, placement-sensitive wide-fan-out cost; S10 has table-write/refresh costs and variable wide-checkpoint timings; S11 has MV preflight/staging costs and variable snapshot/checkpoint timings. These are scoped local results, not production qualification. S12 has a workload observer, a Kafka startup fix, RSS evidence per process generation and passing local release diagnostics; production workload qualification remains open. S13 remains unimplemented.
 **Date:** 2026-09-21. **Base:** `b429d0dfd02a435219f1b5977a442da9972e0c3d` (`0.30.0`).
 **Evidence:** [production-readiness review](production-readiness.md). Its G1–G9 identifiers are used below.
 
@@ -2151,3 +2151,98 @@ allocation summaries and the Cubic verdicts are retained under `target/security-
 Dictionary-typed Multiset snapshot reconstruction still has a pre-existing schema mismatch;
 the staging regression checks retained state directly and does not qualify that materializer.
 S12 production qualification remains open.
+
+### S11/S12 — dictionary reconstruction and fault diagnostics (2026-09-21)
+
+This entry supersedes the dictionary snapshot defect and unconditional registry-publication block
+above. Embedded and single-node Multiset snapshots and counted checkpoints restore the declared
+Arrow types after row decoding hydrates dictionaries. The shared conversion uses checked casts:
+unrepresentable values fail instead of becoming null. Direct and nested dictionary regressions
+failed before the fix and now preserve schemas, nulls, multiplicities and retractions after restore.
+The ordinary 16,384-row dictionary case now checks the materialized snapshot as well as retained
+state. Cluster MV admission remains closed.
+
+The dependency policy now explicitly accepts the unpatched registry XML denial-of-service risks
+through the existing exception deadline; the verified workspace backport remains mandatory.
+The publication guard passes only with this acceptance, exact reviewed dependencies and unexpired
+policy. No crate was uploaded. Current DataFusion/Delta still require object_store 0.13, and the
+current Iceberg adapter still requires OpenDAL 0.57: a direct version bump would retain the affected
+transitive graph. The upstream review and residual risks are in
+[`security/dependency-exceptions.md`](../security/dependency-exceptions.md). CI rejects these
+exceptions on **2026-10-21 UTC** unless they are removed or explicitly re-reviewed beforehand.
+
+The new embedded Kafka overflow test establishes a committed prefix, expands an intermediate
+batch beyond a 64 KiB graph port, checks halt/checkpoint rejection, then explicitly increases
+capacity and restarts. Both Backpressure and Fail recover all 40 acknowledged input IDs without
+duplicates. The independent Kafka reader checks values and a stable stopped-writer boundary.
+Earlier small-batch/query-budget fixtures did not demonstrate saturation and are retained as
+failed probes, not passing evidence. This closes the indivisible-output overflow/replay diagnostic;
+**gradual queue saturation, deferral and restart still need external-ledger evidence**, separately
+from cluster terminal-fault authority.
+
+Single-node Kafka ALO diagnostics use four projection pipelines at 1,000 rows/s each for 60 seconds,
+separate source/sink brokers, 500 ms checkpoints and a process kill halfway through load. A
+10-second sink-broker pause preserves all 240,000 source-acknowledged IDs with 1,796 allowed ALO
+duplicates and 2,784 ms verified recovery. Corrupting the selected manifest fails its committed
+digest check. Advancing the retained Kafka prefix to 60,001 past the committed next position 60,000
+fails replay validation. Both recovery failures exit before readiness and leave every external sink
+boundary unchanged, including after independent canary inputs. No fallback checkpoint is accepted.
+
+The broker-kill diagnostic exposed a test-observer limitation: its consumer exited on transport
+loss. The observer now retains its ledger and original deadline across the two connection-loss
+codes only; malformed output and other errors still fail. The failed initial run is retained.
+The rerun survives a 10-second broker outage and process restart. A fresh consumer audit of the
+final stable broker cut verifies all 240,000 IDs and payloads, with 3,371 stored ALO duplicates and
+12,640 ms verified recovery. Broker restart reused 59 offsets with different payloads, so the
+live observer's 3,430 duplicate observations are not the stored duplicate count; the independent
+final scan establishes the result. This broker behavior and the observed recovery time must be
+included when selecting production durability and recovery targets.
+
+Validation: 6,144 workspace library/server tests pass with one existing ignore. Two parallel
+attempts hit different one-second cluster-test deadlines; the complete serial rerun passes and
+both earlier failure logs are retained. Both Clippy configurations, nightly formatting,
+readability, analytical dependency consistency and whitespace checks pass. All 14 qualification
+unit tests, the new Kafka overflow/restart diagnostic, seven exception-policy tests, the
+publication guard, cargo-audit and cargo-deny pass. The fault workloads use the same verified
+server executable; only the independent observer was rebuilt for the broker-kill rerun.
+
+Performance: matched cached binaries compare the six Multiset update/snapshot/checkpoint cases
+and the core latency control with 100 Criterion samples, two-second warmup and five-second
+measurement targets, pinned to WSL CPUs 0,2,4,6. Initial narrow-update (+9.05%) and wide-checkpoint
+(+5.08%) outliers accompanied an +8.49% slowdown of the byte-identical control binary. Repeating
+only these cases in reversed order with three-second warmup and fifteen-second measurements gives
+-1.43%, +2.63% and -0.91%, respectively. The other four initial cases range from -2.22% to +3.43%.
+No unexplained regression above 5% remains. Snapshot IPC changes from 4.85 to 4.95. Both initial
+and confirmation measurements, source/binary identities and commands are retained.
+
+Local evidence and diagnostic controllers are retained under `target/s12-diagnostics/`. Native
+release executables remain in the WSL evidence directories named by each bundle's
+`executables.json`; bundle hashes were verified there before copying the nonbinary evidence.
+Production acceptance ceilings remain unset. The one-hour runs, three repetitions, workload/mode
+matrix, normal saturation cases and S13 upgrade qualification remain open; these short fault
+diagnostics do not establish production latency, RSS or recovery limits.
+
+### S12 — deferred source scheduling (2026-09-22)
+
+Fixed two replay defects in the shared embedded, single-node and cluster runtime. Buffered source
+ports now count as deferred work, so a source whose downstream queue has drained is retried.
+The coordinator leaves newer input in its existing bounded FIFO until retained work settles,
+preserving the original source cursors and frontier pins across data and control wakeups.
+The redundant replay-wakeup flag was removed; no new queue, state or dependency was added.
+
+Both regressions failed before the fix and pass afterward. Coverage includes ordinary graph
+drain after partial queue saturation and queued successor input during runnable replay, timer
+retries and manual checkpoint wakeups. The external-ledger saturation/checkpoint/restart cases
+remain open; these regressions do not close S12 production qualification.
+
+Validation: 6,145 workspace library/server tests pass with one existing ignore. Both Clippy
+configurations, nightly formatting, readability, analytical dependency consistency and whitespace
+checks pass. No readability baseline was expanded.
+
+Matched WSL Criterion means cover 12 core-latency, group-key, source-queue and graph cases with
+100 samples. The single-graph case initially measured +5.15%; reversed-order 30-second runs
+measure -3.68%, with the byte-identical latency control at -0.68%. The other initial cases range
+from -27.89% to +2.63%; no unexplained regression above 5% remains. Fanout IPC is 0.70 before and
+0.69 after, below the 2.0 rule of thumb in both builds. CPU samples retain allocation, Arrow
+concatenation and scheduling costs. Commands, source/binary hashes, failed/passing regressions,
+measurements and profile reports are retained under `target/s12-gradual-replay/`.

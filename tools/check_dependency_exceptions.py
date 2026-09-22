@@ -70,10 +70,13 @@ def validate(root, today, publication=False):
     if directory.is_symlink() or source_digest(directory) != backport["sha256"]:
         raise ValueError("quick-xml backport source differs from its reviewed digest")
     if publication:
-        raise ValueError(
-            "crate publication is blocked: Cargo drops the quick-xml workspace patch; "
-            "remove the backport after compatible upstream fixes before publishing"
-        )
+        accepted = policy.get("publication", {})
+        xml_advisories = sorted(e["advisory"] for e in exceptions if e["crate"] == "quick-xml")
+        if not accepted.get("reason") or sorted(accepted.get("advisories", [])) != xml_advisories:
+            raise ValueError(
+                "crate publication is blocked: Cargo drops the quick-xml workspace patch; "
+                "an explicit, current exception for the unpatched XML advisories is required"
+            )
 
 
 if __name__ == "__main__":
@@ -85,3 +88,5 @@ if __name__ == "__main__":
     except (ValueError, KeyError, OSError, TypeError) as error:
         sys.exit(f"Dependency exception check failed: {error}")
     print("Dependency exceptions: approval, expiry, scanner lists and pinned sources verified")
+    if args.publication:
+        print("Registry publication allowed under the temporary unpatched XML risk exception")

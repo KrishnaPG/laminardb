@@ -85,6 +85,10 @@ requires all IDs followed by a drained, stable public Kafka boundary. A missing 
 hidden by later records or by another pipeline. Source origins make cross-routing detectable even
 when different pipelines use the same IDs and payload. `backlog` is an end-to-end row backlog, not an
 engine queue-byte measurement. RSS is sampled; spikes shorter than a scrape interval may be missed.
+The observer logs and retries broker connection loss within its original deadline. A broker that
+loses its acknowledged tail can reuse offsets after restart; earlier visibility observations may
+then describe records no longer stored. Such broker-failure diagnostics also need an independent
+scan of the final stable output cut against the input ledger before accepting their result.
 
 Reports use `laminardb-workload-observation/v2`. The resource summary retains each process
 generation's sampled interval, fitting window, sample count, missing RSS samples after warmup,
@@ -106,3 +110,21 @@ under load, corrupt cuts, expired replay, G9 Backpressure/Fail saturation/checkp
 external-ledger cases, and the intended mode's recovery/topology operations. Tables/MVs,
 stateful SQL, cluster delivery, native cloud boundaries and exact compositions need their own
 declared workloads and independent evidence. See [the execution plan](../../docs/production-hardening-plan.md#s12--qualify-the-integrated-workload-g5).
+
+The embedded Kafka ALO overflow diagnostic expands an intermediate projection beyond a
+64 KiB graph-port limit after establishing a durable cut. Both lossless policies must halt without
+publishing the oversized output or advancing the checkpoint. After an explicit capacity repair,
+restart must recover every input ID. An independent Kafka consumer verifies the prefix and final
+output, allowing ALO duplicates. This exercises indivisible-output rejection and replay from the
+last good cut; gradual queue saturation/deferral and cluster durable terminal-fault authority need
+separate external-ledger evidence.
+
+```bash
+mkdir -p target/s12-overload
+LAMINAR_REQUIRE_REDPANDA=1 LAMINAR_S12_DIAGNOSTICS="$PWD/target/s12-overload" \
+  cargo test -p laminar-db --features cluster --test kafka_docker_scenarios \
+  durable_graph_overflow_and_restart_ledger -- --ignored --exact --nocapture
+```
+
+Use a new evidence directory each time. The diagnostic retains its uniquely named broker topics,
+local checkpoints, pressure/fault report and independently consumed output rows.

@@ -221,6 +221,9 @@ fn ordinary_dictionary_and_view_batches_fit_staging_budget() {
                 entry.multiset.as_ref().unwrap().counts.len()
             };
             assert_eq!(retained, 16_384);
+            let snapshot = store.to_record_batch("v").unwrap().unwrap();
+            assert_eq!(snapshot.schema(), data.schema());
+            assert_eq!(snapshot.num_rows(), 16_384);
         }
     }
 }

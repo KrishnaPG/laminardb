@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, ensure, Context as _, Result};
 use rdkafka::consumer::{BaseConsumer, Consumer as _};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::Message as _;
 use serde::Serialize;
 
@@ -183,7 +184,18 @@ fn observe(
     let mut stable_since = Instant::now();
     while Instant::now() < deadline {
         if let Some(result) = consumer.poll(Duration::from_millis(10)) {
-            let message = result?;
+            let message = match result {
+                Err(KafkaError::MessageConsumption(
+                    code @ (RDKafkaErrorCode::BrokerTransportFailure
+                    | RDKafkaErrorCode::AllBrokersDown),
+                )) => {
+                    // Broker fault injection also disconnects this independent consumer. Keep
+                    // its ledger and original deadline; malformed output still fails below.
+                    eprintln!("qualification observer reconnecting after {code}");
+                    continue;
+                }
+                result => result?,
+            };
             let elapsed = start.elapsed();
             let pipeline = topics
                 .iter()

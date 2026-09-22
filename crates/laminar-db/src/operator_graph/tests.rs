@@ -6656,8 +6656,10 @@ async fn graph_prospective_source_gate_retains_input_frontier_and_cached_sql_ret
     let (deferred, names) = graph.take_cycle_deferrals();
     assert!(deferred && names.contains(&Arc::from("trades")));
     assert!(!graph.checkpoint_is_quiescent());
+    assert!(graph.has_deferred_work());
+    assert!(graph.has_runnable_deferred_work());
     let second = graph
-        .execute_checkpoint_drain_cycle(100, None)
+        .execute_cycle(&FxHashMap::default(), 100, None)
         .await
         .unwrap();
     let symbols: Vec<_> = second["sorted"]
@@ -6676,6 +6678,8 @@ async fn graph_prospective_source_gate_retains_input_frontier_and_cached_sql_ret
     assert!(graph.checkpoint_is_quiescent());
     assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
     assert_eq!(graph.output_watermarks[source], 100);
+    assert!(!graph.has_deferred_work());
+    assert!(!graph.has_runnable_deferred_work());
     let third = graph
         .execute_checkpoint_drain_cycle(100, None)
         .await

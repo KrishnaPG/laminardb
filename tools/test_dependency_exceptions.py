@@ -84,10 +84,18 @@ class DependencyExceptions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "owner"):
             self.check()
 
-    def test_publication_rejects_workspace_only_backport(self):
+    def test_publication_requires_explicit_xml_risk_acceptance(self):
         self.check()
-        with self.assertRaisesRegex(ValueError, "publication is blocked"):
-            validate(self.root, date(2026, 9, 21), publication=True)
+        validate(self.root, date(2026, 10, 20), publication=True)
+        with self.assertRaisesRegex(ValueError, "expired"):
+            validate(self.root, date(2026, 10, 21), publication=True)
+        path = self.root / "security/dependency-exceptions.json"
+        policy = json.loads(path.read_text())
+        for acceptance in ({}, {"reason": "accepted", "advisories": ["RUSTSEC-2026-0194"]}):
+            policy["publication"] = acceptance
+            path.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(ValueError, "publication is blocked"):
+                validate(self.root, date(2026, 9, 21), publication=True)
 
 
 if __name__ == "__main__":

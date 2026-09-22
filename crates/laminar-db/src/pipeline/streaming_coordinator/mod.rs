@@ -396,7 +396,7 @@ pub struct StreamingCoordinator {
     /// Cursors staged by `process_msg`; a replay-preserving deferral retains them until the graph
     /// consumes its buffered work, while a fault discards them.
     pending_offsets: Vec<Option<SourceBatchCursor>>,
-    /// The previous cycle retained graph work. Its retry is scheduled ahead of source intake so a
+    /// The previous cycle retained graph work. Source intake waits for it to finish so a
     /// newer connector cursor cannot overtake the buffered mutation.
     replay_pending: bool,
     control_rx: ControlMsgRx,
@@ -449,7 +449,6 @@ impl CoordinatorRunState {
 #[derive(Default)]
 struct CoordinatorWake {
     message: Option<QueuedSourceMsg>,
-    retrying_replay: bool,
     checkpoint_control_due: bool,
     gates: CoordinatorGates,
 }

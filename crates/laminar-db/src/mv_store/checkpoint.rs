@@ -189,9 +189,11 @@ fn multiset_counted_checkpoint_batch(
             "multiset MV contains an invalid checkpoint multiplicity".into(),
         ));
     }
-    let mut arrays = row_converter
-        .convert_rows(counts.iter().map(|(key, _)| key.row()))
-        .map_err(|error| DbError::Storage(format!("multiset MV checkpoint conversion: {error}")))?;
+    let mut arrays = super::multiset::decode_rows(
+        row_converter,
+        schema,
+        counts.iter().map(|(key, _)| key.row()),
+    )?;
     arrays.push(Arc::new(Int64Array::from_iter_values(
         counts.iter().map(|(_, count)| *count),
     )));

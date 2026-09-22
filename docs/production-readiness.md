@@ -6,7 +6,7 @@
 The [execution plan](production-hardening-plan.md) turns this backlog into bounded sessions,
 dependencies, correctness tests and performance gates. Planning refinements below were checked
 against the same HEAD. S1–S3, S4a/S4b/S4d/S4e dependency repairs, S4c CI/release enforcement and S5 Kafka
-progress telemetry are implemented and verified locally. Remaining S4 findings now block CI/release.
+progress telemetry are implemented and verified locally. Remaining S4 findings have explicit temporary exceptions through 2026-10-21; see the execution plan and security policy for the separate registry XML risk acceptance.
 B0 Linux diagnostics completed on 2026-09-20 and found growing cached-plan metric retention.
 S6a now releases cached execution state and corrects stale Top-K cutoffs. Correctness gates pass;
 sort latency has a documented 4–23% cost across diagnostic comparisons. S6b now shares bounded

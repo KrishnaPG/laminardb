@@ -10968,6 +10968,63 @@ async fn deferred_replay_keeps_its_source_frontier_pin_until_settlement() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn deferred_replay_drains_before_admitting_queued_source_input() {
+    for (runnable, manual_wake) in [(true, false), (false, false), (true, true), (false, true)] {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (source_tx, source_rx) = test_source_channel(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            source_rx,
+            control_rx,
+            shutdown,
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.replay_pending = true;
+        coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(checkpoint_at(10)));
+        let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointRequest>(1);
+        coordinator = coordinator.with_force_checkpoint_rx(force_rx);
+        let (reply_tx, _reply_rx) = crossfire::oneshot::oneshot();
+        if manual_wake {
+            force_tx.send(manual_request(reply_tx)).await.unwrap();
+        }
+
+        let mut callback = MockCallback::new();
+        callback.runnable_deferred_input = runnable;
+        callback.shuffle_work_wake = Some(Arc::new(tokio::sync::Notify::new()));
+        callback.retained_results = Some(FxHashMap::from_iter([(
+            Arc::from("test_source"),
+            vec![int_batch(7)],
+        )]));
+        callback.halt_at_cycle = Some(3);
+        let cycle_input_rows = Arc::clone(&callback.cycle_input_rows);
+        let written_rows = Arc::clone(&callback.written_rows);
+        let pin_cycles = Arc::clone(&callback.source_frontier_pin_cycles);
+        source_tx
+            .send(SourceMsg::Batch {
+                source_idx: 0,
+                batch: int_batch(8),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(20)),
+            })
+            .await
+            .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+            .await
+            .expect("replay must drain and then admit the queued successor");
+        assert!(matches!(exit, ExitReason::Halt(ref reason)
+            if reason == "injected halt at cycle 3"));
+        assert_eq!(
+            cycle_input_rows.lock().as_slice(),
+            &[0, 1, 0],
+            "runnable={runnable}, manual_wake={manual_wake}"
+        );
+        assert_eq!(written_rows.load(Ordering::Acquire), 2);
+        assert_eq!(pin_cycles.lock().first(), Some(&1));
+    }
+}
+
 struct BackpressuredCallback {
     inner: MockCallback,
     cycle_count: Arc<std::sync::atomic::AtomicU32>,

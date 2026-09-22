@@ -298,3 +298,6 @@ mod tests;
 
 #[cfg(test)]
 mod quota_tests;
+
+#[cfg(test)]
+mod dictionary_tests;

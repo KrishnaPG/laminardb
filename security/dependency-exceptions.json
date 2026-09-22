@@ -31,13 +31,13 @@
       "advisory": "RUSTSEC-2026-0194",
       "crate": "quick-xml",
       "version": "0.39.4",
-      "reason": "Conditional version-only exception: upstream attribute hash prefilter fix is backported and source-verified."
+      "reason": "Workspace backport is source-verified; registry publication separately accepts the unpatched attribute-check CPU denial-of-service risk until expiry."
     },
     {
       "advisory": "RUSTSEC-2026-0195",
       "crate": "quick-xml",
       "version": "0.39.4",
-      "reason": "Conditional version-only exception: upstream namespace declaration cap is backported and source-verified."
+      "reason": "Workspace backport is source-verified; registry publication separately accepts the unpatched namespace-allocation denial-of-service risk until expiry."
     }
   ],
   "packages": [
@@ -76,6 +76,10 @@
       "checksum": "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
     }
   ],
+  "publication": {
+    "advisories": ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"],
+    "reason": "Explicitly accepted on 2026-09-21 through the policy expiry: Cargo does not propagate the workspace XML patch to registry consumers. object_store 0.13.2 still requires quick-xml ^0.39.0; upgrading the analytical dependency generation is outside this repair. Unpatched registry consumers retain CPU and memory denial-of-service exposure when parsing hostile XML."
+  },
   "backport": {
     "path": "vendor/quick-xml",
     "sha256": "cdf0eb6198ab867db45ba6230c8ebe176299488b13fc69744e34f86c243f19b0"

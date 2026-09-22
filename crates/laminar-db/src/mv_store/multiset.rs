@@ -5,8 +5,9 @@ use super::staging::StagingBudget;
 use super::weight_and_plain_cols;
 use crate::error::DbError;
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
+use arrow::compute::{cast_with_options, CastOptions};
 use arrow::datatypes::SchemaRef;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{OwnedRow, Row, RowConverter, SortField};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -79,6 +80,32 @@ fn row_size(key: &OwnedRow) -> Result<usize, DbError> {
     std::mem::size_of::<(OwnedRow, i64)>()
         .checked_add(key.as_ref().len())
         .ok_or_else(size_overflow)
+}
+
+pub(super) fn decode_rows<'a>(
+    converter: &RowConverter,
+    schema: &SchemaRef,
+    rows: impl IntoIterator<Item = Row<'a>>,
+) -> Result<Vec<ArrayRef>, DbError> {
+    let mut arrays = converter
+        .convert_rows(rows)
+        .map_err(|e| DbError::Storage(format!("multiset MV row conversion: {e}")))?;
+    for (array, field) in arrays.iter_mut().zip(schema.fields()) {
+        // Arrow hydrates dictionaries, including nested ones, when decoding rows.
+        // Restore the declared type without turning an unrepresentable value into null.
+        if array.data_type() != field.data_type() {
+            *array = cast_with_options(
+                array,
+                field.data_type(),
+                &CastOptions {
+                    safe: false,
+                    ..CastOptions::default()
+                },
+            )
+            .map_err(|e| DbError::Storage(format!("multiset MV column '{}': {e}", field.name())))?;
+        }
+    }
+    Ok(arrays)
 }
 
 impl MultisetState {
@@ -293,10 +320,7 @@ impl MultisetState {
         let rows = self.counts.iter().flat_map(|(key, &count)| {
             std::iter::repeat_n(key.row(), usize::try_from(count).unwrap_or(0))
         });
-        let arrays = self
-            .row_converter
-            .convert_rows(rows)
-            .map_err(|e| DbError::Storage(format!("multiset MV row conversion: {e}")))?;
+        let arrays = decode_rows(&self.row_converter, schema, rows)?;
         RecordBatch::try_new(schema.clone(), arrays)
             .map_err(|e| DbError::Storage(format!("multiset MV batch assembly: {e}")))
     }

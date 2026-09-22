@@ -1291,9 +1291,7 @@ impl OperatorGraph {
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .any(|(node_id, node)| {
-                !node.operator.wants_input()
-                    || (!self.source_node_ids.contains(&node_id)
-                        && self.input_bufs[node_id].iter().any(|port| !port.is_empty()))
+                !node.operator.wants_input() || self.node_has_buffered_input(node_id)
             })
     }
 
@@ -1305,9 +1303,7 @@ impl OperatorGraph {
             .any(|(node_id, node)| {
                 !matches!(self.gate_decision(node_id), GateDecision::Skip)
                     && (node.operator.deferred_work_is_runnable()
-                        || (!self.source_node_ids.contains(&node_id)
-                            && node.operator.wants_input()
-                            && self.input_bufs[node_id].iter().any(|port| !port.is_empty())))
+                        || (node.operator.wants_input() && self.node_has_buffered_input(node_id)))
             })
     }
 
