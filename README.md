@@ -87,7 +87,7 @@ conn.close()
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
 | Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
-| Cluster | Multi-node deployment. Static or gossip discovery, lease-fenced control paths, assignment-fenced vnodes, and distributed checkpoints. Stateful vnode acquisition currently fails closed. |
+| Cluster | Multi-node deployment. Static or gossip discovery, lease-fenced control paths, assignment-fenced vnode reassignment, and distributed checkpoints. SQL and delivery admission are narrower than local execution; see below. |
 
 ### Prebuilt binaries
 
@@ -106,8 +106,9 @@ tar xzf laminardb-server-*.tar.gz
 Multi-arch images are published to **Docker Hub** and **GHCR** on every release:
 
 ```bash
-docker run -p 8080:8080 laminardb/laminardb-server:latest          # Docker Hub
-docker run -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest  # GHCR
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+docker run -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN laminardb/laminardb-server:latest          # Docker Hub
+docker run -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN ghcr.io/laminardb/laminardb-server:latest  # GHCR
 ```
 
 The image ships a default config at `/etc/laminardb/laminardb.toml` (mount your own over it) and persists state in `/var/lib/laminardb`. A full `docker compose` stack — server plus Redpanda, Prometheus, and Grafana — is in [`docker-compose.yml`](docker-compose.yml).
@@ -157,8 +158,11 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 > The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
 > object-store-only checkpoint durability. The strict three-node cluster at-least-once fault profile
 > passed on 2026-08-15; single-node and exactly-once release profiles remain separately gated.
-> Cluster SQL admits stateless pipelines, supported non-windowed keyed aggregates, and one bounded
-> join stage over direct, watermarked sources. The join supports `INNER`, `LEFT`,
+> Cluster SQL admits projection/filter pipelines, supported non-windowed keyed aggregates, managed
+> direct-source `TUMBLE`/`HOP`/`SESSION` windows with `EMIT ON WINDOW CLOSE` or `EMIT FINAL`, and one
+> bounded interval join stage over direct, watermarked sources. Managed windows require a watermark
+> on the window's event-time column, replay-immutable expressions, and compiled pre-aggregation;
+> indirect inputs and windowed joins remain rejected. The interval join supports `INNER`, `LEFT`,
 > `RIGHT`, `FULL`, `LEFT/RIGHT SEMI`, and `LEFT/RIGHT ANTI` with ordered `VARCHAR`/`BIGINT`
 > equality keys and a positive finite event-time bound. Every join projection needs an explicit
 > alias, and every projected or filtered column must use its input qualifier. Append-only inputs use
@@ -170,10 +174,30 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 > cluster execution rejects it until reference connectors expose a cluster-agreed snapshot identity
 > that can be rebuilt on reassignment. Output from any of the eight kinds can feed a separate named
 > keyed aggregate stream;
-> fused `JOIN ... GROUP BY` and cluster windowed aggregation remain fail-closed.
+> fused `JOIN ... GROUP BY` remains fail-closed. Managed direct-source temporal ASOF execution uses
+> a separate admission path with ordered, replayable source positions.
 > Cluster materialized views also fail closed regardless of query shape because their
 > retained output lacks a planner-certified distribution and assignment-fenced checkpoint/read
 > lifecycle. Unsupported state and connector compositions fail closed before external I/O.
+
+### Supported SQL and delivery boundaries
+
+These boundaries describe admission in the current source tree, not workload qualification.
+Local means embedded or single-node server. A Cargo feature enables code; it does not certify a
+source/sink composition, and checkpointing alone does not provide exactly-once delivery.
+
+| Surface | Local | Cluster | Executable admission examples |
+|---------|-------|---------|------------------------------|
+| Projection/filter and managed non-windowed keyed aggregates | Supported | Supported for certified plans | `cluster_query_shape_admission_is_pre_mutation_and_mode_derived` in [DB tests](crates/laminar-db/src/db/tests.rs) |
+| Managed event-time `TUMBLE`/`HOP`/`SESSION` | Supported | Direct source and final/window-close emission as above | Same test covers all three windows and rejected shapes |
+| Bounded interval join; separate downstream keyed aggregate | Supported | Supported under the join restrictions above | Same test covers admitted joins and rejected fused aggregation |
+| Managed temporal ASOF | Supported under source-position and recovery contracts | Same contracts plus cluster lifecycle admission | Same test and `temporal_source_contracts_enforce_recovery_positions_and_input_roles` in [connector admission tests](crates/laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs) |
+| Materialized views and reference-table enrichment | Supported | Rejected | `clustered_reference_tables_fail_before_local_registration` and the query-shape test in [DB tests](crates/laminar-db/src/db/tests.rs) |
+| Exactly-once connector output | Exact-certified source plus checkpoint-committable sink and durable checkpoint scope | Kafka to certified direct-S3/S3A Delta append or REST-Iceberg append only, with the authentication limits above | `source_contract_admission_matrix_is_fail_closed`, `complete_exact_protocol_is_admitted_without_opening`, `rest_s3_iceberg_is_cluster_exact_admitted_before_io` in [connector admission tests](crates/laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs) |
+
+The query-shape examples validate planning/admission without opening external connectors. Real
+broker, storage and failure qualification is separate. Server TOML examples are checked by
+`shipped_server_configs_deserialize` in [config tests](crates/laminar-server/src/config/tests.rs).
 
 ### Cluster Configuration Example
 
@@ -185,6 +209,7 @@ node_id = "node-1" # Required and unique per node
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"
 key_groups = 256
 
@@ -204,7 +229,9 @@ interval = "30s"
 timeout = "120s"
 ```
 
-Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields are omitted. To enable mTLS, configure all four fields; every node certificate must chain to the configured CA and contain `cluster_tls_server_name` as a SAN. These fields do not wrap Chitchat gossip, so restrict `gossip_port` to a trusted network. Use mTLS for production clusters unless transport security is provided by the deployment network.
+Set `LAMINAR_CONSOLE_TOKEN` to a random secret before starting each node. Non-loopback HTTP binds require `server.console_token`. Terminate HTTP TLS at a trusted proxy and restrict access to the public health and metrics endpoints.
+
+Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields are omitted. To enable mTLS, configure all four fields; every node certificate must chain to the configured CA and contain `cluster_tls_server_name` as a SAN. These fields do not protect HTTP or Chitchat gossip, so restrict `gossip_port` to a trusted network. Use mTLS for production clusters unless transport security is provided by the deployment network.
 
 > [!NOTE]
 > If `server.mode` is set to `"single"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.
@@ -214,7 +241,9 @@ Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields 
 
 ## Streaming SQL
 
-Standard SQL with streaming extensions. Built on DataFusion 52.
+Standard SQL with streaming extensions. Built on DataFusion 53.1. SQL examples below show local
+execution unless explicitly described as cluster examples; cluster plans must meet the admission
+boundaries above.
 
 ### Window Types
 
@@ -320,12 +349,15 @@ SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
 SHOW CREATE SOURCE name
 DESCRIBE [EXTENDED] table_name
 EXPLAIN ANALYZE SELECT ...
-SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- committed tail or epoch replay
+SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- tail or retained epoch replay
 DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 ```
 
-Embedded and single-node subscriptions retain their existing local delivery semantics. In cluster
-mode, `SUBSCRIBE` is admitted only for named, non-windowed managed keyed aggregates with a
+Embedded and single-node subscriptions deliver live in-process output. Local `retain_history`
+keeps a byte-bounded, in-memory suffix for epoch replay; it does not survive a process restart.
+There is no atomic snapshot-plus-tail attachment API: a separate `SELECT` followed by `SUBSCRIBE`
+does not establish a gap-free snapshot boundary. In cluster mode, `SUBSCRIBE` is admitted only
+for named, non-windowed managed keyed aggregates with a
 planner-certified vnode distribution and an initialized durable output backend. Any server node
 can serve the complete subscription from shared checkpoint storage. Stateless streams, raw join
 output, windowed aggregates, materialized views, and uncertified aggregate plans remain
@@ -346,7 +378,14 @@ ID, only after the complete cluster checkpoint commits. `SUBSCRIBE … AS OF EPO
 partition's exclusive frontier from that committed epoch, or fails visibly when the epoch is not
 committed, has been pruned, belongs to another stream generation, or has corrupt history. This is
 checkpoint-granular replay, not a durable named-consumer cursor; reconnecting after consuming only
-part of an interval may replay that interval.
+part of an interval may replay that interval. Consumers must persist their completed progress and
+make external side effects idempotent when replay can repeat rows.
+
+Local replay is covered by `as_of_starts_strictly_after_exact_retained_barrier` and
+`as_of_classifies_future_missing_and_pruned_epochs` in [registry tests](crates/laminar-db/src/subscription/registry/tests.rs).
+Cluster replay is covered by `as_of_epoch_replays_the_exact_partition_ordered_suffix_from_a_fresh_gateway`
+in [gateway tests](crates/laminar-db/src/subscription/cluster/tests/reader.rs), with SQL admission
+covered by `cluster_keyed_aggregate_commits_and_replays_through_the_gateway` in [DB tests](crates/laminar-db/src/db/tests.rs).
 
 The managed non-windowed aggregate path used after a bounded join supports non-`DISTINCT` `COUNT`,
 `SUM`, `AVG`, `MIN`, and `MAX` in local and cluster mode. Local SQL has additional DataFusion and
@@ -387,15 +426,24 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | Connector | Feature Flag | Notes | Status |
 |-----------|-------------|-------|--------|
 | Kafka | `kafka` | Replayable, splittable, and exact-delivery certified | ✅ |
-| PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | ✅ |
-| MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | ✅ |
+| PostgreSQL CDC | `postgres-cdc` | Raw JSON change envelopes lack canonical primary-keyed row/delete records; admission rejects before I/O, including resume | Not admitted |
+| MongoDB CDC | `mongodb-cdc` | Raw JSON change envelopes lack canonical primary-keyed row/delete records; admission rejects before I/O, including resume | Not admitted |
 | OpenTelemetry OTLP | `otel` | OTLP/gRPC receiver for traces, metrics, and logs | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
-| Delta Lake | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
+| Delta Lake | `delta-lake` | Reader exposes an ephemeral singleton full changelog; ordinary streaming routes reject it, and durable/cluster use is not admitted | Reader only |
 | Iceberg | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog mode fails closed | ✅ |
 | Files (AutoLoader) | `files` | Local glob discovery/watch, Parquet/CSV/JSON; remote URLs fail at startup | ✅ |
 | Postgres Lookup | `postgres-cdc` | Connector name `postgres`; external table enrichment | ✅ |
+
+CDC driver code and feature flags do not enable streaming admission. PostgreSQL lookup and
+MongoDB sink/lookup support are separate from their rejected CDC sources. The rejection is checked
+by both tests in [cdc_admission.rs](crates/laminar-connectors/tests/cdc_admission.rs). Delta's
+`cdf_contract_is_full_changelog` in [reader tests](crates/laminar-connectors/src/lakehouse/delta_source/tests.rs)
+describes the connector contract; `mutation_sources_fail_before_connector_io` in
+[engine admission tests](crates/laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs)
+checks why that contract cannot enter the ordinary append-only route. The positioned mutable join
+routes require recovery and ordering capabilities that this Delta reader does not provide.
 
 ### Sinks
 
@@ -459,7 +507,7 @@ Enable the listener by setting `pgwire_bind` in `laminardb.toml`. Auth is trust 
 |-----------|----------|
 | `SUBSCRIBE <stream>` | Attach at the current tail; cluster rows become visible only after a whole-cluster checkpoint commit |
 | `SUBSCRIBE … WHERE <expr>` | Schema-aware server-side filtering; supported for certified cluster keyed aggregates |
-| `SUBSCRIBE … AS OF EPOCH n` | Replay strictly after committed epoch `n` while its durable history is retained |
+| `SUBSCRIBE … AS OF EPOCH n` | Replay strictly after retained epoch `n`; history is in memory locally and durable in cluster mode |
 | `DECLARE c CURSOR FOR SUBSCRIBE …` + `FETCH n FROM c` | Cursored consumption for `\set FETCH_COUNT n` clients |
 | `SELECT version()` / `SELECT 1` / transaction control | The handful of meta-commands clients issue at startup |
 
@@ -488,7 +536,7 @@ The HTTP API binds to `bind` configured under `[server]`. It serves the followin
   * `POST /api/v1/checkpoint` to trigger manual checkpoints.
   * `POST /api/v1/reload` to trigger configuration and TLS certificate hot-reloading.
 
-Authentication is gated using a token defined by `server.console_token` in headers/query parameters. CORS origins are restricted via `server.console_cors_allowed_origins`.
+Non-loopback HTTP binds require `server.console_token`; loopback development can omit it. Protected routes accept `Authorization: Bearer <token>`. The `?token=` alternative is limited to WebSocket upgrades. CORS origins are restricted via `server.console_cors_allowed_origins`.
 
 ---
 
@@ -523,9 +571,9 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | Flag | Description |
 |------|-------------|
 | `kafka` | Kafka source/sink, Avro serde, Schema Registry |
-| `postgres-cdc` | PostgreSQL CDC source via logical replication (also builds the standalone `postgres` lookup connector) |
+| `postgres-cdc` | PostgreSQL CDC implementation (source admission rejected); also builds the supported `postgres` lookup connector |
 | `postgres-sink` | PostgreSQL sink via COPY BINARY |
-| `mongodb-cdc` | MongoDB CDC source and sink |
+| `mongodb-cdc` | MongoDB sink/lookup and CDC implementation (CDC source admission rejected) |
 | `delta-lake` | Delta Lake source and sink |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
 | `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |

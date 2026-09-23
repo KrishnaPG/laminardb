@@ -288,14 +288,17 @@ fn secret_matches(presented: &str, expected: &Secret) -> bool {
     presented.len() == expected.len() && ct_eq(presented, expected)
 }
 
-/// Extract and percent-decode the `token` query parameter, if present. Browser
-/// WebSocket clients URL-encode the value, so it must be decoded before the
-/// constant-time comparison.
+/// Extract and percent-decode exactly one `token` query parameter. Browser WebSocket clients
+/// URL-encode the value, so it must be decoded before the constant-time comparison.
 pub(super) fn query_token(uri: &axum::http::Uri) -> Option<String> {
-    let raw = uri.query()?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
+    let mut tokens = uri.query()?.split('&').filter_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (key == "token").then_some(value)
-    })?;
+    });
+    let raw = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
     Some(
         percent_encoding::percent_decode_str(raw)
             .decode_utf8_lossy()

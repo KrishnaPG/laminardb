@@ -57,9 +57,9 @@ remote = ["dep:reqwest", "dep:governor"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.30.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.30.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.30.0", default-features = false }
+laminar-core = { path = "../laminar-core", version = "0.31.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.31.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 quick_cache = { workspace = true }
@@ -68,7 +68,7 @@ governor = { version = "0.8", optional = true }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
-hf-hub = { version = "0.4", default-features = false, features = [
+hf-hub = { version = "0.5", default-features = false, features = [
     "tokio",
     "rustls-tls",
 ], optional = true }
@@ -150,8 +150,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.30.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.30.0", default-features = false, features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.31.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false, features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -168,6 +168,16 @@ object_store = { workspace = true, features = ["aws"] }
 [[bench]]
 name = "recovery_bench"
 harness = false
+
+[[bench]]
+name = "reference_table_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[bench]]
+name = "materialized_view_bench"
+harness = false
+required-features = ["benchmark-internals"]
 
 [[bench]]
 name = "stream_executor_bench"

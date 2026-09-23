@@ -417,9 +417,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Verify dependency exception policy and security backport
+        run: |
+          python3 tools/check_dependency_exceptions.py
+          python3 -m unittest discover -s tools -p 'test_dependency_exceptions.py'
+      - name: Test XML security backport
+        run: cargo test --manifest-path vendor/quick-xml/Cargo.toml --all-features --lib --locked
       - uses: taiki-e/install-action@cargo-audit
-      - run: cargo audit
-        continue-on-error: true  # Advisory only until deps stabilize
+      - run: cargo audit --deny warnings
 
   # ============================================
   # Dependency Licenses
@@ -429,10 +434,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Verify dependency exception policy and security backport
+        run: python3 tools/check_dependency_exceptions.py
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: --workspace
-        continue-on-error: true  # Advisory only until deny.toml is tuned
+          arguments: --locked --workspace
 
   # ============================================
   # Miri (Unsafe Code Verification)
@@ -508,7 +514,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -523,6 +529,8 @@ jobs:
              [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \
+             [[ "${{ needs.audit.result }}" != "success" ]] || \
+             [[ "${{ needs.deny.result }}" != "success" ]] || \
              [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1

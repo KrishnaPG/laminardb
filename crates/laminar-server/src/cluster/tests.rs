@@ -28,6 +28,63 @@ use crate::cluster_config::ClusterConfig;
 use crate::config::ServerConfig;
 
 #[tokio::test]
+async fn graph_input_limit_is_validated_before_cluster_discovery() {
+    let config: ServerConfig = toml::from_str(
+        "node_id = 'node-a'\n[server]\nmode = 'cluster'\npipeline_max_input_buf_bytes = 0\n[discovery]\nstrategy = 'static'\nseeds = ['node-a:7946']",
+    ).unwrap();
+    let cluster_config = ClusterConfig::from_server_config(&config).unwrap().unwrap();
+    let error = start_cluster(config, cluster_config, PathBuf::from("unused.toml"))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("pipeline_max_input_buf_bytes"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn source_queue_limit_is_validated_before_cluster_discovery() {
+    let config: ServerConfig = toml::from_str(
+        "node_id = 'node-a'\n[server]\nmode = 'cluster'\nsource_queue_max_bytes = 0\n[discovery]\nstrategy = 'static'\nseeds = ['node-a:7946']",
+    ).unwrap();
+    let cluster_config = ClusterConfig::from_server_config(&config).unwrap().unwrap();
+    let error = start_cluster(config, cluster_config, PathBuf::from("unused.toml"))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("source_queue_max_bytes"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn datafusion_memory_limit_is_validated_before_cluster_discovery() {
+    let config: ServerConfig = toml::from_str(
+        r#"
+node_id = "node-a"
+[server]
+mode = "cluster"
+datafusion_memory_limit_bytes = 0
+[discovery]
+strategy = "static"
+seeds = ["node-a:7946"]
+"#,
+    )
+    .unwrap();
+    let cluster_config = ClusterConfig::from_server_config(&config).unwrap().unwrap();
+    let error = start_cluster(config, cluster_config, PathBuf::from("unused.toml"))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("datafusion_memory_limit_bytes"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn cluster_entry_rejects_invalid_temporal_retention_before_discovery() {
     let mut config: ServerConfig = toml::from_str(
         r#"

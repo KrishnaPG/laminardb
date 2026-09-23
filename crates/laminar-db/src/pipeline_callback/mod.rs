@@ -1453,6 +1453,10 @@ impl ConnectorPipelineCallback {
                     reason = %msg,
                     "backpressure_policy=Fail tripped; halting pipeline"
                 ),
+                crate::error::DbError::GraphBufferBudgetExceeded { .. } => tracing::error!(
+                    reason = %err,
+                    "graph input budget exceeded; halting pipeline"
+                ),
                 crate::error::DbError::ShuffleTerminal(msg) => tracing::error!(
                     reason = %msg,
                     "permanent shuffle routing failure; halting pipeline"
@@ -5520,6 +5524,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return Ok(());
         }
         let mut store = self.mv_store.write();
+        store
+            .update_views(
+                results
+                    .iter()
+                    .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
+            )
+            .map_err(|error| {
+                let reason = format!("materialized-view cycle preflight failed: {error}");
+                set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
+                crate::pipeline::CycleError::Recovery(reason)
+            })?;
         let mut updates = 0u64;
         // Snapshot broadcast is deferred past the write lock (rematerialize is O(rows) and would
         // otherwise block SELECT readers on the store-wide lock).
@@ -5538,18 +5553,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         .index_of(laminar_core::changelog::WEIGHT_COLUMN)
                         .is_ok()
             });
-            // Apply the whole cycle's output in one call: an Aggregate-mode MV replaces its
-            // result set per cycle, so a per-batch update would keep only the last chunk of a
-            // multi-batch (>8192-row) output (EX-1).
             let row_batches = batches.iter().filter(|b| b.num_rows() > 0).count() as u64;
             if row_batches > 0 {
-                store.update_cycle(stream_name, batches).map_err(|error| {
-                    let reason = format!(
-                        "materialized-view state update for '{stream_name}' failed: {error}"
-                    );
-                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                    crate::pipeline::CycleError::Recovery(reason)
-                })?;
                 updates += row_batches;
                 if !changelog {
                     for batch in batches {

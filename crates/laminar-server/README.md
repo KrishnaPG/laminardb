@@ -39,7 +39,9 @@ cargo install laminar-server
 laminardb --config laminardb.toml
 
 # Docker
-docker run -d -p 8080:8080 -v laminardb-data:/var/lib/laminardb \
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
+  -v laminardb-data:/var/lib/laminardb \
   ghcr.io/laminardb/laminardb-server:latest
 
 # Check health
@@ -50,11 +52,25 @@ curl http://localhost:8080/health
 
 See the [Configuration Reference](https://laminardb.io/docs/) for every field, or the example below:
 
+Set `LAMINAR_CONSOLE_TOKEN` before starting with this configuration. Non-loopback HTTP binds
+require a console token; loopback development can omit it. Use `Authorization: Bearer <token>`
+for protected routes. HTTP TLS terminates at a trusted proxy; pgwire and cluster TLS settings
+do not protect HTTP. Restrict network access to the public health and metrics endpoints.
+
 ```toml
 [server]
 mode = "single"             # "single" (standalone) or "cluster" (multi-node)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
+datafusion_memory_limit_bytes = 268435456 # shared per DB/node; 256 MiB default, must be > 0
+source_queue_max_bytes = 67108864 # shared connector FIFO per DB/node; 64 MiB default
+reference_table_max_rows = 1000000 # independently per local reference table; must be > 0
+reference_table_max_bytes = 268435456 # retained-memory charge per local table; 256 MiB default
+materialized_view_max_rows = 1000000 # per local MV; distinct rows for multiset storage
+materialized_view_max_bytes = 268435456 # retained-memory charge per local MV; must be > 0
+# pipeline_max_input_buf_batches = 256 # per graph input port; 0 disables count limit
+# pipeline_max_input_buf_bytes = 33554432 # optional per-port Arrow bytes; unset disables
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -62,7 +78,8 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # [server.pgwire_users]
 # alice = "${ALICE_PASSWORD}"
 # bob   = "${BOB_PASSWORD}"
-# Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
+# Main I/O runtime worker count uses $TOKIO_WORKER_THREADS (default: logical CPUs).
+# Streaming compute uses one separate single-threaded laminar-compute runtime.
 
 [checkpoint]
 # Provider-neutral object_store URL: absolute file://, s3[a]://, gs/gcs://,
@@ -188,11 +205,15 @@ including remote AI — runs normally.
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
 
-- `SUBSCRIBE <name> [WHERE <predicate>]`: streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
+- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
-`WHERE` is compiled with DataFusion against the target's schema and works on materialized views and sources. It is rejected on named streams because their output schema isn't introspectable.
+`WHERE` is compiled with DataFusion against the resolved output schema; an unresolved named-stream
+schema is rejected. Local epoch replay uses byte-bounded in-memory history. Cluster replay uses
+verified segments in the checkpoint store and is partition-ordered. There is no atomic
+snapshot-plus-tail attachment or durable named-consumer cursor. See the
+[subscription boundaries and tests](../../README.md#ddl).
 
 ### Authentication
 
@@ -284,6 +305,37 @@ Edit the TOML file while the server is running. The file watcher detects changes
 
 Changes to `[server]` and `[checkpoint]` require a restart. Disable the file watcher with `LAMINAR_DISABLE_FILE_WATCH=1`.
 
+`server.datafusion_memory_limit_bytes` bounds participating fallible DataFusion reservations in both
+server modes and requires a restart to change. DB-owned contexts share the limit and disable
+disk spilling. It does not cap process RSS, queues, managed state or connector I/O allocations;
+see the [memory scope](../laminar-db/README.md#datafusion-memory-limit).
+
+`server.source_queue_max_bytes` bounds queued connector Arrow storage in both server modes
+and requires a restart to change. It also caps each individual source batch; oversized input
+faults before its cursor is settled. See the [queue ownership scope](../laminar-db/README.md#connector-source-queue-limit)
+for producer scratch, parked messages and downstream retention.
+
+`server.pipeline_max_input_buf_batches` and `server.pipeline_max_input_buf_bytes` configure
+prospective graph-port limits in both server modes. The count default is 256; the byte cap is
+unset by default and must be greater than zero when supplied. Fan-out charges each port
+independently. Output that cannot fit after execution halts before routing; see the
+[graph input contract](../laminar-db/README.md#graph-input-limits). These startup settings are
+not hot-reloaded and do not bound total process RSS.
+
+`server.reference_table_max_rows` and `server.reference_table_max_bytes` bound each local
+reference table's final state. Both must be greater than zero and require a restart to change.
+Over-limit updates, multi-table refreshes and checkpoint restores fail before live installation.
+Cluster reference-table admission remains restricted. See the
+[table accounting and staging scope](../laminar-db/README.md#reference-table-memory-limits)
+for shared Arrow buffers, external ownership, checkpoint captures and memory headroom.
+
+`server.materialized_view_max_rows` and `server.materialized_view_max_bytes` apply to every
+local MV storage mode. Both must be nonzero. Aggregate, upsert and multiset growth fails
+before any affected MV changes or publishes cycle output. Append storage evicts oldest
+complete batches, but rejects a single batch that cannot fit. Restore fails instead of
+truncating committed state. Cluster MV admission remains rejected. See the
+[MV accounting and publication scope](../laminar-db/README.md#materialized-view-memory-limits).
+
 ## Tuning the Allocator (`MALLOC_CONF`)
 
 The server ships with [`jemalloc`](https://jemalloc.net/) on Linux / non-MSVC (via `tikv-jemallocator`) and `mimalloc` on Windows MSVC. These replace the system allocator and materially reduce fragmentation under bursty sink workloads (Delta Lake, Iceberg, Parquet writers). Both are enabled by default; no action needed to turn them on.
@@ -307,7 +359,7 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:3000,muzzy_d
 
 ### Settings to avoid
 
-- **Do not set `narenas:N` to a small value.** The jemalloc default is `ncpus * 4`, which gives each reactor / sink thread its own arena and eliminates cross-thread contention on `malloc`/`free`. LaminarDB is thread-per-core. Forcing `narenas:4` on an 8-core box means multiple reactors share an arena, and the lock contention shows up directly in the sink commit path. Leave `narenas` unset.
+- **Leave `narenas` unset unless measurements justify changing it.** LaminarDB runs one coordinator on the dedicated single-threaded `laminar-compute` runtime; connector I/O, checkpoint persistence and sink publication use the main work-stealing runtime. Too few allocator arenas can increase contention among those threads. Profile the actual workload before tuning the arena count.
 - **Do not set `tcache:false`.** The per-thread small-allocation cache is load-bearing on any sink that churns Arrow/Parquet buffers.
 
 ### How to set it
