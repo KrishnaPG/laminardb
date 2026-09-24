@@ -10084,6 +10084,14 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             )
             .await
             .unwrap();
+            let message = assert_cluster_rejection(
+                &db,
+                "rejected_multi_input_union",
+                "CREATE STREAM rejected_multi_input_union AS \
+                 SELECT id FROM left_events UNION ALL SELECT id FROM right_events",
+            )
+            .await;
+            assert!(message.contains("single input frontier"), "{message}");
             db.execute(
                 "CREATE SOURCE unwatermarked_events (id BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL) \
                  FROM GENERATOR ('max.rows' = '1')",
@@ -13022,11 +13030,9 @@ async fn open_subscription_after_sequence_pruned_reports_sequence_coordinate() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR)")
         .await
         .unwrap();
-    db.execute(
-        "CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '256b')",
-    )
-    .await
-    .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '256b')")
+        .await
+        .unwrap();
     db.start().await.unwrap();
 
     // Drive the registry directly so the retained prefix is smaller than the
@@ -13037,7 +13043,8 @@ async fn open_subscription_after_sequence_pruned_reports_sequence_coordinate() {
         let batch = arrow_array::RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(arrow::array::StringArray::from(vec![
-                "AAPL".to_string();
+                "AAPL"
+                    .to_string();
                 64
             ]))],
         )

@@ -5,6 +5,9 @@
 mod assignment_authority;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
+#[cfg(test)]
+mod datafusion_memory_tests;
+mod session;
 #[cfg(feature = "cluster")]
 pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
@@ -21,7 +24,6 @@ use laminar_core::catalog::CatalogObjectKind;
 use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
-use laminar_sql::register_streaming_functions;
 
 use crate::builder::LaminarDbBuilder;
 use crate::catalog::SourceCatalog;
@@ -1681,7 +1683,7 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if `DataFusion` context creation fails.
+    /// Returns `DbError` if the configuration is invalid or `DataFusion` context creation fails.
     pub fn open_with_config(config: LaminarConfig) -> Result<Arc<Self>, DbError> {
         let db = Self::open_with_config_and_vars(config, HashMap::new())?;
         db.connector_registry.freeze();
@@ -1692,7 +1694,7 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if `DataFusion` context creation fails.
+    /// Returns `DbError` if the configuration is invalid or `DataFusion` context creation fails.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn open_with_config_and_vars(
         config: LaminarConfig,
@@ -1720,68 +1722,21 @@ impl LaminarDB {
         target_partitions: Option<usize>,
         runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
-        config.source_idle_timeout =
-            crate::config::source_idle_timeout_ms(config.source_idle_timeout)
-                .map_err(|error| DbError::Config(error.to_string()))?
-                .map(Duration::from_millis);
-        let future_skew_ms =
-            crate::config::event_time_max_future_skew_ms(config.event_time_max_future_skew)
-                .map_err(|error| DbError::Config(error.to_string()))?;
-        config.event_time_max_future_skew = Duration::from_millis(future_skew_ms.unsigned_abs());
-        let max_managed_state_bytes = config
-            .pipeline_max_managed_state_bytes
-            .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
-        if max_managed_state_bytes == 0 {
-            return Err(DbError::Config(
-                "pipeline_max_managed_state_bytes must be greater than zero".into(),
-            ));
-        }
-        config.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
-
-        if let Some(checkpoint) = config.checkpoint.as_mut() {
-            let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
-                laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
-            );
-            laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
-                max_node_data_bytes,
-            )
-            .map_err(|error| DbError::Config(format!("checkpoint.max_node_data_bytes: {error}")))?;
-            checkpoint.max_node_data_bytes = Some(max_node_data_bytes);
-        }
+        config.validate_and_normalize()?;
 
         // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();
 
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
-        // Wire the LookupJoinExtensionPlanner so LookupJoinNode → LookupJoinExec.
-        let ctx = {
-            let mut session_config = laminar_sql::datafusion::base_session_config();
-            if let Some(n) = target_partitions {
-                session_config = session_config.with_target_partitions(n);
-            }
-            let extension_planner: Arc<
-                dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync,
-            > = Arc::new(laminar_sql::datafusion::LookupJoinExtensionPlanner::new(
-                Arc::clone(&lookup_registry),
-            ));
-            let query_planner: Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> =
-                Arc::new(LookupQueryPlanner { extension_planner });
-            let mut state_builder = datafusion::execution::SessionStateBuilder::new()
-                .with_config(session_config)
-                .with_default_features()
-                .with_query_planner(query_planner);
-            for rule in extra_optimizer_rules {
-                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
-            }
-            SessionContext::new_with_state(state_builder.build())
-        };
-        register_streaming_functions(&ctx);
+        let ctx = session::create_context(
+            &config,
+            Arc::clone(&lookup_registry),
+            extra_optimizer_rules,
+            target_partitions,
+        )?;
 
-        let catalog = Arc::new(SourceCatalog::new(
-            config.default_buffer_size,
-            config.default_backpressure,
-        ));
+        let catalog = Arc::new(SourceCatalog::from_config(&config));
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry)?;
@@ -1794,7 +1749,6 @@ impl LaminarDB {
             ctx,
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
-            config,
             config_vars: Arc::new(config_vars),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             coordinator: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1804,8 +1758,12 @@ impl LaminarDB {
             connector_registry,
             mv_registry: parking_lot::Mutex::new(laminar_core::mv::MvRegistry::new()),
             table_store: Arc::new(parking_lot::RwLock::new(
-                crate::table_store::TableStore::new(),
+                crate::table_store::TableStore::from_config(&config),
             )),
+            mv_store: Arc::new(parking_lot::RwLock::new(
+                crate::mv_store::MvStore::from_config(&config),
+            )),
+            config,
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             catalog_cleanup_fenced: std::sync::atomic::AtomicBool::new(false),
@@ -1848,7 +1806,6 @@ impl LaminarDB {
             ai_runtime: None,
             ai_handle: None,
             control_tx: parking_lot::Mutex::new(None),
-            mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
@@ -4345,7 +4302,7 @@ impl LaminarDB {
 
         let _catalog_guard = self.topology_ddl_lock.read().await;
         let provider = self.ctx.table_provider(exact_table_reference(name)).await?;
-        let context = SessionContext::new();
+        let context = self.create_auxiliary_context();
         context.register_table(exact_table_reference(LOCAL_SCAN_NAME), provider)?;
         Ok(context
             .sql(&format!("SELECT * FROM {LOCAL_SCAN_NAME}"))
@@ -5710,7 +5667,8 @@ impl LaminarDB {
                     result = stream.next() => {
                         match result {
                             Some(Ok(batch)) => {
-                                if source_clone.push_arrow(batch).is_err() {
+                                // Query output retains its own count-bound ownership, outside input push budgets.
+                                if source_clone.push(crate::catalog::ArrowRecord { batch }).is_err() {
                                     break;
                                 }
                             }

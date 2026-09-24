@@ -100,6 +100,40 @@ impl std::fmt::Display for DbError {
             Self::ConnectorOp(e) => {
                 write!(f, "[{}] Connector error: {e}", self.code())
             }
+            Self::Pipeline(_)
+            | Self::PipelineTerminal(_)
+            | Self::BackpressureFail(_)
+            | Self::GraphBufferBudgetExceeded { .. }
+            | Self::ShuffleNotReady(_)
+            | Self::ShuffleTerminal(_)
+            | Self::ShufflePartialSend(_)
+            | Self::StatefulOperatorPartialApply(_)
+            | Self::ReferenceTableQuotaExceeded { .. }
+            | Self::MaterializedViewQuotaExceeded { .. }
+            | Self::ManagedStateBudgetExceeded { .. } => self.fmt_execution_error(f),
+            Self::QueryPipeline {
+                context,
+                translated,
+            } => write!(f, "Stream '{context}': {translated}"),
+            Self::MaterializedView(msg) => {
+                write!(f, "[{}] Materialized view error: {msg}", self.code())
+            }
+            Self::Storage(msg) => {
+                write!(f, "[{}] Storage error: {msg}", self.code())
+            }
+            Self::Config(msg) => {
+                write!(f, "[{}] Config error: {msg}", self.code())
+            }
+            Self::Unsupported(msg) => {
+                write!(f, "[{}] Unsupported: {msg}", self.code())
+            }
+        }
+    }
+}
+
+impl DbError {
+    fn fmt_execution_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             Self::Pipeline(msg) => {
                 write!(f, "[{}] Pipeline error: {msg}", self.code())
             }
@@ -109,6 +143,13 @@ impl std::fmt::Display for DbError {
             Self::BackpressureFail(msg) => {
                 write!(f, "[{}] Backpressure fail: {msg}", self.code())
             }
+            Self::GraphBufferBudgetExceeded {
+                node, port, batches, bytes, max_batches, max_bytes,
+            } => write!(
+                f,
+                "[{}] Graph input budget exceeded at '{node}' port {port}: projected={batches} batches/{bytes} bytes, limits={max_batches} batches/{max_bytes:?} bytes; reduce batch size or increase graph input limits; terminal fault resolution is required before restarting",
+                self.code()
+            ),
             Self::ShuffleNotReady(msg) => {
                 write!(f, "[{}] Shuffle target not ready: {msg}", self.code())
             }
@@ -134,22 +175,13 @@ impl std::fmt::Display for DbError {
                 "[{}] Managed state budget exceeded during {context}: accounted={accounted_bytes} bytes, limit={limit_bytes} bytes",
                 self.code()
             ),
-            Self::QueryPipeline {
-                context,
-                translated,
-            } => write!(f, "Stream '{context}': {translated}"),
-            Self::MaterializedView(msg) => {
-                write!(f, "[{}] Materialized view error: {msg}", self.code())
-            }
-            Self::Storage(msg) => {
-                write!(f, "[{}] Storage error: {msg}", self.code())
-            }
-            Self::Config(msg) => {
-                write!(f, "[{}] Config error: {msg}", self.code())
-            }
-            Self::Unsupported(msg) => {
-                write!(f, "[{}] Unsupported: {msg}", self.code())
-            }
+            Self::MaterializedViewQuotaExceeded { view, rows, bytes, max_rows, max_bytes } => write!(
+                f, "[{}] Materialized-view '{view}' quota exceeded: projected={rows} rows/{bytes} bytes, limits={max_rows} rows/{max_bytes} bytes", self.code()
+            ),
+            Self::ReferenceTableQuotaExceeded { table, rows, bytes, max_rows, max_bytes } => write!(
+                f, "[{}] Reference-table '{table}' quota exceeded: projected={rows} rows/{bytes} bytes, limits={max_rows} rows/{max_bytes} bytes", self.code()
+            ),
+            _ => unreachable!("execution formatting is dispatched only for execution errors"),
         }
     }
 }

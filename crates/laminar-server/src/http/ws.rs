@@ -465,8 +465,7 @@ pub(super) async fn ws_upgrade(
                 .into_response();
         }
         Err(
-            error
-            @ (laminar_db::DbError::SubscriptionReplayPruned { .. }
+            error @ (laminar_db::DbError::SubscriptionReplayPruned { .. }
             | laminar_db::DbError::SubscriptionSequencePruned { .. }),
         ) => {
             return error_response(StatusCode::GONE, error.to_string()).into_response();
