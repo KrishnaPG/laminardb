@@ -708,6 +708,9 @@ async fn as_of_cursor_reports_exact_gap_after_live_byte_eviction() {
     let registry = SubscriptionRegistry::new();
     registry.configure("mv", 1024);
     registry.broadcast_barrier(1, 1);
+    // An AS-OF reader resumes at the retained barrier's cut cursor, and the
+    // barrier entry itself is never reported as skipped.
+    let barrier_sequence = registry.head_sequence("mv").unwrap();
     let mut reader = registry
         .subscribe("mv", SubscribeStart::AsOfEpoch(1))
         .unwrap();
@@ -720,7 +723,7 @@ async fn as_of_cursor_reports_exact_gap_after_live_byte_eviction() {
     }
 
     let head = registry.head_sequence("mv").unwrap();
-    let expected = head.saturating_sub(1);
+    let expected = head.saturating_sub(barrier_sequence + 1);
     assert!(
         expected > 0,
         "test must evict entries beyond the AS-OF cursor"
@@ -901,7 +904,7 @@ async fn after_sequence_then_live_publish_has_no_gap_or_duplicate() {
     registry.send_batch("mv", batch(vec![3])).unwrap();
 
     let mut reader = registry
-        .subscribe("mv", SubscribeStart::AfterSequence(1))
+        .subscribe("mv", SubscribeStart::AfterSequence(2))
         .unwrap();
 
     assert_eq!(next_value(&mut reader).await, 3);

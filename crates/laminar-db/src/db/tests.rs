@@ -13040,13 +13040,10 @@ async fn open_subscription_after_sequence_pruned_reports_sequence_coordinate() {
     let reg = &db.subscription_registry;
     let schema = db.source_untyped("trades").unwrap().schema().clone();
     for _ in 0..3 {
+        let symbols = vec!["AAPL".to_string(); 64];
         let batch = arrow_array::RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(arrow::array::StringArray::from(vec![
-                "AAPL"
-                    .to_string();
-                64
-            ]))],
+            vec![Arc::new(arrow::array::StringArray::from(symbols))],
         )
         .unwrap();
         reg.send_batch("all_trades", batch).unwrap();
