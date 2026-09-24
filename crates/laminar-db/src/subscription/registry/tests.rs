@@ -847,6 +847,33 @@ fn after_sequence_before_retention_floor_is_rejected() {
     ));
 }
 
+#[test]
+fn after_sequence_rejects_entries_past_retention_when_a_reader_pins_the_head() {
+    let entry_bytes = approx_size(&MvUpdate::Batch(batch(vec![1])));
+    let registry = SubscriptionRegistry::with_storage_budget(1 << 20);
+    registry.configure("mv", entry_bytes);
+    registry.send_batch("mv", batch(vec![1])).unwrap();
+
+    // An attached tail reader keeps sequence 1 resident below the retention
+    // floor, so the physical head lags the earliest replay-eligible sequence.
+    let _pinned = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
+    registry.send_batch("mv", batch(vec![2])).unwrap();
+    registry.send_batch("mv", batch(vec![3])).unwrap();
+
+    let error = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap_err();
+
+    // Admission must key off the retention floor, not the pinned physical head.
+    assert!(matches!(
+        error,
+        SubscriptionOpenError::SequencePruned {
+            requested: 0,
+            earliest_retained: 2
+        }
+    ));
+}
+
 #[tokio::test]
 async fn after_sequence_does_not_require_checkpoint_config() {
     let registry = SubscriptionRegistry::new();
