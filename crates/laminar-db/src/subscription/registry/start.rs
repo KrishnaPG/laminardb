@@ -14,12 +14,15 @@ use super::{MvUpdate, StreamLogInner, SubscriptionOpenError};
 
 /// Resolve the first physical sequence an `AfterSequence(n)` reader replays.
 ///
-/// A cursor at or beyond the current head attaches live with no replay and no
-/// future entry skipped. A cursor behind the retention floor (or any cursor
-/// when retention is disabled) fails closed with the earliest replay-eligible
-/// sequence so the caller can report a truthful sequence-coordinate diagnostic.
-/// Admission keys off the retention window rather than the physical head,
-/// because a slow attached reader can pin entries below `retention_floor`.
+/// Shared-log sequences are 1-based, so a requested `0` maps to the first
+/// entry (the beginning of the log) and a cursor at or beyond the current head
+/// attaches live with no replay and no future entry skipped. A cursor behind
+/// the retention floor (or any cursor when retention is disabled) fails closed
+/// with the earliest replay-eligible sequence so the caller can report a
+/// truthful sequence-coordinate diagnostic. `0` is the reserved "no
+/// replay-eligible entry" coordinate. Admission keys off the retention window
+/// rather than the physical head, because a slow attached reader can pin
+/// entries below `retention_floor`.
 pub(super) fn cursor_after_sequence(
     inner: &StreamLogInner,
     requested: u64,

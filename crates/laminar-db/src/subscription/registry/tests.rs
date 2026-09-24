@@ -104,7 +104,7 @@ async fn delayed_commit_preserves_the_aligned_cut_cursor() {
         MvUpdate::Barrier {
             epoch: 1,
             checkpoint_id: 1,
-            through_sequence: 1,
+            through_sequence: 2,
         }
     ));
 
@@ -176,7 +176,7 @@ fn conflicting_attempt_cannot_steal_the_reserved_cut() {
     );
 
     registry.commit_cut(reserved).unwrap();
-    assert_eq!(registry.next_sequence("mv"), Some(1));
+    assert_eq!(registry.next_sequence("mv"), Some(2));
     assert_eq!(registry.charged_bytes(), BARRIER_ENTRY_BYTES);
 }
 
@@ -304,12 +304,12 @@ fn reserved_marker_survives_process_budget_contention() {
     assert!(error.contains("process memory budget exhausted"));
     {
         let inner = log.inner.lock();
-        assert_eq!(inner.next_sequence, 0);
+        assert_eq!(inner.next_sequence, 1);
         assert_eq!(inner.reserved_marker, Some(attempt));
         assert!(inner.terminal_error.is_none());
     }
     registry.commit_cut(attempt).unwrap();
-    assert_eq!(registry.next_sequence("mv"), Some(1));
+    assert_eq!(registry.next_sequence("mv"), Some(2));
     assert_eq!(registry.charged_bytes(), BARRIER_ENTRY_BYTES);
 }
 
@@ -325,7 +325,7 @@ fn unobserved_commit_releases_reserved_marker_bytes() {
     registry.commit_cut(attempt).unwrap();
 
     assert_eq!(registry.charged_bytes(), 0);
-    assert_eq!(registry.next_sequence("mv"), Some(0));
+    assert_eq!(registry.next_sequence("mv"), Some(1));
 }
 
 #[test]
@@ -380,14 +380,14 @@ async fn recreated_object_is_outside_the_dropped_objects_reserved_cut() {
     registry.configure("mv", 1 << 20);
     let mut recreated_reader = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
     registry.commit_cut(attempt).unwrap();
-    assert_eq!(registry.next_sequence("mv"), Some(0));
+    assert_eq!(registry.next_sequence("mv"), Some(1));
     assert!(matches!(recreated_reader.try_read(), TryRead::Pending));
 
     registry.send_batch("mv", batch(vec![7])).unwrap();
     assert!(matches!(
         recreated_reader.next().await,
         SubscriptionRead::Update {
-            sequence: 0,
+            sequence: 1,
             update,
         } if matches!(update.as_ref(), MvUpdate::Batch(_))
     ));
@@ -417,7 +417,7 @@ async fn recovery_replacement_continues_the_current_object_sequence() {
     assert!(matches!(
         before_recovery.next().await,
         SubscriptionRead::Update {
-            sequence: 0,
+            sequence: 1,
             update,
         } if matches!(update.as_ref(), MvUpdate::Batch(_))
     ));
@@ -436,7 +436,7 @@ async fn recovery_replacement_continues_the_current_object_sequence() {
     assert!(matches!(
         after_recovery.next().await,
         SubscriptionRead::Update {
-            sequence: 1,
+            sequence: 2,
             update,
         } if matches!(update.as_ref(), MvUpdate::Batch(_))
     ));
@@ -447,14 +447,14 @@ async fn recovery_replacement_continues_the_current_object_sequence() {
     assert!(matches!(
         after_recovery.next().await,
         SubscriptionRead::Update {
-            sequence: 2,
+            sequence: 3,
             update,
         } if matches!(
             update.as_ref(),
             MvUpdate::Barrier {
                 epoch: 2,
                 checkpoint_id: 2,
-                through_sequence: 2,
+                through_sequence: 3,
             }
         )
     ));
@@ -700,7 +700,7 @@ async fn process_budget_contention_fails_without_claim_and_release_is_reusable()
         .send_batch("replacement", sample)
         .unwrap();
     assert_eq!(contender_registry.charged_bytes(), entry_bytes);
-    assert_eq!(contender_registry.next_sequence("replacement"), Some(1));
+    assert_eq!(contender_registry.next_sequence("replacement"), Some(2));
 }
 
 #[tokio::test]
@@ -803,6 +803,9 @@ async fn after_sequence_replays_retained_entries_strictly_after_cursor() {
         .subscribe("mv", SubscribeStart::AfterSequence(0))
         .unwrap();
 
+    // Sequences are 1-based, so `AfterSequence(0)` replays the whole log
+    // from the very first entry.
+    assert_eq!(next_value(&mut reader).await, 1);
     assert_eq!(next_value(&mut reader).await, 2);
     assert_eq!(next_value(&mut reader).await, 3);
     assert!(matches!(reader.try_read(), TryRead::Pending));
@@ -816,7 +819,7 @@ async fn after_sequence_at_head_attaches_live_without_replay() {
     registry.send_batch("mv", batch(vec![2])).unwrap();
 
     let mut reader = registry
-        .subscribe("mv", SubscribeStart::AfterSequence(1))
+        .subscribe("mv", SubscribeStart::AfterSequence(2))
         .unwrap();
     assert!(matches!(reader.try_read(), TryRead::Pending));
 
@@ -842,7 +845,7 @@ fn after_sequence_before_retention_floor_is_rejected() {
         error,
         SubscriptionOpenError::SequencePruned {
             requested: 0,
-            earliest_retained: 2
+            earliest_retained: 3
         }
     ));
 }
@@ -854,7 +857,7 @@ fn after_sequence_rejects_entries_past_retention_when_a_reader_pins_the_head() {
     registry.configure("mv", entry_bytes);
     registry.send_batch("mv", batch(vec![1])).unwrap();
 
-    // An attached tail reader keeps sequence 1 resident below the retention
+    // An attached tail reader keeps sequence 2 resident below the retention
     // floor, so the physical head lags the earliest replay-eligible sequence.
     let _pinned = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
     registry.send_batch("mv", batch(vec![2])).unwrap();
@@ -869,7 +872,7 @@ fn after_sequence_rejects_entries_past_retention_when_a_reader_pins_the_head() {
         error,
         SubscriptionOpenError::SequencePruned {
             requested: 0,
-            earliest_retained: 2
+            earliest_retained: 3
         }
     ));
 }
@@ -885,6 +888,7 @@ async fn after_sequence_does_not_require_checkpoint_config() {
         .subscribe("mv", SubscribeStart::AfterSequence(0))
         .unwrap();
 
+    assert_eq!(next_value(&mut reader).await, 11);
     assert_eq!(next_value(&mut reader).await, 12);
 }
 
@@ -904,4 +908,23 @@ async fn after_sequence_then_live_publish_has_no_gap_or_duplicate() {
     registry.send_batch("mv", batch(vec![4])).unwrap();
     assert_eq!(next_value(&mut reader).await, 4);
     assert!(matches!(reader.try_read(), TryRead::Pending));
+}
+
+#[tokio::test]
+async fn after_sequence_zero_replays_the_first_published_batch() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    registry.send_batch("mv", batch(vec![42])).unwrap();
+
+    // Sequences are 1-based, so the beginning of the log is coordinate 0.
+    // This must deliver the very first published batch, not skip it.
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap();
+
+    let update = next_update(&mut reader).await;
+    assert!(matches!(
+        update.as_ref(),
+        MvUpdate::Batch(batch) if batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0) == 42
+    ));
 }

@@ -133,7 +133,9 @@ pub enum SubscribeStart {
     /// Replay retained shared-log entries sequenced strictly after `n`, then
     /// continue live. This is the retained-log coordinate, not a checkpoint
     /// epoch, so it does not require checkpoint configuration or committed
-    /// epochs. `n` at or beyond the current head attaches live without replay.
+    /// epochs. Sequences are 1-based, so `AfterSequence(0)` replays from the
+    /// beginning of the log; `n` at or beyond the current head attaches live
+    /// without replay.
     AfterSequence(u64),
 }
 
@@ -207,7 +209,11 @@ impl StreamLog {
         budget: Arc<SubscriptionMemoryBudget>,
         latest_committed_epoch: Option<u64>,
     ) -> Self {
-        Self::new_at(retention_cap, budget, latest_committed_epoch, 0)
+        // Shared-log sequences are 1-based: the first appended entry is
+        // sequence 1, so `AfterSequence(0)` denotes the beginning of the log
+        // and `earliest_retained: 0` unambiguously means no replay-eligible
+        // sequence.
+        Self::new_at(retention_cap, budget, latest_committed_epoch, 1)
     }
 
     fn new_at(
