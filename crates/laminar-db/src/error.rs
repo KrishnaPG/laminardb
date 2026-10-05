@@ -87,18 +87,41 @@ pub enum DbError {
         latest_committed: Option<u64>,
     },
 
-    /// Requested subscription shared-log sequence is no longer retained for replay.
+    /// Requested sequence resume needs entries that are no longer retained.
     SubscriptionSequencePruned {
         /// Subscription object name.
         name: String,
-        /// Shared-log sequence requested by the subscriber; replay begins strictly after it.
+        /// Last sequence received by the subscriber.
         requested_sequence: u64,
-        /// Earliest shared-log sequence still retained for replay.
-        earliest_retained_sequence: u64,
+        /// Earliest replayable sequence; `None` when no history is retained.
+        earliest_retained_sequence: Option<u64>,
+    },
+
+    /// Requested subscription sequence has not been published.
+    SubscriptionSequenceNotPublished {
+        /// Subscription object name.
+        name: String,
+        /// Sequence requested by the subscriber.
+        requested_sequence: u64,
+        /// Sequence that the next published entry will receive.
+        next_sequence: u64,
     },
 
     /// Structured committed cluster-subscription failure.
     Subscription(#[from] crate::subscription::ClusterSubscriptionError),
+
+    /// Typed durable topology authority failure.
+    #[cfg(feature = "cluster")]
+    Topology(#[from] laminar_core::cluster::control::TopologyError),
+
+    /// SQL-generated request identity retained when submission has an uncertain outcome.
+    #[cfg(feature = "cluster")]
+    TopologySubmission {
+        /// UUID to use for definitive status reads and retries.
+        operation_id: laminar_core::cluster::control::TopologyOperationId,
+        /// Original typed failure, preserving its registry code and source chain.
+        source: Box<Self>,
+    },
 
     /// SQL parse error (from streaming parser)
     SqlParse(#[from] laminar_sql::parser::ParseError),
@@ -287,8 +310,13 @@ impl DbError {
             | Self::SubscriptionReplayPruned { .. }
             | Self::SubscriptionEpochNotCommitted { .. }
             | Self::SubscriptionSequencePruned { .. }
+            | Self::SubscriptionSequenceNotPublished { .. }
             | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
             Self::Subscription(error) => error.code(),
+            #[cfg(feature = "cluster")]
+            Self::Topology(error) => error.code(),
+            #[cfg(feature = "cluster")]
+            Self::TopologySubmission { source, .. } => source.code(),
             Self::Shutdown => error_codes::SHUTDOWN,
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
@@ -355,4 +383,218 @@ impl DbError {
     }
 }
 
-mod display;
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sql(e) => write!(f, "SQL error: {e}"),
+            Self::Engine(e) => write!(f, "Engine error: {e}"),
+            Self::Streaming(e) => write!(f, "Streaming error: {e}"),
+            Self::DataFusion(e) => {
+                let translated = laminar_sql::error::translate_datafusion_error(&e.to_string());
+                write!(f, "{translated}")
+            }
+            Self::SourceNotFound(name) => {
+                write!(f, "[{}] Source '{name}' not found", self.code())
+            }
+            Self::SinkNotFound(name) => {
+                write!(f, "[{}] Sink '{name}' not found", self.code())
+            }
+            Self::QueryNotFound(name) => {
+                write!(f, "[{}] Query '{name}' not found", self.code())
+            }
+            Self::SourceAlreadyExists(name) => {
+                write!(f, "[{}] Source '{name}' already exists", self.code())
+            }
+            Self::SinkAlreadyExists(name) => {
+                write!(f, "[{}] Sink '{name}' already exists", self.code())
+            }
+            Self::StreamNotFound(name) => {
+                write!(f, "[{}] Stream '{name}' not found", self.code())
+            }
+            Self::StreamAlreadyExists(name) => {
+                write!(f, "[{}] Stream '{name}' already exists", self.code())
+            }
+            Self::TableNotFound(name) => {
+                write!(f, "[{}] Table '{name}' not found", self.code())
+            }
+            Self::TableAlreadyExists(name) => {
+                write!(f, "[{}] Table '{name}' already exists", self.code())
+            }
+            Self::InsertError(msg) => {
+                write!(f, "[{}] Insert error: {msg}", self.code())
+            }
+            Self::SchemaMismatch(msg) => {
+                write!(f, "[{}] Schema mismatch: {msg}", self.code())
+            }
+            Self::InvalidOperation(msg) => {
+                write!(f, "[{}] Invalid operation: {msg}", self.code())
+            }
+            Self::SubscriptionReplayPruned { .. }
+            | Self::SubscriptionEpochNotCommitted { .. }
+            | Self::SubscriptionSequencePruned { .. }
+            | Self::SubscriptionSequenceNotPublished { .. } => self.fmt_subscription_start_error(f),
+            Self::Subscription(error) => write!(f, "[{}] {error}", self.code()),
+            #[cfg(feature = "cluster")]
+            Self::Topology(error) => write!(f, "{error}"),
+            #[cfg(feature = "cluster")]
+            Self::TopologySubmission { operation_id, source } => write!(f,
+                "{source}; topology operation {} may be admitted; query status and retry the same identity",
+                operation_id.get()),
+            Self::SqlParse(e) => write!(f, "SQL parse error: {e}"),
+            Self::Shutdown => write!(f, "[{}] Database is shut down", self.code()),
+            Self::Checkpoint(msg) => {
+                write!(f, "[{}] Checkpoint error: {msg}", self.code())
+            }
+            Self::CheckpointStore(e) => {
+                write!(f, "[{}] Checkpoint store error: {e}", self.code())
+            }
+            Self::UnresolvedConfigVar(msg) => {
+                write!(f, "[{}] Unresolved config variable: {msg}", self.code())
+            }
+            Self::Connector(msg) => {
+                write!(f, "[{}] Connector error: {msg}", self.code())
+            }
+            Self::ConnectorOp(e) => {
+                write!(f, "[{}] Connector error: {e}", self.code())
+            }
+            Self::Pipeline(_)
+            | Self::PipelineTerminal(_)
+            | Self::BackpressureFail(_)
+            | Self::GraphBufferBudgetExceeded { .. }
+            | Self::ShuffleNotReady(_)
+            | Self::ShuffleTerminal(_)
+            | Self::ShufflePartialSend(_)
+            | Self::StatefulOperatorPartialApply(_)
+            | Self::ReferenceTableQuotaExceeded { .. }
+            | Self::MaterializedViewQuotaExceeded { .. }
+            | Self::ManagedStateBudgetExceeded { .. } => self.fmt_execution_error(f),
+            Self::QueryPipeline {
+                context,
+                translated,
+            } => write!(f, "Stream '{context}': {translated}"),
+            Self::MaterializedView(msg) => {
+                write!(f, "[{}] Materialized view error: {msg}", self.code())
+            }
+            Self::Storage(msg) => {
+                write!(f, "[{}] Storage error: {msg}", self.code())
+            }
+            Self::Config(msg) => {
+                write!(f, "[{}] Config error: {msg}", self.code())
+            }
+            Self::Unsupported(msg) => {
+                write!(f, "[{}] Unsupported: {msg}", self.code())
+            }
+        }
+    }
+}
+
+impl DbError {
+    fn fmt_subscription_start_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubscriptionReplayPruned {
+                name,
+                requested,
+                earliest_retained,
+            } => write!(
+                f,
+                "[{}] Epoch {requested} for stream '{name}' is no longer retained (earliest retained is {earliest_retained})",
+                self.code()
+            ),
+            Self::SubscriptionEpochNotCommitted {
+                name,
+                requested,
+                latest_committed,
+            } => match latest_committed {
+                Some(latest) => write!(
+                    f,
+                    "[{}] Epoch {requested} for stream '{name}' is not committed (latest committed is {latest})",
+                    self.code()
+                ),
+                None => write!(
+                    f,
+                    "[{}] Epoch {requested} for stream '{name}' is not committed (no committed epoch is available)",
+                    self.code()
+                ),
+            },
+            Self::SubscriptionSequencePruned {
+                name,
+                requested_sequence,
+                earliest_retained_sequence,
+            } => match earliest_retained_sequence {
+                Some(earliest) => write!(
+                    f,
+                    "[{}] Sequence {requested_sequence} for stream '{name}' is no longer retained (earliest retained sequence is {earliest})",
+                    self.code()
+                ),
+                None => write!(
+                    f,
+                    "[{}] Sequence {requested_sequence} for stream '{name}' is no longer retained (no replay history is retained)",
+                    self.code()
+                ),
+            },
+            Self::SubscriptionSequenceNotPublished {
+                name,
+                requested_sequence,
+                next_sequence,
+            } => write!(
+                f,
+                "[{}] Sequence {requested_sequence} for stream '{name}' has not been published (next sequence is {next_sequence})",
+                self.code()
+            ),
+            _ => unreachable!("subscription-start formatting is dispatched only for start errors"),
+        }
+    }
+
+    fn fmt_execution_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pipeline(msg) => {
+                write!(f, "[{}] Pipeline error: {msg}", self.code())
+            }
+            Self::PipelineTerminal(msg) => {
+                write!(f, "[{}] Terminal pipeline error: {msg}", self.code())
+            }
+            Self::BackpressureFail(msg) => {
+                write!(f, "[{}] Backpressure fail: {msg}", self.code())
+            }
+            Self::GraphBufferBudgetExceeded {
+                node, port, batches, bytes, max_batches, max_bytes,
+            } => write!(
+                f,
+                "[{}] Graph input budget exceeded at '{node}' port {port}: projected={batches} batches/{bytes} bytes, limits={max_batches} batches/{max_bytes:?} bytes; reduce batch size or increase graph input limits; terminal fault resolution is required before restarting",
+                self.code()
+            ),
+            Self::ShuffleNotReady(msg) => {
+                write!(f, "[{}] Shuffle target not ready: {msg}", self.code())
+            }
+            Self::ShuffleTerminal(msg) => {
+                write!(f, "[{}] Terminal shuffle routing error: {msg}", self.code())
+            }
+            Self::ShufflePartialSend(msg) => {
+                write!(f, "[{}] Shuffle partial send: {msg}", self.code())
+            }
+            Self::StatefulOperatorPartialApply(msg) => {
+                write!(
+                    f,
+                    "[{}] Stateful operator partial apply: {msg}",
+                    self.code()
+                )
+            }
+            Self::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "[{}] Managed state budget exceeded during {context}: accounted={accounted_bytes} bytes, limit={limit_bytes} bytes",
+                self.code()
+            ),
+            Self::MaterializedViewQuotaExceeded { view, rows, bytes, max_rows, max_bytes } => write!(
+                f, "[{}] Materialized-view '{view}' quota exceeded: projected={rows} rows/{bytes} bytes, limits={max_rows} rows/{max_bytes} bytes", self.code()
+            ),
+            Self::ReferenceTableQuotaExceeded { table, rows, bytes, max_rows, max_bytes } => write!(
+                f, "[{}] Reference-table '{table}' quota exceeded: projected={rows} rows/{bytes} bytes, limits={max_rows} rows/{max_bytes} bytes", self.code()
+            ),
+            _ => unreachable!("execution formatting is dispatched only for execution errors"),
+        }
+    }
+}

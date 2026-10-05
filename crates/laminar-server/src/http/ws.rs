@@ -464,10 +464,7 @@ pub(super) async fn ws_upgrade(
             return error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
                 .into_response();
         }
-        Err(
-            error @ (laminar_db::DbError::SubscriptionReplayPruned { .. }
-            | laminar_db::DbError::SubscriptionSequencePruned { .. }),
-        ) => {
+        Err(error @ laminar_db::DbError::SubscriptionReplayPruned { .. }) => {
             return error_response(StatusCode::GONE, error.to_string()).into_response();
         }
         Err(error @ laminar_db::DbError::SubscriptionEpochNotCommitted { .. }) => {

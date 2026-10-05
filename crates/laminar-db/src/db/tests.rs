@@ -729,6 +729,7 @@ async fn complete_audited_vnode_revocation(final_owner_exit: bool) {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -1200,6 +1201,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         registry: Arc::clone(&registry),
         sender: Arc::clone(&sender),
         receiver: Arc::clone(&receiver),
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -3738,6 +3740,7 @@ async fn replacement_process_stages_and_publishes_zero_owner_topology() {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity);
@@ -6439,6 +6442,9 @@ struct TestCatalogAuthority {
     lease_tx: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
     lease: laminar_core::cluster::control::LeaderLease,
 }
+
+#[cfg(feature = "cluster")]
+mod topology_planning;
 
 #[cfg(feature = "cluster")]
 async fn test_catalog_authority(
@@ -10844,6 +10850,138 @@ async fn startup_bootstrap_restores_before_config_and_requires_exact_ddl() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
+    use laminar_core::cluster::control::{TopologyCatalogState, TopologyVersion};
+    use object_store::ObjectStore;
+
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = test_catalog_authority(Arc::clone(&objects)).await;
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&authority.controller))
+        .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
+        .catalog_manifest_store(Arc::clone(&authority.manifest_store))
+        .build()
+        .await
+        .unwrap();
+    db.execute_cluster_bootstrap("CREATE SOURCE existing (id INT)")
+        .await
+        .unwrap();
+    let before = db.cluster_topology_status().await.unwrap();
+    let TopologyCatalogState::LegacySealed { manifest } = before.catalog else {
+        panic!("sealed catalog has no implied logical version");
+    };
+    assert_eq!(before.committed_version, None);
+    assert_eq!(before.locally_active_version, None);
+    let deployment = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(objects)
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    authority
+        .manifest_store
+        .adopt_legacy_topology(
+            &authority.lease.proof(),
+            uuid::Uuid::from_u128(42).try_into().unwrap(),
+            &manifest,
+            &deployment,
+        )
+        .await
+        .unwrap();
+    let adopted = db.cluster_topology_status().await.unwrap();
+    assert_eq!(
+        adopted.committed_version,
+        Some(TopologyVersion::LEGACY_BASELINE)
+    );
+    assert_eq!(adopted.locally_active_version, None);
+    db.restore_catalog_from_manifest().await.unwrap();
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+
+    // Control-state fixture: authority/replay alone cannot claim activation. Running and the
+    // actual intake-release gate are both required, and a fault immediately removes it.
+    DbState::Running.store(&db.state);
+    db.set_source_gate(true);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    db.set_source_gate(false);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        Some(TopologyVersion::LEGACY_BASELINE)
+    );
+    // The real capture helper and assignment/source release share the existing authority lock.
+    // A still-current assignment must not reopen a held topology cut or report it active.
+    assert!(
+        crate::pipeline_callback::fence_intake_after_terminal_cut_capture(
+            &db.source_gate,
+            &db.topology_cut_hold,
+            &db.cluster_authority_transition,
+            laminar_core::checkpoint::flags::TOPOLOGY_CUT,
+            false,
+        )
+    );
+    db.set_source_gate(false);
+    assert!(db.source_gate.load(std::sync::atomic::Ordering::Acquire));
+    assert!(db
+        .topology_cut_hold
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    // Reset the control-state fixture; production clears this only at authorized recovery Release.
+    db.topology_cut_hold
+        .store(false, std::sync::atomic::Ordering::Release);
+    db.set_source_gate(false);
+    authority.controller.set_recovering(true);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    authority.controller.set_recovering(false);
+    authority.controller.fence_process_lease();
+    let fenced = db.cluster_topology_status().await.unwrap();
+    assert_eq!(
+        fenced.committed_version,
+        Some(TopologyVersion::LEGACY_BASELINE)
+    );
+    assert_eq!(fenced.locally_active_version, None);
+    DbState::Faulted.store(&db.state);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+
+    let error = db
+        .execute("CREATE SOURCE still_guarded (id INT)")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    assert!(db.catalog.get_source("still_guarded").is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn catalog_bootstrap_rechecks_lifecycle_after_acquiring_topology_lock() {
     let db = LaminarDB::open().unwrap();
     let topology_guard = db.topology_ddl_lock.write().await;
@@ -13023,50 +13161,112 @@ async fn open_subscription_as_of_uncommitted_returns_structured_error() {
 }
 
 #[tokio::test]
-async fn open_subscription_after_sequence_pruned_reports_sequence_coordinate() {
-    use crate::subscription::SubscribeStart;
+async fn open_subscription_after_sequence_replays_without_checkpointing() {
+    use crate::subscription::{PortalFrame, SubscribeStart};
 
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE trades (symbol VARCHAR)")
         .await
         .unwrap();
-    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '256b')")
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '4mb')")
         .await
         .unwrap();
     db.start().await.unwrap();
-
-    // Drive the registry directly so the retained prefix is smaller than the
-    // requested sequence. This tests the DB-level pruned diagnostic, not DDL.
-    let reg = &db.subscription_registry;
     let schema = db.source_untyped("trades").unwrap().schema().clone();
-    for _ in 0..3 {
-        let symbols = vec!["AAPL".to_string(); 64];
-        let batch = arrow_array::RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow::array::StringArray::from(symbols))],
+    for symbol in ["AAPL", "MSFT"] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::StringArray::from(vec![symbol]))],
         )
         .unwrap();
-        reg.send_batch("all_trades", batch).unwrap();
+        db.subscription_registry
+            .send_batch("all_trades", batch)
+            .unwrap();
     }
-
-    let err = db
+    let mut portal = db
         .open_subscription("all_trades", None, SubscribeStart::AfterSequence(0))
         .await
-        .unwrap_err();
-
-    assert!(matches!(
-        err,
-        DbError::SubscriptionSequencePruned {
-            ref name,
-            requested_sequence: 0,
-            earliest_retained_sequence,
-        } if name == "all_trades" && earliest_retained_sequence > 0
-    ));
-    assert_eq!(err.code(), laminar_core::error_codes::INVALID_OPERATION);
-    let message = err.to_string();
-    assert!(message.contains("Sequence 0"), "msg: {message}");
-    assert!(
-        !message.contains("Epoch"),
-        "sequence pruning must not be reported as an epoch: {message}"
+        .unwrap();
+    let Some(PortalFrame::Batch {
+        sequence, batch, ..
+    }) = portal.try_next_frame()
+    else {
+        panic!("expected the retained batch after sequence zero");
+    };
+    assert_eq!(sequence, 1);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0),
+        "MSFT"
     );
+    assert!(portal.try_next_frame().is_none());
+    portal.close();
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_subscription_after_sequence_reports_cursor_errors() {
+    use crate::subscription::SubscribeStart;
+
+    for retention in ["1kb", "1b"] {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+            .await
+            .unwrap();
+        db.execute(&format!("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '{retention}')")).await.unwrap();
+        db.start().await.unwrap();
+        let schema = db.source_untyped("trades").unwrap().schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec!["AAPL"]))],
+        )
+        .unwrap();
+        for _ in 0..32 {
+            db.subscription_registry
+                .send_batch("all_trades", batch.clone())
+                .unwrap();
+        }
+        let error = db
+            .open_subscription("all_trades", None, SubscribeStart::AfterSequence(0))
+            .await
+            .unwrap_err();
+        let DbError::SubscriptionSequencePruned {
+            name,
+            requested_sequence,
+            earliest_retained_sequence,
+        } = &error
+        else {
+            panic!("expected a sequence pruning error: {error}");
+        };
+        assert_eq!(name, "all_trades");
+        assert_eq!(*requested_sequence, 0);
+        assert_eq!(error.code(), laminar_core::error_codes::INVALID_OPERATION);
+        if retention == "1kb" {
+            assert!(earliest_retained_sequence.is_some_and(|earliest| earliest > 1));
+            assert!(error.to_string().contains("earliest retained sequence is"));
+        } else {
+            assert_eq!(*earliest_retained_sequence, None);
+            assert!(error.to_string().contains("no replay history is retained"));
+        }
+        for requested in [32, 33, u64::MAX] {
+            let error = db
+                .open_subscription("all_trades", None, SubscribeStart::AfterSequence(requested))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DbError::SubscriptionSequenceNotPublished { ref name, requested_sequence, next_sequence: 32 }
+                    if name == "all_trades" && requested_sequence == requested
+            ));
+            assert_eq!(error.code(), laminar_core::error_codes::INVALID_OPERATION);
+            assert!(error
+                .to_string()
+                .contains("has not been published (next sequence is 32)"));
+        }
+        db.shutdown().await.unwrap();
+    }
 }
