@@ -16,6 +16,8 @@ mod json_encoding;
 mod ops;
 mod router;
 mod state;
+mod topology;
+mod topology_submission;
 mod ws;
 
 pub use router::{bind_listener, build_router, serve_listener};

@@ -87,8 +87,41 @@ pub enum DbError {
         latest_committed: Option<u64>,
     },
 
+    /// Requested sequence resume needs entries that are no longer retained.
+    SubscriptionSequencePruned {
+        /// Subscription object name.
+        name: String,
+        /// Last sequence received by the subscriber.
+        requested_sequence: u64,
+        /// Earliest replayable sequence; `None` when no history is retained.
+        earliest_retained_sequence: Option<u64>,
+    },
+
+    /// Requested subscription sequence has not been published.
+    SubscriptionSequenceNotPublished {
+        /// Subscription object name.
+        name: String,
+        /// Sequence requested by the subscriber.
+        requested_sequence: u64,
+        /// Sequence that the next published entry will receive.
+        next_sequence: u64,
+    },
+
     /// Structured committed cluster-subscription failure.
     Subscription(#[from] crate::subscription::ClusterSubscriptionError),
+
+    /// Typed durable topology authority failure.
+    #[cfg(feature = "cluster")]
+    Topology(#[from] laminar_core::cluster::control::TopologyError),
+
+    /// SQL-generated request identity retained when submission has an uncertain outcome.
+    #[cfg(feature = "cluster")]
+    TopologySubmission {
+        /// UUID to use for definitive status reads and retries.
+        operation_id: laminar_core::cluster::control::TopologyOperationId,
+        /// Original typed failure, preserving its registry code and source chain.
+        source: Box<Self>,
+    },
 
     /// SQL parse error (from streaming parser)
     SqlParse(#[from] laminar_sql::parser::ParseError),
@@ -276,8 +309,14 @@ impl DbError {
             | Self::ReferenceTableQuotaExceeded { .. }
             | Self::SubscriptionReplayPruned { .. }
             | Self::SubscriptionEpochNotCommitted { .. }
+            | Self::SubscriptionSequencePruned { .. }
+            | Self::SubscriptionSequenceNotPublished { .. }
             | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
             Self::Subscription(error) => error.code(),
+            #[cfg(feature = "cluster")]
+            Self::Topology(error) => error.code(),
+            #[cfg(feature = "cluster")]
+            Self::TopologySubmission { source, .. } => source.code(),
             Self::Shutdown => error_codes::SHUTDOWN,
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
@@ -390,32 +429,17 @@ impl std::fmt::Display for DbError {
             Self::InvalidOperation(msg) => {
                 write!(f, "[{}] Invalid operation: {msg}", self.code())
             }
-            Self::SubscriptionReplayPruned {
-                name,
-                requested,
-                earliest_retained,
-            } => write!(
-                f,
-                "[{}] Epoch {requested} for stream '{name}' is no longer retained (earliest retained is {earliest_retained})",
-                self.code()
-            ),
-            Self::SubscriptionEpochNotCommitted {
-                name,
-                requested,
-                latest_committed,
-            } => match latest_committed {
-                Some(latest) => write!(
-                    f,
-                    "[{}] Epoch {requested} for stream '{name}' is not committed (latest committed is {latest})",
-                    self.code()
-                ),
-                None => write!(
-                    f,
-                    "[{}] Epoch {requested} for stream '{name}' is not committed (no committed epoch is available)",
-                    self.code()
-                ),
-            },
+            Self::SubscriptionReplayPruned { .. }
+            | Self::SubscriptionEpochNotCommitted { .. }
+            | Self::SubscriptionSequencePruned { .. }
+            | Self::SubscriptionSequenceNotPublished { .. } => self.fmt_subscription_start_error(f),
             Self::Subscription(error) => write!(f, "[{}] {error}", self.code()),
+            #[cfg(feature = "cluster")]
+            Self::Topology(error) => write!(f, "{error}"),
+            #[cfg(feature = "cluster")]
+            Self::TopologySubmission { operation_id, source } => write!(f,
+                "{source}; topology operation {} may be admitted; query status and retry the same identity",
+                operation_id.get()),
             Self::SqlParse(e) => write!(f, "SQL parse error: {e}"),
             Self::Shutdown => write!(f, "[{}] Database is shut down", self.code()),
             Self::Checkpoint(msg) => {
@@ -465,6 +489,62 @@ impl std::fmt::Display for DbError {
 }
 
 impl DbError {
+    fn fmt_subscription_start_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubscriptionReplayPruned {
+                name,
+                requested,
+                earliest_retained,
+            } => write!(
+                f,
+                "[{}] Epoch {requested} for stream '{name}' is no longer retained (earliest retained is {earliest_retained})",
+                self.code()
+            ),
+            Self::SubscriptionEpochNotCommitted {
+                name,
+                requested,
+                latest_committed,
+            } => match latest_committed {
+                Some(latest) => write!(
+                    f,
+                    "[{}] Epoch {requested} for stream '{name}' is not committed (latest committed is {latest})",
+                    self.code()
+                ),
+                None => write!(
+                    f,
+                    "[{}] Epoch {requested} for stream '{name}' is not committed (no committed epoch is available)",
+                    self.code()
+                ),
+            },
+            Self::SubscriptionSequencePruned {
+                name,
+                requested_sequence,
+                earliest_retained_sequence,
+            } => match earliest_retained_sequence {
+                Some(earliest) => write!(
+                    f,
+                    "[{}] Sequence {requested_sequence} for stream '{name}' is no longer retained (earliest retained sequence is {earliest})",
+                    self.code()
+                ),
+                None => write!(
+                    f,
+                    "[{}] Sequence {requested_sequence} for stream '{name}' is no longer retained (no replay history is retained)",
+                    self.code()
+                ),
+            },
+            Self::SubscriptionSequenceNotPublished {
+                name,
+                requested_sequence,
+                next_sequence,
+            } => write!(
+                f,
+                "[{}] Sequence {requested_sequence} for stream '{name}' has not been published (next sequence is {next_sequence})",
+                self.code()
+            ),
+            _ => unreachable!("subscription-start formatting is dispatched only for start errors"),
+        }
+    }
+
     fn fmt_execution_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pipeline(msg) => {

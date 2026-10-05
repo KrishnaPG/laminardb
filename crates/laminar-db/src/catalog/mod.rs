@@ -273,6 +273,10 @@ pub struct SourceCatalog {
     default_buffer_size: usize,
     default_backpressure: BackpressureStrategy,
     push_source_max_bytes: usize,
+    // Only the unstarted private topology planner uses schema-only queues. This flag is checked
+    // during catalog registration, never during record intake, push, poll, or subscription.
+    #[cfg(feature = "cluster")]
+    topology_planning: bool,
 }
 
 impl SourceCatalog {
@@ -290,6 +294,8 @@ impl SourceCatalog {
             default_buffer_size: buffer_size,
             default_backpressure: backpressure,
             push_source_max_bytes: streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES,
+            #[cfg(feature = "cluster")]
+            topology_planning: false,
         }
     }
 
@@ -297,6 +303,14 @@ impl SourceCatalog {
         Self {
             push_source_max_bytes: config.push_source_max_bytes,
             ..Self::new(config.default_buffer_size, config.default_backpressure)
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn for_topology_planning(config: &crate::LaminarConfig) -> Self {
+        Self {
+            topology_planning: true,
+            ..Self::from_config(config)
         }
     }
 
@@ -337,6 +351,8 @@ impl SourceCatalog {
         }
 
         let buf_size = buffer_size.unwrap_or(self.default_buffer_size);
+        #[cfg(feature = "cluster")]
+        let buf_size = if self.topology_planning { 1 } else { buf_size };
         let bp = backpressure.unwrap_or(self.default_backpressure);
 
         // Channel buffer is at least 1024 to avoid blocking on small snapshot rings.
@@ -352,6 +368,13 @@ impl SourceCatalog {
             max_queued_bytes: self.push_source_max_bytes,
         };
 
+        #[cfg(feature = "cluster")]
+        let (source, sink) = if self.topology_planning {
+            streaming::create_for_schema_planning::<ArrowRecord>(config)
+        } else {
+            streaming::create_with_config::<ArrowRecord>(config)
+        };
+        #[cfg(not(feature = "cluster"))]
         let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
 
         let ordinal = self.next_source_instance.fetch_add(1, Ordering::Relaxed);
