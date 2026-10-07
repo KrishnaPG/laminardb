@@ -234,9 +234,23 @@ impl SourceEntry {
         &self.source_instance
     }
 
-    /// Current committed native admission ordinal.
-    pub(crate) fn committed_input_offset(&self) -> OrderedInputOffset {
-        self.admitted_input_offset.current()
+    /// Snapshot the managed admission cut atomically with admission.
+    ///
+    /// Returns `None` unless this is a declared managed push source. Otherwise it holds the
+    /// admission lock, so the read is synchronized with [`Self::admit_arrow`]: no batch can be
+    /// half-admitted when the cut is taken, and every batch admitted afterwards reserves a
+    /// strictly greater ordinal. The catalog bridge calls this when it establishes its
+    /// checkpoint barrier, so batches admitted after the barrier stay outside the committed
+    /// checkpoint cut.
+    pub(crate) fn managed_admission_cut(&self) -> Option<(SourceInstance, OrderedInputOffset)> {
+        if !self.is_managed_push() {
+            return None;
+        }
+        let _admission = self.buffer.lock();
+        Some((
+            self.source_instance.clone(),
+            self.admitted_input_offset.current(),
+        ))
     }
 }
 
