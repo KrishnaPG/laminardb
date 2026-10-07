@@ -166,6 +166,13 @@ impl SourceEntry {
     ///
     /// The ordinal is reserved only after the native channel accepted the batch,
     /// so a rejected or backpressured enqueue produces no offset and no receipt.
+    ///
+    /// The managed-push flag is *not* set here. This shared admission path also backs
+    /// ordinary `push_and_buffer` (`INSERT INTO`) and the compatibility
+    /// [`crate::UntypedSourceHandle::push_arrow`], which must stay unmanaged so
+    /// connector sources keep byte-identical checkpoint metadata. Only
+    /// [`crate::UntypedSourceHandle::push_arrow_receipted`] and
+    /// [`Self::declare_managed_push`] opt a source in.
     pub(crate) fn admit_arrow(
         &self,
         batch: RecordBatch,
@@ -179,14 +186,16 @@ impl SourceEntry {
         )?;
         // Serialize admission and history publication so concurrent producers cannot leave
         // accepted batches waiting outside either owner or publish snapshots out of order.
+        // Reserve the ordinal while the buffer lock is still held, immediately after the
+        // native channel accepted the batch, so ordinal assignment matches enqueue order
+        // even when two producers interleave.
         let mut buffer = self.buffer.lock();
         self.source.push_arrow(batch.clone())?;
+        let offset = self.admitted_input_offset.next_offset();
         buffer.push(batch);
         drop(buffer);
         self.data_notify.notify_one();
-        self.managed_push
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(self.admitted_input_offset.next_offset())
+        Ok(offset)
     }
 
     /// Declare this source as a managed push source owned by a context layer.

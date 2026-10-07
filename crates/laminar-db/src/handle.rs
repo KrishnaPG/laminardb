@@ -494,8 +494,9 @@ impl UntypedSourceHandle {
 
     /// Push a raw `RecordBatch` (sent to pipeline and buffered for snapshots).
     ///
-    /// Compatibility delegate: it discards the native admission receipt. Use
-    /// [`Self::push_arrow_receipted`] when the admission coordinate is required.
+    /// Compatibility path: it keeps the source unmanaged and returns no admission
+    /// receipt. Use [`Self::push_arrow_receipted`] when the native admission
+    /// coordinate is required.
     ///
     /// # Errors
     /// Returns `StreamingError` on invalid data, a closed queue, count/byte saturation,
@@ -504,7 +505,7 @@ impl UntypedSourceHandle {
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
-        self.push_arrow_receipted(batch).map(|_| ())
+        self.entry.push_and_buffer(batch)
     }
 
     /// Push a raw `RecordBatch` and return its native admission receipt.
@@ -522,6 +523,10 @@ impl UntypedSourceHandle {
         laminar_core::streaming::StreamingError,
     > {
         let offset = self.entry.admit_arrow(batch)?;
+        // A successful receipted push opts the source into managed metadata capture. This is
+        // the only implicit declaration point; ordinary `push_and_buffer`/`push_arrow` stay
+        // unmanaged.
+        self.entry.declare_managed_push();
         Ok(
             crate::source_admission::SourceAdmissionReceipt::from_native_admission(
                 self.entry.source_instance().clone(),

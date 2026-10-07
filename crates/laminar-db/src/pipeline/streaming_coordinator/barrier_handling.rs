@@ -42,7 +42,29 @@ impl StreamingCoordinator {
             source_name,
             barrier_checkpoint.input_channels_arc().cloned(),
         )?;
-        self.capture_replayable_barrier_cursor(source_idx, barrier_checkpoint);
+        // Capture a managed push source's native admission cut as part of the barrier's
+        // source cut, so the emitted checkpoint reports only batches admitted before the
+        // barrier. Persist it even for an ephemeral bridge: recovery still selects replay
+        // cursors by `supports_replay()`, so this metadata is not a replay cursor.
+        let managed_cut = callback.managed_source_cut(source_name);
+        let managed = managed_cut.is_some();
+        let mut stamped_checkpoint;
+        let barrier_checkpoint = if let Some((source_instance, ordered_input_offset)) = managed_cut
+        {
+            stamped_checkpoint = barrier_checkpoint.clone();
+            stamped_checkpoint.set_metadata(
+                crate::source_admission::SOURCE_INSTANCE_METADATA_KEY,
+                source_instance,
+            );
+            stamped_checkpoint.set_metadata(
+                crate::source_admission::ORDERED_INPUT_OFFSET_METADATA_KEY,
+                ordered_input_offset.to_string(),
+            );
+            &stamped_checkpoint
+        } else {
+            barrier_checkpoint
+        };
+        self.capture_barrier_cursor(source_idx, barrier_checkpoint, managed);
 
         self.pending_barrier.sources_aligned.insert(source_idx);
 

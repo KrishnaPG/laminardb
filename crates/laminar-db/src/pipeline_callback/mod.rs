@@ -6091,6 +6091,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         Ok(())
     }
 
+    fn managed_source_cut(&self, source_name: &str) -> Option<(String, u64)> {
+        let entry = self.source_entries_for_wm.get(source_name)?;
+        if !entry.is_managed_push() {
+            return None;
+        }
+        Some((
+            entry.source_instance().as_str().to_string(),
+            entry.committed_input_offset().value(),
+        ))
+    }
+
     fn filter_late_rows(
         &self,
         source_name: &str,
@@ -6824,27 +6835,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 });
         // Capture-time authority is bound only after the final assignment proof is consumed.
         handoff.bind_request(&mut request, reassignment_portable, assignment_fence);
-        // Bind the managed source's native instance and admitted input coordinate
-        // into the exact cut about to become the committed checkpoint. This reads
-        // the native admission ordinal, never an output-row/queue/epoch/wall-clock
-        // substitute. Non-managed sources keep their connector checkpoint as-is.
-        let mut source_checkpoints = source_checkpoints;
-        for (source_name, checkpoint) in &mut source_checkpoints {
-            if let Some(entry) = self
-                .source_entries_for_wm
-                .get(source_name)
-                .filter(|entry| entry.is_managed_push())
-            {
-                checkpoint.set_metadata(
-                    crate::source_admission::SOURCE_INSTANCE_METADATA_KEY,
-                    entry.source_instance().as_str(),
-                );
-                checkpoint.set_metadata(
-                    crate::source_admission::ORDERED_INPUT_OFFSET_METADATA_KEY,
-                    entry.committed_input_offset().value().to_string(),
-                );
-            }
-        }
+        // Managed-source admission metadata is bound into the exact cut that becomes the
+        // committed checkpoint by the coordinator at the barrier's source cut (see
+        // `managed_source_cut`), never read back from live admission state here. A managed
+        // source's cut therefore travels with its checkpoint and already reports only the
+        // batches admitted before the barrier. Non-managed sources keep their connector
+        // checkpoint byte-identical.
         let mut tail = LeaderTail {
             in_flight,
             coordinator: Arc::clone(&self.coordinator),

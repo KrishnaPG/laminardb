@@ -597,6 +597,19 @@ pub trait PipelineCallback: Send + 'static {
         input_channels: Option<Arc<[Vec<u8>]>>,
     ) -> Result<(), CycleError>;
 
+    /// Capture a managed push source's admission cut for the barrier being handled.
+    ///
+    /// Returns the native `(source_instance, ordered_input_offset)` pair to bind into the
+    /// barrier's source checkpoint for a declared managed push source, or `None` for an
+    /// ordinary source. The pair is captured here, at the barrier's source cut, so the
+    /// committed checkpoint reports only batches admitted before the barrier; it must never
+    /// be read back from live admission state at manifest-assembly time. The offset is the
+    /// native admission ordinal, not an output-row, queue, epoch, or wall-clock substitute.
+    fn managed_source_cut(&self, source_name: &str) -> Option<(String, u64)> {
+        let _ = source_name;
+        None
+    }
+
     /// Filter late rows while preserving any validated hidden source metadata.
     ///
     /// # Errors
