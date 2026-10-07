@@ -116,8 +116,34 @@ pub enum SourceRowPositionCapability {
     /// Every emitted row carries a replay position. Within one source run, `(order_key,
     /// sub_offset)` is nondecreasing per partition across batches; recovery may restart from an
     /// earlier position. Replaying an equal position must produce the same logical row and
-    /// mutation.
+    /// mutation. This does not define the merge order of independent partitions.
     OrderedDeterministic,
+}
+
+/// Row order and batch boundaries reproduced when resuming a source cursor.
+///
+/// This is separate from row positions and delivery guarantees. The runtime must enforce
+/// the declared batch boundaries before relying on them for input/timer replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceReplayOrder {
+    /// The source does not promise a replay order.
+    #[default]
+    Unspecified,
+    /// One physical input channel reproduces the same ordered suffix from a committed cursor,
+    /// including the order of different keys. Poll size and timing must not reorder rows, and
+    /// recovery must retain the channel identity. Independent-channel merging is excluded;
+    /// this raw row-order promise does not reproduce watermark cuts.
+    SingleChannel,
+    /// One global physical channel, with the same ordered rows in the same nonempty batches
+    /// after a committed cursor. Poll limits and timing must not change batch membership.
+    /// The channel may move between nodes under splittable placement; independent channels
+    /// are excluded. Deterministic row positions and bounded atomic batches are required.
+    ///
+    /// Process-function execution treats each batch as one input/watermark cut. The engine
+    /// derives event-time progress from that batch and excludes external and wall-clock
+    /// advancement. Transport batching may change within a cut without changing its end.
+    SingleChannelFixedBatches,
 }
 
 /// Complete source admission contract for a concrete connector configuration.
@@ -131,6 +157,8 @@ pub struct SourceContract {
     pub input_mode: SourceInputMode,
     /// Deterministic per-row position support.
     pub row_positions: SourceRowPositionCapability,
+    /// Order reproduced from a persisted cursor; unspecified unless explicitly declared.
+    pub replay_order: SourceReplayOrder,
     exact_delivery_certified: bool,
 }
 
@@ -148,6 +176,7 @@ impl SourceContract {
             topology,
             input_mode,
             row_positions: SourceRowPositionCapability::Unavailable,
+            replay_order: SourceReplayOrder::Unspecified,
             exact_delivery_certified: false,
         }
     }
@@ -157,6 +186,34 @@ impl SourceContract {
     pub const fn with_row_positions(mut self, capability: SourceRowPositionCapability) -> Self {
         self.row_positions = capability;
         self
+    }
+
+    /// Declare the row order reproduced from a committed cursor. Connector implementations
+    /// must uphold this for the exact configuration, independently of poll size and timing.
+    #[must_use]
+    pub const fn with_replay_order(mut self, order: SourceReplayOrder) -> Self {
+        self.replay_order = order;
+        self
+    }
+
+    /// Whether the declared source shape supports replay at fixed batch boundaries.
+    /// The runtime must also enforce one physical channel and reproduce its watermark cuts.
+    #[must_use]
+    pub const fn supports_fixed_batch_replay(self) -> bool {
+        self.supports_replay()
+            && matches!(
+                self.topology,
+                SourceTopology::Singleton | SourceTopology::Splittable
+            )
+            && matches!(self.input_mode, SourceInputMode::AppendOnly)
+            && matches!(
+                self.row_positions,
+                SourceRowPositionCapability::OrderedDeterministic
+            )
+            && matches!(
+                self.replay_order,
+                SourceReplayOrder::SingleChannelFixedBatches
+            )
     }
 
     /// Mark a built-in connector whose exact-delivery suite is an engine release gate.

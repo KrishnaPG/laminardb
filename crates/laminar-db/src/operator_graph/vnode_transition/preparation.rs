@@ -369,14 +369,25 @@ impl OperatorGraph {
         Ok(())
     }
 
-    fn canonical_managed_operator_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| !node.removed && node.capability.managed_state.is_some())
-            .map(|(node_idx, _)| node_idx)
-            .collect();
+    fn transition_operator_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for (node_idx, node) in self.nodes.iter().enumerate() {
+            if node.removed {
+                continue;
+            }
+            match node.capability.managed_state {
+                None => {}
+                Some(
+                    ManagedStateContract::SqlAggregateV1
+                    | ManagedStateContract::CoreWindowV1
+                    | ManagedStateContract::BoundedIntervalJoinV3
+                    | ManagedStateContract::TemporalJoinV1
+                    | ManagedStateContract::ProcessFunctionV1,
+                ) => indices.push(node_idx),
+                #[cfg(test)]
+                Some(ManagedStateContract::TestVnodeStateV1) => indices.push(node_idx),
+            }
+        }
         indices.sort_unstable_by(|left, right| {
             self.nodes[*left]
                 .name
@@ -393,7 +404,7 @@ impl OperatorGraph {
     ) -> Result<(usize, Vec<usize>, Vec<ProjectedTransitionFrames<'a>>), DbError> {
         let payload_bytes = self.transition_payload_bytes(state_frames)?;
         self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
-        let mut node_indices = self.canonical_managed_operator_indices();
+        let mut node_indices = self.transition_operator_indices();
         node_indices.retain(|&index| !empty_at_cut.contains(&self.nodes[index].name.as_ref()));
         let projected = self.project_transition_frames(&node_indices, state_frames)?;
         Ok((payload_bytes, node_indices, projected))
@@ -418,13 +429,9 @@ impl OperatorGraph {
                 .capability
                 .managed_state
                 .expect("managed operator inventory was filtered above");
-            match contract {
-                ManagedStateContract::SqlAggregateV1
-                | ManagedStateContract::CoreWindowV1
-                | ManagedStateContract::BoundedIntervalJoinV3
-                | ManagedStateContract::TemporalJoinV1 => {}
-                #[cfg(test)]
-                ManagedStateContract::TestVnodeStateV1 => continue,
+            #[cfg(test)]
+            if contract == ManagedStateContract::TestVnodeStateV1 {
+                continue;
             }
             let relevant_revoked = match self.relevant_revoked_vnodes(node_idx, revoked) {
                 Ok(relevant) => relevant,
@@ -473,6 +480,7 @@ impl OperatorGraph {
                         | ManagedStateContract::BoundedIntervalJoinV3
                         | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
+                        | ManagedStateContract::ProcessFunctionV1
                 );
             if !relevant {
                 continue;

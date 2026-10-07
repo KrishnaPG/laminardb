@@ -146,6 +146,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
+sha2 = { workspace = true }
 tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"
 rcgen = "0.13"
@@ -154,6 +155,7 @@ serde_json = { workspace = true }
 [features]
 # Cross-platform defaults.
 default = [
+    "process-remote",
     "jemalloc",
     "mimalloc",
     "kafka",
@@ -172,6 +174,7 @@ default = [
     "gcs",
     "azure",
 ]
+process-remote = ["laminar-db/process-remote"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 # Connector features (forwarded to laminar-db → laminar-connectors)

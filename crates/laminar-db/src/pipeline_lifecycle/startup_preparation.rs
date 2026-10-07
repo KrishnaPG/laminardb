@@ -46,7 +46,7 @@ impl LaminarDB {
             }
         }
 
-        let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
+        let (source_regs, sink_regs, stream_regs, table_regs, has_external, process_regs) = {
             let mgr = self.connector_manager.lock();
             (
                 mgr.sources().clone(),
@@ -54,6 +54,10 @@ impl LaminarDB {
                 mgr.streams().clone(),
                 mgr.tables().clone(),
                 mgr.has_external_connectors(),
+                mgr.process_functions()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
         };
 
@@ -68,6 +72,7 @@ impl LaminarDB {
         }
 
         let startup_runtime = self.runtime_mode();
+        self.validate_process_source_orders(&process_regs, &source_regs)?;
 
         let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
             &source_regs,
@@ -115,7 +120,8 @@ impl LaminarDB {
                     sink_regs.values(),
                     stream_regs.values(),
                     table_regs.values(),
-                ),
+                )
+                .with_process_functions(process_regs.iter()),
                 startup_runtime,
                 injected_cluster_checkpoint_store,
                 {
@@ -143,7 +149,7 @@ impl LaminarDB {
             .await?;
         }
 
-        let install_runtime = has_external || !stream_regs.is_empty();
+        let install_runtime = has_external || !stream_regs.is_empty() || !process_regs.is_empty();
         #[cfg(feature = "cluster")]
         let install_runtime = install_runtime || topology.is_some();
         if install_runtime {

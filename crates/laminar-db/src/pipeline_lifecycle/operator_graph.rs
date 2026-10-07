@@ -1,3 +1,5 @@
+use laminar_connectors::connector::SourceConnector as _;
+
 use super::{
     admit_source_contract, admit_source_recovery_contract, admit_temporal_source_contract,
     exact_table_reference, schema_has_reserved_mutation_columns, Arc,
@@ -189,6 +191,28 @@ impl LaminarDB {
         // Seed changelog producers up front so consumer admission is independent of build order.
         graph.set_changelog_tables(changelog_carrying.clone());
 
+        self.install_registered_operators(&mut graph, stream_regs)?;
+
+        Ok(graph)
+    }
+
+    fn install_registered_operators(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    ) -> Result<(), DbError> {
+        let mut registrations = self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        registrations.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
+        for registration in &registrations {
+            graph.add_process_function(registration)?;
+        }
+
         let mut ordered_streams: Vec<_> = stream_regs.values().collect();
         ordered_streams.sort_by(|left, right| left.name.cmp(&right.name));
         for reg in ordered_streams {
@@ -204,7 +228,7 @@ impl LaminarDB {
         }
         graph.take_build_errors()?;
 
-        Ok(graph)
+        Ok(())
     }
 
     fn install_operator_graph_catalog_context(
@@ -241,7 +265,6 @@ impl LaminarDB {
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Vec<TrackedSourceRegistration>, DbError> {
         use crate::pipeline::SourceRegistration;
-        use laminar_connectors::connector::SourceConnector as _;
         let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
         for (name, reg) in source_regs {
             if reg.connector_type.is_none() {
@@ -280,6 +303,7 @@ impl LaminarDB {
                     source.with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
             }
             let contract = source.contract();
+            self.validate_instantiated_process_source_order(name, contract)?;
             let has_primary_key = source_entry
                 .as_ref()
                 .is_some_and(|entry| !entry.primary_key.is_empty());

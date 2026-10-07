@@ -428,6 +428,7 @@ fn test_state_with_db_and_gate(
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            process_functions: vec![],
             discovery: None,
             node_id: None,
             sql: None,
@@ -520,6 +521,7 @@ fn test_state_with_auth_and_gate(
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            process_functions: vec![],
             discovery: None,
             node_id: None,
             sql: None,
@@ -853,6 +855,7 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
     ];
     for (method, path) in [
         ("GET", "/api/v1/sources"),
+        ("GET", "/api/v1/process-functions"),
         ("GET", "/api/v1/graph"),
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
@@ -878,6 +881,22 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
             );
         }
     }
+}
+
+#[tokio::test]
+async fn process_function_catalog_is_behind_console_auth() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    let request = Request::builder()
+        .uri("/api/v1/process-functions")
+        .header("authorization", "Bearer supersecret-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"[]");
 }
 
 #[tokio::test]

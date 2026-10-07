@@ -37,6 +37,7 @@ use laminar_sql::translator::{
 
 mod catalog_context;
 mod input_admission;
+mod process;
 mod state_restore;
 
 use input_admission::retained_input_bytes;
@@ -465,6 +466,28 @@ pub(crate) trait GraphOperator: Send {
     /// Whether a successful empty-input step may advance this operator's output frontier.
     fn advances_frontier_without_input(&self) -> bool {
         false
+    }
+
+    /// Bind fresh or restored process state to the verified startup assignment and local roster.
+    /// The graph calls this before compute launch and drops the entire image on failure.
+    #[cfg(feature = "cluster")]
+    fn bind_startup_assignment(
+        &mut self,
+        _assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        _owned_vnodes: &[u32],
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Bind process execution to the same lease and transport as its startup state image.
+    /// This grants no cluster admission or source intake authority.
+    #[cfg(feature = "cluster")]
+    fn bind_process_execution_authority(
+        &mut self,
+        _config: &crate::operator::sql_query::ClusterShuffleConfig,
+        _deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    ) -> Result<(), DbError> {
+        Ok(())
     }
 
     /// Bind a privately restored operator's future transport to the exact target generation.
@@ -1071,6 +1094,8 @@ pub(crate) struct OperatorGraph {
     ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
     // Must be the main multi-threaded runtime; Ring-1 workers (AI, lookup-enrich) spawn here.
     main_runtime_handle: Option<tokio::runtime::Handle>,
+    #[cfg(feature = "process-remote")]
+    process_work_wake: Option<Arc<tokio::sync::Notify>>,
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
     // Changelog-producing intermediates used for consumer admission and changelog enrichment.
@@ -1180,6 +1205,8 @@ impl OperatorGraph {
             live_handles: FxHashMap::default(),
             ai_runtime: None,
             main_runtime_handle: None,
+            #[cfg(feature = "process-remote")]
+            process_work_wake: None,
             partial_lookup_tables: FxHashMap::default(),
             changelog_tables: FxHashSet::default(),
             reference_tables: FxHashSet::default(),
@@ -1345,7 +1372,9 @@ impl OperatorGraph {
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .any(|(node_id, node)| {
-                !node.operator.wants_input() || self.node_has_buffered_input(node_id)
+                node.operator.deferred_work_is_runnable()
+                    || !node.operator.wants_input()
+                    || self.node_has_buffered_input(node_id)
             })
     }
 

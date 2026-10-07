@@ -69,6 +69,13 @@ impl LaminarDB {
             )
             .into());
         }
+        if !self.connector_manager.lock().process_functions().is_empty() {
+            return Err(TopologyError::Unsupported(
+                "process bindings are immutable; catalog changes require a new checkpoint namespace"
+                    .into(),
+            )
+            .into());
+        }
         let _compiler = self
             .topology_validation_lock
             .try_lock()
@@ -597,6 +604,7 @@ const fn state_contract_name(contract: ManagedStateContract) -> &'static str {
         ManagedStateContract::CoreWindowV1 => "core_window_v1",
         ManagedStateContract::BoundedIntervalJoinV3 => "bounded_interval_join_v3",
         ManagedStateContract::TemporalJoinV1 => "temporal_join_v1",
+        ManagedStateContract::ProcessFunctionV1 => "process_function_v1",
         #[cfg(test)]
         ManagedStateContract::TestVnodeStateV1 => "test_vnode_state_v1",
     }
