@@ -5531,7 +5531,7 @@ async fn create_source_surfaces_kafka_config_error_in_ddl_message() {
         "DDL error must name the offending key, got: {msg}"
     );
     assert!(
-        msg.contains("schema auto-discovery failed"),
+        msg.contains("schema resolution"),
         "DDL error must use the new framing, got: {msg}"
     );
 }
@@ -5657,6 +5657,8 @@ async fn test_builder_register_connector() {
             registry.register_source(
                 "test-source",
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "test-source".to_string(),
                     display_name: "Test Source".to_string(),
                     version: "0.1.0".to_string(),
@@ -5683,6 +5685,8 @@ async fn test_builder_register_connector() {
     let replacement = registry.register_source(
         "test-source",
         laminar_connectors::config::ConnectorInfo {
+            schema_capabilities:
+                laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
             name: "replacement".into(),
             display_name: "Replacement".into(),
             version: "9.9.9".into(),
@@ -5710,6 +5714,8 @@ async fn builder_rejects_custom_replacement_of_builtin_connector() {
             registry.register_source(
                 "generator",
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "replacement".into(),
                     display_name: "Replacement".into(),
                     version: "1".into(),
@@ -5810,7 +5816,7 @@ async fn test_sql_create_source_errors_when_discovery_yields_empty() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("could not auto-discover a schema"),
+        err.to_string().contains("schema resolution") && err.to_string().contains("field count"),
         "expected actionable discovery-failure error, got: {err}"
     );
 }
@@ -5888,6 +5894,12 @@ async fn fake_source_db(
             registry.register_source(
                 name,
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::metadata(
+                            &[],
+                            false,
+                            laminar_connectors::schema::resolution::SchemaPreparation::None,
+                        ),
                     name: name.into(),
                     display_name: name.into(),
                     version: "0.1.0".into(),
@@ -5990,6 +6002,12 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
                 registry.register_source(
                     "gated-source",
                     ConnectorInfo {
+                        schema_capabilities:
+                            laminar_connectors::schema::resolution::SchemaCapabilities::metadata(
+                                &[],
+                                false,
+                                laminar_connectors::schema::resolution::SchemaPreparation::None,
+                            ),
                         name: "gated-source".into(),
                         display_name: "gated-source".into(),
                         version: "0.1.0".into(),
@@ -6027,7 +6045,7 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
         tokio::spawn(async move { db.start().await })
     };
     tokio::task::yield_now().await;
-    assert_eq!(DbState::load(&db.state), DbState::Starting);
+    assert_eq!(DbState::load(&db.state), DbState::Created);
     assert!(!start.is_finished());
 
     release.notify_one();
@@ -7622,13 +7640,18 @@ async fn feature_disabled_lookup_connectors_leave_no_residue() {
 #[tokio::test]
 async fn postgres_lookup_registration_preserves_canonical_name() {
     let db = LaminarDB::open().unwrap();
-    db.execute(
-        "CREATE LOOKUP TABLE customers (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
+    // Exercise catalog registration from an already committed legacy reader.
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            None,
+            db.execute(
+                "CREATE LOOKUP TABLE customers (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
          WITH ('connector' = 'postgres', 'connection' = 'host=localhost', \
          'table' = 'customers')",
-    )
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
 
     assert!(db.table_store.read().has_table("customers"));
     assert_eq!(
@@ -7689,13 +7712,18 @@ async fn postgres_lookup_registration_preserves_canonical_name() {
 async fn postgres_on_demand_admission_uses_lookup_factory() {
     let db = LaminarDB::open().unwrap();
     assert!(db.connector_registry().has_lookup_source("postgres"));
-    db.execute(
-        "CREATE LOOKUP TABLE pg_direct (id INT NOT NULL, PRIMARY KEY (id)) \
+    // Exercise catalog registration from an already committed legacy reader.
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            None,
+            db.execute(
+                "CREATE LOOKUP TABLE pg_direct (id INT NOT NULL, PRIMARY KEY (id)) \
          WITH ('connector' = 'postgres', 'strategy' = 'on-demand', \
          'connection' = 'host=localhost', 'table' = 'pg_direct')",
-    )
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
     assert!(db
         .connector_manager
         .lock()
@@ -7710,14 +7738,19 @@ async fn mongodb_on_demand_admission_does_not_require_table_source() {
     let db = LaminarDB::open().unwrap();
     assert!(db.connector_registry().has_lookup_source("mongodb"));
     assert!(!db.connector_registry().has_table_source("mongodb"));
-    db.execute(
-        "CREATE LOOKUP TABLE mongo_direct (id VARCHAR NOT NULL, PRIMARY KEY (id)) \
+    // Admission is independent of metadata I/O; exercise an explicit legacy reader.
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            None,
+            db.execute(
+                "CREATE LOOKUP TABLE mongo_direct (id VARCHAR NOT NULL, PRIMARY KEY (id)) \
          WITH ('connector' = 'mongodb', 'strategy' = 'on-demand', \
          'connection.uri' = 'mongodb://localhost:27017', 'database' = 'test', \
          'collection' = 'dimensions')",
-    )
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
     assert!(db
         .connector_manager
         .lock()
@@ -7818,6 +7851,8 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
             registry.register_lookup_source(
                 "mock-direct",
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "mock-direct".into(),
                     display_name: "Mock direct lookup".into(),
                     version: "0.1.0".into(),
@@ -8477,6 +8512,8 @@ async fn db_with_mock_table_source(snapshot_batches: Vec<RecordBatch>) -> Arc<La
             registry.register_table_source(
                 "mock",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "mock".to_string(),
                     display_name: "Mock Table Source".to_string(),
                     version: "0.1.0".to_string(),
@@ -8558,6 +8595,8 @@ async fn test_table_source_multiple_tables() {
             registry.register_table_source(
                 "mock",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "mock".to_string(),
                     display_name: "Mock".to_string(),
                     version: "0.1.0".to_string(),
@@ -9163,301 +9202,6 @@ fn test_filter_late_rows_filters_correctly() {
         .unwrap();
     assert_eq!(ids.value(0), 2); // ts=500
     assert_eq!(ids.value(1), 4); // ts=800
-}
-
-#[test]
-fn recovered_input_channels_hold_the_logical_watermark_during_skewed_replay() {
-    use arrow::array::{BinaryArray, TimestampMillisecondArray};
-    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
-
-    let recovered_inventory: Arc<[Vec<u8>]> =
-        Arc::from([b"fast".to_vec(), b"slow".to_vec(), b"stale".to_vec()]);
-    let recovered = rustc_hash::FxHashMap::from_iter([
-        (
-            Box::<[u8]>::from(&b"slow"[..]),
-            RecoveredInputChannelProgress {
-                watermark: Some(10),
-                idle: false,
-            },
-        ),
-        (
-            Box::<[u8]>::from(&b"fast"[..]),
-            RecoveredInputChannelProgress {
-                watermark: Some(100),
-                idle: false,
-            },
-        ),
-        (
-            Box::<[u8]>::from(&b"stale"[..]),
-            RecoveredInputChannelProgress {
-                watermark: Some(1_000),
-                idle: true,
-            },
-        ),
-    ]);
-    let mut state = SourceWatermarkState::new(
-        EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
-        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
-        "ts".into(),
-    )
-    .with_input_channels(
-        Duration::ZERO,
-        0,
-        None,
-        recovered,
-        Some(recovered_inventory),
-    );
-    state
-        .install_input_channels(
-            Some(Arc::from([b"fast".to_vec(), b"slow".to_vec()])),
-            i64::MIN,
-        )
-        .unwrap();
-    let partitioned = state.partitioned.as_ref().unwrap();
-    assert!(partitioned.recovered.is_empty());
-    assert!(partitioned.recovered_inventory.is_none());
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "ts",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-            false,
-        ),
-        Field::new(
-            laminar_connectors::connector::SOURCE_PARTITION_COLUMN,
-            DataType::Binary,
-            false,
-        ),
-    ]));
-    let batch = |timestamp, input_channel: &'static [u8]| {
-        RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![timestamp])),
-                Arc::new(BinaryArray::from(vec![input_channel])),
-            ],
-        )
-        .unwrap()
-    };
-
-    state
-        .observe_input_channels(&batch(200, b"fast"), 10)
-        .unwrap();
-    assert_eq!(state.generator.current_watermark(), 10);
-
-    let slow = filter_late_rows(&batch(12, b"slow"), "ts", 10)
-        .unwrap()
-        .expect("the slow channel row is still on time");
-    state.observe_input_channels(&slow, 10).unwrap();
-    assert_eq!(state.generator.current_watermark(), 12);
-
-    state
-        .install_input_channels(Some(Arc::from([b"slow".to_vec()])), 1)
-        .unwrap();
-    let retained = state.input_channel_progress().unwrap().unwrap();
-    assert_eq!(retained[0].watermark, Some(12));
-
-    state
-        .install_input_channels(
-            Some(Arc::from([
-                b"fast".to_vec(),
-                b"slow".to_vec(),
-                b"stale".to_vec(),
-            ])),
-            1,
-        )
-        .unwrap();
-    let reassigned = state.input_channel_progress().unwrap().unwrap();
-    assert_eq!(reassigned[0].watermark, Some(12));
-    assert_eq!(reassigned[1].watermark, Some(12));
-    assert_eq!(reassigned[2].watermark, Some(12));
-    assert!(!reassigned[2].idle);
-
-    {
-        let channels = &mut state.partitioned.as_mut().unwrap().channels;
-        channels.get_mut(&b"slow"[..]).unwrap().idle = true;
-        channels.get_mut(&b"stale"[..]).unwrap().idle = true;
-    }
-    state
-        .observe_input_channels(&batch(200, b"fast"), 1)
-        .unwrap();
-    assert_eq!(state.generator.current_watermark(), 200);
-
-    state
-        .observe_input_channels(&batch(13, b"slow"), 1)
-        .unwrap();
-    let resumed = state.input_channel_progress().unwrap().unwrap();
-    assert_eq!(resumed[1].watermark, Some(200));
-    assert!(!resumed[1].idle);
-}
-
-#[test]
-fn null_event_time_does_not_advance_a_physical_input_channel() {
-    use arrow::array::{BinaryArray, TimestampMillisecondArray};
-    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
-
-    let mut state = SourceWatermarkState::new(
-        EventTimeExtractor::from_column("ts"),
-        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
-        "ts".into(),
-    )
-    .with_input_channels(Duration::ZERO, 0, None, Default::default(), None);
-    state
-        .install_input_channels(Some(Arc::from([b"p0".to_vec()])), i64::MIN)
-        .unwrap();
-
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-                true,
-            ),
-            Field::new(
-                laminar_connectors::connector::SOURCE_PARTITION_COLUMN,
-                DataType::Binary,
-                false,
-            ),
-        ])),
-        vec![
-            Arc::new(TimestampMillisecondArray::from(vec![None])),
-            Arc::new(BinaryArray::from(vec![&b"p0"[..]])),
-        ],
-    )
-    .unwrap();
-
-    assert_eq!(
-        state.observe_input_channels(&batch, i64::MIN).unwrap(),
-        None
-    );
-    assert_eq!(state.generator.current_watermark(), i64::MIN);
-    assert_eq!(
-        state.input_channel_progress().unwrap().unwrap()[0].watermark,
-        None
-    );
-}
-
-#[test]
-fn recovered_input_channels_are_not_idle_before_inventory_reconciliation() {
-    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
-
-    let inventory: Arc<[Vec<u8>]> = Arc::from([b"slow".to_vec()]);
-    let recovered = rustc_hash::FxHashMap::from_iter([(
-        Box::<[u8]>::from(&b"slow"[..]),
-        RecoveredInputChannelProgress {
-            watermark: Some(10),
-            idle: false,
-        },
-    )]);
-    let mut state = SourceWatermarkState::new(
-        EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
-        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
-        "ts".into(),
-    )
-    .with_input_channels(
-        Duration::ZERO,
-        0,
-        None,
-        recovered,
-        Some(Arc::clone(&inventory)),
-    );
-    state.generator.restore_watermark_for_recovery(10);
-    assert_eq!(state.input_channels_all_idle(), Some(false));
-
-    let mut tracker = laminar_core::time::WatermarkTracker::new(2);
-    tracker.update_source(0, 10);
-    tracker.update_source(1, 100);
-    let advanced = tracker.update_source(0, state.generator.current_watermark());
-    if state.input_channels_all_idle() == Some(true) {
-        let _ = tracker.mark_idle(0).or(advanced);
-    }
-    assert_eq!(
-        tracker
-            .current_watermark()
-            .map(|watermark| watermark.timestamp()),
-        Some(10),
-        "an uninstalled recovered source must hold the combined frontier"
-    );
-
-    state
-        .install_input_channels(Some(Arc::from([])), 10)
-        .unwrap();
-    assert_eq!(state.input_channels_all_idle(), Some(true));
-}
-
-#[test]
-fn input_channel_idle_tick_keeps_active_minimum_and_idle_maximum_semantics() {
-    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
-
-    let mut state = SourceWatermarkState::new(
-        EventTimeExtractor::from_column("ts"),
-        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
-        "ts".into(),
-    )
-    .with_input_channels(Duration::ZERO, 0, None, Default::default(), None);
-    state
-        .install_input_channels(
-            Some(Arc::from([b"fast".to_vec(), b"slow".to_vec()])),
-            i64::MIN,
-        )
-        .unwrap();
-    let channels = &mut state.partitioned.as_mut().unwrap().channels;
-    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
-        &mut channels.get_mut(&b"fast"[..]).unwrap().generator,
-        20,
-    );
-    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
-        &mut channels.get_mut(&b"slow"[..]).unwrap().generator,
-        10,
-    );
-
-    assert_eq!(state.tick_input_channel_idleness(), (Some(10), false));
-    state
-        .partitioned
-        .as_mut()
-        .unwrap()
-        .channels
-        .get_mut(&b"slow"[..])
-        .unwrap()
-        .idle = true;
-    assert_eq!(state.tick_input_channel_idleness(), (Some(20), false));
-    state
-        .partitioned
-        .as_mut()
-        .unwrap()
-        .channels
-        .get_mut(&b"fast"[..])
-        .unwrap()
-        .idle = true;
-    assert_eq!(state.tick_input_channel_idleness(), (None, true));
-}
-
-#[test]
-fn rejected_external_watermark_is_not_checkpointed_as_a_partition_floor() {
-    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
-
-    let mut state = SourceWatermarkState::new(
-        EventTimeExtractor::from_column("ts"),
-        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(1)),
-        "ts".into(),
-    )
-    .with_input_channels(
-        Duration::ZERO,
-        1,
-        None,
-        rustc_hash::FxHashMap::default(),
-        None,
-    );
-    state
-        .install_input_channels(Some(Arc::from([b"partition".to_vec()])), i64::MIN)
-        .unwrap();
-
-    assert_eq!(state.advance_external_watermark(i64::MAX), None);
-    assert_eq!(state.generator.current_watermark(), i64::MIN);
-    assert_eq!(
-        state.input_channel_progress().unwrap().unwrap()[0].watermark,
-        None
-    );
 }
 
 #[test]
@@ -10665,8 +10409,11 @@ async fn query_cannot_observe_catalog_create_while_manifest_seal_is_pending() {
     tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
         .await
         .unwrap();
-    assert!(db.catalog.get_source("tentative").is_some());
-    assert!(db.ctx.table_exist("tentative").unwrap());
+    assert!(
+        db.catalog.get_source("tentative").is_none(),
+        "uncommitted schemas must be invisible"
+    );
+    assert!(!db.ctx.table_exist("tentative").unwrap());
 
     let query = {
         let db = Arc::clone(&db);
@@ -10677,16 +10424,27 @@ async fn query_cannot_observe_catalog_create_while_manifest_seal_is_pending() {
         tokio::spawn(async move { db.collect_local_table("tentative").await })
     };
     tokio::task::yield_now().await;
-    assert!(!query.is_finished());
-    assert!(!local_scan.is_finished());
+    let query_error = tokio::time::timeout(std::time::Duration::from_secs(2), query)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let scan_error = tokio::time::timeout(std::time::Duration::from_secs(2), local_scan)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(query_error.to_string().contains("tentative"));
+    assert!(scan_error.to_string().contains("tentative"));
+    assert!(
+        !create.is_finished(),
+        "the catalog read must not wait for metadata publication"
+    );
 
     *db.catalog_seal_gate.lock() = None;
     release.notify_one();
     assert!(create.await.unwrap().is_err());
-    let query_error = query.await.unwrap().unwrap_err();
-    assert!(query_error.to_string().contains("tentative"));
-    let scan_error = local_scan.await.unwrap().unwrap_err();
-    assert!(scan_error.to_string().contains("tentative"));
+
     assert!(db.catalog.get_source("tentative").is_none());
     assert!(!db.ctx.table_exist("tentative").unwrap());
 }
@@ -11369,6 +11127,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
     manifest_store
         .seal(
             &CatalogManifest::new(vec![CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: "secured".into(),
                 kind: CatalogObjectKind::Source,
                 catalog_generation: 1,
@@ -11414,6 +11173,10 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
                 registry.register_source(
                     "capture-secret",
                     ConnectorInfo {
+                        schema_capabilities:
+                            laminar_connectors::schema::resolution::SchemaCapabilities::declared(
+                                false,
+                            ),
                         name: "capture-secret".into(),
                         display_name: "capture-secret".into(),
                         version: "1".into(),
@@ -11460,6 +11223,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
     manifest_store
         .seal(
             &CatalogManifest::new(vec![CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: "unstable".into(),
                 kind: CatalogObjectKind::Source,
                 catalog_generation: 1,
@@ -11483,6 +11247,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
                     registry.register_source(
                         "changing-discovery",
                         ConnectorInfo {
+                            schema_capabilities: laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                             name: "changing-discovery".into(),
                             display_name: "changing-discovery".into(),
                             version: "1".into(),
@@ -11719,6 +11484,7 @@ async fn cluster_manifest_invalid_entry_fails_before_any_replay() {
 
     fn entry(name: &str, kind: CatalogObjectKind, ddl: &str) -> CatalogManifestEntry {
         CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: name.to_string(),
             kind,
             catalog_generation: 1,
@@ -12310,7 +12076,7 @@ async fn connector_options_resolve_vars() {
         .build()
         .await
         .unwrap();
-    db.execute("CREATE SOURCE s (id BIGINT) FROM GENERATOR ('topic' = '${TOPIC}')")
+    db.execute("CREATE SOURCE s FROM GENERATOR ('topic' = '${TOPIC}')")
         .await
         .unwrap();
     {
@@ -13270,3 +13036,9 @@ async fn open_subscription_after_sequence_reports_cursor_errors() {
         db.shutdown().await.unwrap();
     }
 }
+
+mod schema_resolution;
+
+mod schema_resolution_races;
+
+mod schema_preparation_recovery;

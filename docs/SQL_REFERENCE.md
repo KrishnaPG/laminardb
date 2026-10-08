@@ -22,6 +22,11 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 
 ## Sources
 
+Columns can be omitted for metadata-capable or built-in source formats. Creation
+resolves a validated contract, and durable deployments commit it before activation.
+Explicit columns remain authoritative. See [connector schema resolution](SCHEMA_RESOLUTION.md)
+for format policies, query-derived sinks, sampling and recovery/migration behavior.
+
 Create data sources using `CREATE SOURCE`. Event-time columns must be
 declared as `TIMESTAMP`. LaminarDB uses Arrow `Timestamp(_)` internally
 at any precision and rescales to milliseconds via the Arrow cast kernel.
@@ -44,6 +49,12 @@ Arrow side. Connectors that produce their own schemas (OTel, Kafka+Avro,
 CDC) may use a different precision (nanosecond for OTel's
 `_laminar_received_at`, millisecond for CDC's `_ts_ms`); all precisions
 compose correctly with `INTERVAL` arithmetic and window functions.
+
+For a direct source, `INSERT INTO ... VALUES` accepts a signed integer Unix
+epoch microsecond literal for a `TIMESTAMP` column. For example,
+`INSERT INTO events VALUES ('a', 60, 100000)` inserts an event at 0.1 seconds
+after the epoch. String timestamp literals are not accepted by this insertion
+path.
 
 **Rust side:**
 ```rust

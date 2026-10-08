@@ -14,15 +14,18 @@ use super::{
 };
 
 impl LaminarDB {
-    pub(super) async fn launch_pipeline_runtime(
+    async fn prepare_streaming_coordinator(
         &self,
         setup: PipelineRuntimeSetup,
         shutdown: Arc<tokio::sync::Notify>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "cluster")] startup_generation_fence: Option<
-            tokio::sync::OwnedRwLockWriteGuard<()>,
-        >,
-    ) -> Result<(), DbError> {
+    ) -> Result<
+        (
+            crate::pipeline::StreamingCoordinator,
+            crate::pipeline_callback::ConnectorPipelineCallback,
+        ),
+        DbError,
+    > {
         let PipelineRuntimeSetup {
             sources,
             config: pipeline_config,
@@ -34,7 +37,6 @@ impl LaminarDB {
             source_process_authority,
             runtime_mode,
         } = setup;
-        let readiness_timeout = pipeline_config.checkpoint_timeout;
         let (control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
         *self.control_tx.lock() = Some(control_tx);
@@ -46,7 +48,7 @@ impl LaminarDB {
         let coordinator = crate::pipeline::StreamingCoordinator::new_with_tracked_source_registry(
             sources,
             pipeline_config,
-            Arc::clone(&shutdown),
+            shutdown,
             control_rx,
             source_gate,
             #[cfg(feature = "cluster")]
@@ -55,10 +57,31 @@ impl LaminarDB {
             runtime_mode,
         )
         .await?
-        .with_terminal_shutdown(runtime_shutdown.clone())
+        .with_terminal_shutdown(runtime_shutdown)
         .with_force_checkpoint_rx(force_ckpt_rx)
         .with_checkpoint_complete_rx(checkpoint_complete_rx)
         .with_checkpoint_admission(checkpoint_in_flight);
+        if let Some(metrics) = self.engine_metrics() {
+            coordinator.observe_source_queue_metrics(&metrics);
+        }
+        Ok((coordinator, callback))
+    }
+
+    pub(super) async fn launch_pipeline_runtime(
+        &self,
+        setup: PipelineRuntimeSetup,
+        shutdown: Arc<tokio::sync::Notify>,
+        runtime_shutdown: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "cluster")] startup_generation_fence: Option<
+            tokio::sync::OwnedRwLockWriteGuard<()>,
+        >,
+    ) -> Result<(), DbError> {
+        let readiness_timeout = setup.config.checkpoint_timeout;
+        #[cfg(feature = "cluster")]
+        let runtime_mode = setup.runtime_mode;
+        let (coordinator, callback) = self
+            .prepare_streaming_coordinator(setup, Arc::clone(&shutdown), runtime_shutdown.clone())
+            .await?;
 
         let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
         let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
@@ -450,6 +473,29 @@ impl LaminarDB {
         result
     }
 
+    fn install_stream_schemas(&self, resolved: &HashMap<String, arrow_schema::SchemaRef>) {
+        let process_schemas = self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .values()
+            .map(|registration| {
+                (
+                    registration.output_name.clone(),
+                    Arc::clone(&registration.descriptor.output_schema),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut schemas = self.stream_schemas.write();
+        schemas.clear();
+        schemas.extend(
+            resolved
+                .iter()
+                .map(|(name, schema)| (name.clone(), Arc::clone(schema))),
+        );
+        schemas.extend(process_schemas);
+    }
+
     pub(super) async fn start_connector_pipeline(
         &self,
         source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -463,7 +509,7 @@ impl LaminarDB {
         runtime_shutdown: tokio_util::sync::CancellationToken,
         #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
-        use crate::pipeline::{CheckpointSchedule, PipelineConfig};
+        use crate::pipeline::CheckpointSchedule;
 
         let runtime_mode = self.runtime_mode();
 
@@ -523,15 +569,7 @@ impl LaminarDB {
         )
         .await?;
         let stream_output_schemas = &resolved_stream_outputs.schemas;
-        {
-            let mut schemas = self.stream_schemas.write();
-            schemas.clear();
-            schemas.extend(
-                stream_output_schemas
-                    .iter()
-                    .map(|(name, schema)| (name.clone(), Arc::clone(schema))),
-            );
-        }
+        self.install_stream_schemas(stream_output_schemas);
 
         #[cfg(feature = "cluster")]
         let (restored_graph, topology_metadata) = match topology {
@@ -668,7 +706,7 @@ impl LaminarDB {
             self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
                 .await?;
         }
-        let watermarks = self.prepare_pipeline_watermarks(
+        let mut watermarks = self.prepare_pipeline_watermarks(
             &sources,
             &stream_regs,
             &recovered_channel_progress,
@@ -685,37 +723,13 @@ impl LaminarDB {
             "Starting event-driven connector pipeline"
         );
 
-        let drain_budget_ns = self.config.pipeline_drain_budget_ns.unwrap_or(1_000_000);
-        let query_budget_ns = self.config.pipeline_query_budget_ns.unwrap_or(8_000_000);
-        let pipeline_config = PipelineConfig {
-            max_poll_records: self.config.default_buffer_size.min(1024),
-            channel_capacity: self.config.pipeline_channel_capacity.unwrap_or(64),
-            source_queue_max_bytes: self.config.source_queue_max_bytes,
-            fallback_poll_interval: if has_external {
-                std::time::Duration::from_millis(10)
-            } else {
-                std::time::Duration::from_millis(1)
-            },
+        let pipeline_config = self.prepare_pipeline_configuration(
+            has_external,
             checkpoint_schedule,
-            batch_window: self
-                .config
-                .pipeline_batch_window
-                .unwrap_or(if has_external {
-                    std::time::Duration::from_millis(5)
-                } else {
-                    std::time::Duration::ZERO
-                }),
-            checkpoint_timeout: pipeline_checkpoint_timeout,
-            delivery_guarantee: self.config.delivery_guarantee,
-            cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
-            drain_budget_ns,
-            query_budget_ns,
-            max_input_buf_batches: self.config.pipeline_max_input_buf_batches.unwrap_or(256),
-            max_input_buf_bytes: self.config.pipeline_max_input_buf_bytes,
-            backpressure_policy: self.config.pipeline_backpressure_policy,
-            shared_source_isolation: self.config.shared_source_isolation,
-            max_replay_buffer_bytes: 256 * 1024 * 1024,
-        };
+            pipeline_checkpoint_timeout,
+            &sources,
+            &mut watermarks,
+        )?;
 
         let PreparedPipelineRuntime { runtime } = self
             .prepare_pipeline_runtime(
@@ -729,15 +743,15 @@ impl LaminarDB {
             .await?;
 
         #[cfg(feature = "cluster")]
-        let graph_ready_vnode_state = if runtime_mode == RuntimeMode::Cluster {
+        let (runtime, graph_ready_vnode_state) = if runtime_mode == RuntimeMode::Cluster {
             let graph_ready_deadline = checked_pipeline_deadline(
                 pipeline_checkpoint_timeout,
                 "pipeline graph-ready checkpoint",
             )?;
-            self.prepare_graph_ready_vnode_state_binding(graph_ready_deadline)
+            self.prepare_graph_ready_runtime(runtime, graph_ready_deadline)
                 .await?
         } else {
-            None
+            (runtime, None)
         };
         #[cfg(feature = "cluster")]
         if let Some(installed) = graph_ready_vnode_state.as_ref() {

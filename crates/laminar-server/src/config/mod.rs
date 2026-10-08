@@ -19,6 +19,7 @@ mod validation;
 
 use validation::validate_config;
 pub(crate) use validation::validate_http_auth;
+pub(crate) use validation::validate_process_functions;
 
 /// Regex for `${VAR}` and `${VAR:-default}` patterns.
 static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -106,6 +107,9 @@ pub struct ServerConfig {
     pub pipelines: Vec<PipelineConfig>,
     #[serde(default, rename = "sink")]
     pub sinks: Vec<SinkConfig>,
+    /// Offline, local Python process functions installed before pipeline DDL.
+    #[serde(default, rename = "process_function")]
+    pub process_functions: Vec<ProcessFunctionConfig>,
     /// Raw SQL DDL executed before `start()`, as an alternative to structured sections.
     #[serde(default)]
     pub sql: Option<String>,
@@ -686,8 +690,9 @@ pub struct SourceConfig {
     pub name: String,
     /// Connector type: "kafka", "postgres-cdc", "mongodb-cdc", "generator".
     pub connector: String,
-    #[serde(default = "default_format")]
-    pub format: String,
+    /// Serialization codec; omit it for connectors with a fixed native protocol.
+    #[serde(default)]
+    pub format: Option<String>,
     #[serde(default)]
     pub properties: toml::Table,
     #[serde(default)]
@@ -763,6 +768,7 @@ pub struct PipelineConfig {
 #[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     pub name: String,
+    /// SQL pipeline or process-function output stream to publish.
     pub pipeline: String,
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
@@ -771,6 +777,30 @@ pub struct SinkConfig {
     pub format: Option<String>,
     #[serde(default)]
     pub properties: toml::Table,
+}
+
+/// `[[process_function]]` binds one SQL source to a Python process manifest.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessFunctionConfig {
+    pub source: String,
+    pub output: String,
+    /// One `CREATE SOURCE` statement, executed before worker registration.
+    pub source_sql: String,
+    pub manifest: std::path::PathBuf,
+    pub handler_file: std::path::PathBuf,
+    pub function: String,
+    #[serde(default = "default_process_python")]
+    pub python: std::path::PathBuf,
+    /// Interpreter installation for an environment-bound process manifest.
+    #[serde(default)]
+    pub runtime_root: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub python_paths: Vec<std::path::PathBuf>,
+    #[serde(default = "default_process_max_in_flight")]
+    pub max_in_flight: usize,
+    #[serde(default = "default_process_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
 }
 
 /// `[discovery]` section: cluster node discovery.
@@ -846,9 +876,6 @@ fn default_checkpoint_interval() -> Duration {
 fn default_checkpoint_timeout() -> Duration {
     Duration::from_secs(120)
 }
-fn default_format() -> String {
-    "json".to_string()
-}
 fn default_max_ooo() -> Duration {
     Duration::from_secs(5)
 }
@@ -869,6 +896,15 @@ fn default_delivery() -> DeliveryGuarantee {
 }
 fn default_gossip_port() -> u16 {
     7946
+}
+fn default_process_python() -> std::path::PathBuf {
+    "python".into()
+}
+fn default_process_max_in_flight() -> usize {
+    2
+}
+fn default_process_timeout() -> Duration {
+    Duration::from_secs(15)
 }
 // ---------------------------------------------------------------------------
 // Tests

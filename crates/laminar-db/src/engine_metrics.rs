@@ -193,6 +193,21 @@ fn register_event_counters(registry: &Registry) -> (IntCounter, IntCounter) {
     )
 }
 
+fn register_operator_process_duration(registry: &Registry) -> HistogramVec {
+    // Operator names are catalog-bound and mode has exactly two values.
+    let metric = HistogramVec::new(
+        HistogramOpts::new(
+            "operator_process_duration_seconds",
+            "Operator processing duration by catalog operator and execution mode",
+        )
+        .buckets(prometheus::exponential_buckets(0.0001, 4.0, 10).unwrap()),
+        &["operator", "mode"],
+    )
+    .unwrap();
+    registry.register(Box::new(metric.clone())).unwrap();
+    metric
+}
+
 #[cfg(feature = "cluster")]
 fn register_int_gauge(registry: &Registry, name: &str, help: &str) -> IntGauge {
     let metric = IntGauge::new(name, help).unwrap();
@@ -216,6 +231,7 @@ fn register_subscription_histogram(registry: &Registry, name: &str, help: &str) 
 /// Constructed once at startup, `Arc`-shared into `PipelineCallback`,
 /// `CheckpointCoordinator`, and `OperatorGraph`.
 pub struct EngineMetrics {
+    pub(crate) source_queue: crate::pipeline::streaming_coordinator::SourceQueueMetrics,
     /// Committed cluster-subscription metrics without per-stream or per-reader labels.
     #[cfg(feature = "cluster")]
     pub cluster_subscription: ClusterSubscriptionMetrics,
@@ -361,6 +377,8 @@ impl EngineMetrics {
         let (events_ingested, events_emitted) = register_event_counters(registry);
 
         Self {
+            source_queue: crate::pipeline::streaming_coordinator::SourceQueueMetrics::register(registry)
+                .unwrap(),
             #[cfg(feature = "cluster")]
             cluster_subscription: ClusterSubscriptionMetrics::new(registry),
             events_ingested,
@@ -551,16 +569,7 @@ impl EngineMetrics {
                 ]),
             )
             .unwrap()),
-            // Operator names are catalog-bound and mode has exactly two values.
-            operator_process_duration: reg!(HistogramVec::new(
-                HistogramOpts::new(
-                    "operator_process_duration_seconds",
-                    "Operator processing duration by catalog operator and execution mode",
-                )
-                .buckets(prometheus::exponential_buckets(0.0001, 4.0, 10).unwrap()),
-                &["operator", "mode"],
-            )
-            .unwrap()),
+            operator_process_duration: register_operator_process_duration(registry),
             // Checkpoint: serialization_timeout=120s, so max bucket must cover that.
             // 0.01 * 2^14 = 163.84s.
             checkpoint_duration: reg!(Histogram::with_opts(
