@@ -29,6 +29,31 @@ See `postgres_cdc_admission_rejects_unexecuted_options_and_reference_use` and
 `mongodb_cdc_admission_uses_runtime_options_and_rejects_removed_ones` in [CDC admission tests](tests/cdc_admission.rs).
 Their lookup connectors and supported sinks are separate capabilities.
 
+### Recovery and native client APIs
+
+The engine admits source and sink compositions through their typed contracts. Connectors
+use their client libraries for fetching, acknowledgements, retries, transactions and storage
+I/O. A library capability becomes a delivery guarantee only when the connector implements
+the corresponding checkpoint and recovery protocol.
+
+Kafka input uses librdkafka partition offsets, assignment, seek, pause/resume and broker
+commits. Broker commits use the engine's durable checkpoint positions; automatic commits
+cannot advance recovery authority. Kafka preserves partition order. It provides neither a
+cross-partition replay order nor fixed poll batches. Stateful process replay currently rejects
+that missing order contract in embedded, single-node and cluster modes. Best-effort process
+execution remains available locally. There is no Kafka `replay.order` setting.
+
+Delta uses delta-rs writers, log-store APIs and application transactions; Iceberg uses native
+writers and catalog transactions. Their storage libraries handle the configured object store.
+The engine coordinates staged output with source positions and managed state. Provider wiring
+alone does not certify that complete recovery protocol. See the
+[object-store support matrix](../../docs/cloud-object-store-support.md) for current admission
+and qualification evidence.
+
+Latency depends on native fetch/write batching, queue bounds, acknowledgements, checkpoint
+frequency and provider calls. Connector I/O runs outside the compute runtime. Delivery
+admission does not establish a latency measurement.
+
 Delta's `cdf_contract_is_full_changelog` in [reader tests](src/lakehouse/delta_source/tests.rs)
 checks its reader contract. That contract is not an admitted append-only streaming source:
 `mutation_sources_fail_before_connector_io` in [engine admission tests](../laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs)

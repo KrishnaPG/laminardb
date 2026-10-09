@@ -6,7 +6,7 @@ function transport. A handler accepts immutable `Activation` values and returns
 state, timers, checkpoints, and output publication. Handler-local mutable data is
 not managed state.
 
-The [account activity example](../../examples/process_account/README.md) runs the
+The [account activity example](../../examples/process_account) runs the
 same monitor in native Rust and vectorized Python. It checks running totals,
 threshold crossings, named inactivity timers and completed-checkpoint recovery
 against a fixed independent reference. Its container targets reuse the Compose
@@ -145,7 +145,8 @@ is observed by the server even without another call. The server revokes serving,
 stops the database and exits with an error after either loss. A process manager
 can restart the entire server with the same checkpoint and artifacts. There is
 no in-place worker replacement, and uncommitted direct-source input is lost.
-Cluster mode remains rejected. The HTTP control API uses the
+For replayable server input, use the [replay-safe Linux deployment](#replay-safe-linux-deployment)
+profile below. The HTTP control API uses the
 existing console bearer token policy; configure `server.console_token` before
 binding it beyond loopback.
 
@@ -251,9 +252,56 @@ bytecode caches under the standard filesystem importer.
 Abrupt host termination releases the guards.
 Handler changes to import controls, external data and libraries loaded
 from outside the declared trees are not protected. This does not establish the
-complete immutable dependency closure. Python remains `BestEffort` in embedded
-and single-node modes; `AtLeastOnce`, `ExactlyOnce` and both cluster forms remain
-rejected.
+complete immutable dependency closure. This environment binding alone supports
+`BestEffort` delivery in embedded and single-node modes.
+
+### Replay-safe Linux deployment
+
+The Rust library and server admit supervised Python with `AtLeastOnce` delivery in
+embedded, single-node and cluster mode when the manifest declares `"determinism":"replay_safe"`.
+This is a reviewed trusted-code contract: results must depend only on activations
+and managed state. The handler must not read external data, use wall-clock time
+or randomness, perform external writes, or keep business state in worker globals.
+It is not a sandbox or an attestation of handler behavior.
+
+Package the complete interpreter, dependencies and handler with the existing
+`package_process_python` command, placing `--replay-safe` before its paths. Deploy
+the manifest and all bound trees inside the same Linux root image. Start the
+engine with a read-only root filesystem, a non-root user, no effective Linux
+capabilities and `no-new-privileges`. Read-only bind mounts from other filesystems
+are rejected because another mount may permit changes to their contents. Writable
+temporary and checkpoint mounts must remain outside the bound package.
+
+The supervisor verifies every inventoried path, clears inherited environment
+variables and fixes `PYTHONHASHSEED=0`. It supplies a private lifetime binding to
+the connected client and revokes it when the child exits. Connecting separately
+to a matching worker does not establish this binding. Host administrators and
+the deployment image remain trusted. Retain the same resolved image digest on
+every owner and across recovery; the package hash does not attest system libraries.
+The code review must include native extension dependencies and lazy imports.
+
+The source must reproduce one physical channel in fixed replay batches with
+deterministic row positions and watermark cuts. Built-in sources currently lack
+that replay contract, so they are rejected for at-least-once process execution
+in every mode. Kafka's native partition offsets do not establish a global replay
+order or fixed watermark cuts. The engine's independent-channel merge remains
+unsupported. Best-effort process execution is available in embedded and
+single-node mode.
+
+Cluster startup registers the
+same package on every owner before sealing its invocation DDL; source ownership
+must follow the certified assignment. Replay tests cover matching callback IDs,
+managed state and timers after worker restart and committed vnode rescale.
+For server deployments, set `server.delivery = "at_least_once"` and configure the
+same `[[process_function]]` package on every owner. Its `source_sql` supplies the
+replayable source; a configured sink must support durable at-least-once delivery.
+Cluster mode uses a shared checkpoint URL. The server binds workers before sealing
+the startup catalog and fences intake and serving if a worker exits, including
+while idle. A process manager can restart with the same package and committed
+checkpoints. Cluster timers advance from committed watermark cuts, so checkpoint
+frequency also bounds timer latency. Uncommitted output may be replayed.
+Exactly-once process delivery remains rejected.
+Windows and macOS retain the best-effort profile.
 
 To run the environment-bound Rust regressions, set `LAMINAR_PROCESS_PYTHON` to
 an explicit interpreter file and `LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT` to its
