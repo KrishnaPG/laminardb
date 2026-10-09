@@ -73,46 +73,7 @@ impl KafkaSource {
             let consumer: BaseConsumer = client_config
                 .create()
                 .map_err(|error| consumer_creation_error(&error))?;
-            let mut inventory = KafkaPartitionSet::new();
-            for topic in topics {
-                let metadata = consumer
-                    .fetch_metadata(Some(&topic), remaining(deadline)?)
-                    .map_err(|e| fetch_error(&topic, &e))?;
-                let topic_metadata = metadata
-                    .topics()
-                    .iter()
-                    .find(|m| m.name() == topic)
-                    .ok_or_else(|| invalid_response(&topic, "metadata omitted the topic"))?;
-                if let Some(error) = topic_metadata.error() {
-                    return Err(topic_error(&topic, error.into()));
-                }
-                if topic_metadata.partitions().is_empty()
-                    || inventory
-                        .len()
-                        .saturating_add(topic_metadata.partitions().len())
-                        > MAX_INITIAL_PARTITIONS
-                {
-                    return Err(invalid_response(
-                        &topic,
-                        "initial inventory must contain 1..=4096 partitions in total",
-                    ));
-                }
-                for partition in topic_metadata.partitions() {
-                    if let Some(error) = partition.error() {
-                        return Err(topic_error(&topic, error.into()));
-                    }
-                    if partition.id() < 0
-                        || usize::try_from(partition.id())
-                            .map_or(true, |id| id >= topic_metadata.partitions().len())
-                        || !inventory.insert((topic.clone(), partition.id()))
-                    {
-                        return Err(invalid_response(
-                            &topic,
-                            "invalid or duplicate partition identity",
-                        ));
-                    }
-                }
-            }
+            let inventory = fetch_initial_inventory(&consumer, topics, deadline)?;
             let mut baselines = KafkaPartitionBaselines::with_capacity(inventory.len());
             if sealed_baselines.as_ref().is_some_and(|sealed| {
                 sealed.len() != inventory.len() || inventory.iter().any(|partition| !sealed.contains_key(partition))
@@ -152,6 +113,54 @@ impl KafkaSource {
                 ConnectorError::Internal(format!("Kafka initialization worker failed: {e}"))
             })?
     }
+}
+
+fn fetch_initial_inventory(
+    consumer: &BaseConsumer,
+    topics: Vec<String>,
+    deadline: std::time::Instant,
+) -> Result<KafkaPartitionSet, ConnectorError> {
+    let mut inventory = KafkaPartitionSet::new();
+    for topic in topics {
+        let metadata = consumer
+            .fetch_metadata(Some(&topic), remaining(deadline)?)
+            .map_err(|e| fetch_error(&topic, &e))?;
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|m| m.name() == topic)
+            .ok_or_else(|| invalid_response(&topic, "metadata omitted the topic"))?;
+        if let Some(error) = topic_metadata.error() {
+            return Err(topic_error(&topic, error.into()));
+        }
+        if topic_metadata.partitions().is_empty()
+            || inventory
+                .len()
+                .saturating_add(topic_metadata.partitions().len())
+                > MAX_INITIAL_PARTITIONS
+        {
+            return Err(invalid_response(
+                &topic,
+                "initial inventory must contain 1..=4096 partitions in total",
+            ));
+        }
+        for partition in topic_metadata.partitions() {
+            if let Some(error) = partition.error() {
+                return Err(topic_error(&topic, error.into()));
+            }
+            if partition.id() < 0
+                || usize::try_from(partition.id())
+                    .map_or(true, |id| id >= topic_metadata.partitions().len())
+                || !inventory.insert((topic.clone(), partition.id()))
+            {
+                return Err(invalid_response(
+                    &topic,
+                    "invalid or duplicate partition identity",
+                ));
+            }
+        }
+    }
+    Ok(inventory)
 }
 
 fn remaining(deadline: std::time::Instant) -> Result<std::time::Duration, ConnectorError> {

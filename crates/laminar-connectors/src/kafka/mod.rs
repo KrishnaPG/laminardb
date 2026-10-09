@@ -156,9 +156,8 @@ pub fn register_kafka_sink(
 }
 
 /// Returns the configuration key specifications for the Kafka source.
-#[allow(clippy::too_many_lines)]
 fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
-    vec![
+    let mut keys = vec![
         // Required
         ConfigKeySpec::required("bootstrap.servers", "Kafka broker addresses"),
         ConfigKeySpec::required("group.id", "Consumer group identifier"),
@@ -196,6 +195,78 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
+    ];
+    keys.extend(kafka_source_consumer_config_keys());
+    keys.extend([
+        // Schema Registry
+        ConfigKeySpec::optional(
+            "schema.registry.url",
+            "Confluent Schema Registry URL (required for Avro)",
+            "",
+        ),
+        ConfigKeySpec::optional("schema.registry.username", "Schema Registry username", ""),
+        ConfigKeySpec::optional("schema.registry.password", "Schema Registry password", ""),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.ca.location",
+            "Schema Registry SSL CA cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.certificate.location",
+            "Schema Registry SSL client cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.key.location",
+            "Schema Registry SSL client key path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.compatibility",
+            "Schema compatibility level override",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.evolution.strategy",
+            "Runtime schema evolution handling (log/reject/ignore)",
+            "log",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.subject.name.strategy",
+            "Schema Registry subject naming (topic-name/record-name/topic-record-name)",
+            "topic-name",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.record.name",
+            "Avro record name for record-based subject naming",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.discovery.timeout.ms",
+            "Schema discovery timeout in milliseconds",
+            "10000",
+        ),
+        ConfigKeySpec::optional(
+            "max.poll.interval.ms",
+            "Maximum interval between consumer polls in milliseconds",
+            "600000",
+        ),
+        ConfigKeySpec::optional(
+            "broker.commit.on.checkpoint",
+            "Commit broker offsets after checkpoint completion",
+            "true",
+        ),
+        ConfigKeySpec::optional(
+            "reader.channel.capacity",
+            "Bounded reader channel capacity in records",
+            "8192",
+        ),
+    ]);
+    keys
+}
+
+fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
+    vec![
         // Consumer tuning
         ConfigKeySpec::optional(
             "startup.mode",
@@ -284,69 +355,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "max.deser.error.rate",
             "Max tolerated deserialization error rate per batch (0.0-1.0)",
             "0.5",
-        ),
-        // Schema Registry
-        ConfigKeySpec::optional(
-            "schema.registry.url",
-            "Confluent Schema Registry URL (required for Avro)",
-            "",
-        ),
-        ConfigKeySpec::optional("schema.registry.username", "Schema Registry username", ""),
-        ConfigKeySpec::optional("schema.registry.password", "Schema Registry password", ""),
-        ConfigKeySpec::optional(
-            "schema.registry.ssl.ca.location",
-            "Schema Registry SSL CA cert path",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "schema.registry.ssl.certificate.location",
-            "Schema Registry SSL client cert path",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "schema.registry.ssl.key.location",
-            "Schema Registry SSL client key path",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "schema.compatibility",
-            "Schema compatibility level override",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "schema.evolution.strategy",
-            "Runtime schema evolution handling (log/reject/ignore)",
-            "log",
-        ),
-        ConfigKeySpec::optional(
-            "schema.registry.subject.name.strategy",
-            "Schema Registry subject naming (topic-name/record-name/topic-record-name)",
-            "topic-name",
-        ),
-        ConfigKeySpec::optional(
-            "schema.registry.record.name",
-            "Avro record name for record-based subject naming",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "schema.registry.discovery.timeout.ms",
-            "Schema discovery timeout in milliseconds",
-            "10000",
-        ),
-        ConfigKeySpec::optional(
-            "max.poll.interval.ms",
-            "Maximum interval between consumer polls in milliseconds",
-            "600000",
-        ),
-        ConfigKeySpec::optional(
-            "broker.commit.on.checkpoint",
-            "Commit broker offsets after checkpoint completion",
-            "true",
-        ),
-        ConfigKeySpec::optional(
-            "reader.channel.capacity",
-            "Bounded reader channel capacity in records",
-            "8192",
         ),
     ]
 }

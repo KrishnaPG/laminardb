@@ -819,6 +819,101 @@ fn source_contract_is_replayable_and_splittable() {
         SourceRowPositionCapability::OrderedDeterministic
     );
     assert!(contract.is_exact_delivery_certified());
+    assert_eq!(
+        contract.replay_order,
+        crate::connector::SourceReplayOrder::Unspecified
+    );
+    assert!(!contract.supports_fixed_batch_replay());
+}
+
+async fn collect_native_ids(source: &mut KafkaSource, count: usize, poll_limit: usize) -> Vec<i64> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut ids = Vec::with_capacity(count);
+        while ids.len() < count {
+            let Some(batch) = source.poll_batch(poll_limit).await.unwrap() else {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            };
+            ids.extend(
+                batch
+                    .records
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+        ids
+    })
+    .await
+    .expect("an idle Kafka partition must not block active partition intake")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_partition_progress_and_offset_replay_do_not_wait_for_idle_partitions() {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("events", 2, 1).unwrap();
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", cluster.bootstrap_servers())
+        .create()
+        .unwrap();
+    for id in [10, 20, 30] {
+        let payload = format!(r#"{{"id":{id},"value":"accepted"}}"#);
+        producer
+            .send(
+                FutureRecord::<(), str>::to("events")
+                    .partition(0)
+                    .payload(&payload),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+    }
+    let mut config = ConnectorConfig::new("kafka");
+    config.set("bootstrap.servers", cluster.bootstrap_servers());
+    config.set("group.id", "native-partition-replay");
+    config.set("topic", "events");
+    config.set("startup.mode", "earliest");
+    config.set("laminar.source.name", "events-source");
+    let mut source = KafkaSource::new(test_schema(), test_config(), None);
+    source
+        .start(
+            SourceStart::new(
+                config.clone(),
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_native_ids(&mut source, 1, 1).await, [10]);
+    let checkpoint = source.try_checkpoint().unwrap().unwrap();
+    assert_eq!(checkpoint.input_channels().unwrap().len(), 2);
+    assert_eq!(checkpoint.get_offset("events:0"), Some("0"));
+    assert!(checkpoint.get_offset("events:1").is_none());
+    source.close().await.unwrap();
+
+    let mut resumed = KafkaSource::new(test_schema(), test_config(), None);
+    resumed
+        .start(
+            SourceStart::new(
+                config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                    checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_native_ids(&mut resumed, 2, 32).await, [20, 30]);
+    resumed.close().await.unwrap();
 }
 
 #[test]

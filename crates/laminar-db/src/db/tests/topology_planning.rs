@@ -19,6 +19,63 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use super::*;
 use crate::{ClusterTopologyObjectTransition, TopologyInitialization, TopologyValidationScope};
 
+#[cfg(all(feature = "kafka", feature = "cluster"))]
+#[tokio::test]
+async fn isolated_catalog_resolves_installed_process_output_for_sink_admission() {
+    use crate::process_function::cluster_recovery_tests::source::{register, SourceProbe, SOURCE};
+    use crate::process_function::tests::{descriptor, AccountActivity};
+
+    let base = LaminarDB::builder()
+        .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .register_connector(register(
+            Arc::new(SourceProbe::default()),
+            Vec::new().into(),
+        ))
+        .build()
+        .await
+        .unwrap();
+    let candidate = base.isolated_topology_catalog().unwrap();
+    candidate
+        .register_native_process_function(
+            "activity",
+            "events",
+            descriptor(),
+            Arc::new(AccountActivity),
+        )
+        .await
+        .unwrap();
+    let definitions = [
+        format!(
+            "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+         ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+         FROM \"{SOURCE}\""
+        ),
+        candidate
+            .process_function_bootstrap_sql("activity")
+            .unwrap(),
+        "CREATE SINK activity_output FROM activity INTO KAFKA \
+         ('bootstrap.servers' = '127.0.0.1:1', 'topic' = 'activity_output') FORMAT JSON"
+            .into(),
+    ];
+    for sql in definitions {
+        let statement = laminar_sql::parse_streaming_sql(&sql).unwrap().remove(0);
+        CATALOG_BOOTSTRAP
+            .scope((), candidate.execute_parsed_single(&sql, &statement))
+            .await
+            .unwrap();
+    }
+    let plan = candidate.plan_topology_graph().await.unwrap();
+    assert_eq!(plan.schemas["activity"], descriptor().output_schema);
+    assert!(plan.connector_sha256.contains_key("activity_output"));
+    assert!(plan.operators.contains_key("activity"));
+    candidate.shutdown().await.unwrap();
+    base.shutdown().await.unwrap();
+}
+
 #[derive(Default)]
 struct RestoreValidationControl {
     block: std::sync::atomic::AtomicBool,
@@ -1620,4 +1677,52 @@ mod removal {
         fixture.assert_no_effects();
         fixture.db.shutdown().await.unwrap();
     }
+}
+
+#[cfg(all(feature = "cluster", feature = "delta-lake"))]
+#[tokio::test]
+async fn cluster_planning_rejects_a_connector_sink_reading_a_source_directly() {
+    let control = crate::temporal_test_source::TemporalTestSourceControl::new();
+    let base = LaminarDB::builder()
+        .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .register_connector(move |registry| {
+            crate::temporal_test_source::register(registry, &control)
+        })
+        .build()
+        .await
+        .unwrap();
+    let candidate = base.isolated_topology_catalog().unwrap();
+    let lake = tempfile::tempdir().unwrap();
+    let location = lake.path().to_string_lossy().replace('\\', "/");
+    let connector = crate::temporal_test_source::CONNECTOR_NAME;
+    let definitions = [
+        format!(
+            "CREATE SOURCE events (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, \
+             value BIGINT NOT NULL, WATERMARK FOR ts AS ts) FROM \"{connector}\" ('mode' = 'append')"
+        ),
+        format!(
+            "CREATE SINK events_lake FROM events INTO \"delta-lake\" ('table.path' = '{location}', \
+             'auto.create' = 'true')"
+        ),
+    ];
+    for sql in definitions {
+        let statement = laminar_sql::parse_streaming_sql(&sql).unwrap().remove(0);
+        CATALOG_BOOTSTRAP
+            .scope((), candidate.execute_parsed_single(&sql, &statement))
+            .await
+            .unwrap();
+    }
+    let Err(error) = candidate.plan_topology_graph().await else {
+        panic!("cluster planning admitted a sink reading a source directly");
+    };
+    assert!(
+        error.to_string().contains("reads source 'events' directly"),
+        "{error}"
+    );
+    candidate.shutdown().await.unwrap();
+    base.shutdown().await.unwrap();
 }
