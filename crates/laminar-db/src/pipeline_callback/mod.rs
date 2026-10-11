@@ -6828,8 +6828,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // committed checkpoint when the source establishes its barrier (see
         // `CatalogSourceConnector::checkpoint`), never read back from live admission state
         // here. A managed source's cut therefore travels with its checkpoint and already
-        // reports only the batches admitted before the barrier. Non-managed sources keep
-        // their connector checkpoint byte-identical.
+        // reports only the batches the bridge forwarded before the barrier, never a batch
+        // still queued behind it. Non-managed sources keep their connector checkpoint
+        // byte-identical.
         let mut tail = LeaderTail {
             in_flight,
             coordinator: Arc::clone(&self.coordinator),

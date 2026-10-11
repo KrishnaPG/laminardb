@@ -225,9 +225,4 @@ impl AdmittedInputCounter {
     pub(crate) fn next_offset(&self) -> OrderedInputOffset {
         OrderedInputOffset::new(self.next.fetch_add(1, Ordering::AcqRel) + 1)
     }
-
-    /// Current committed admission ordinal.
-    pub(crate) fn current(&self) -> OrderedInputOffset {
-        OrderedInputOffset::new(self.next.load(Ordering::Acquire))
-    }
 }

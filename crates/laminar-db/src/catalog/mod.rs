@@ -147,6 +147,13 @@ pub struct SourceEntry {
     source_instance: SourceInstance,
     /// Monotonic native admission ordinal for pushed batches.
     admitted_input_offset: AdmittedInputCounter,
+    /// Native admission ordinal of the last admitted batch the catalog bridge has
+    /// actually polled and forwarded downstream.
+    ///
+    /// The bridge advances this as it drains the subscription, so it is always
+    /// `<= admitted_input_offset`. A batch that is admitted but still queued stays
+    /// outside every committed cut, so it can never be reported as covered.
+    forwarded_input_offset: AtomicU64,
     /// Whether this source is a managed push source owned by a downstream
     /// context layer. Only declared sources have their native instance/coordinate
     /// bound into checkpoint metadata, so connector sources are byte-identical.
@@ -167,15 +174,35 @@ impl SourceEntry {
     /// The ordinal is reserved only after the native channel accepted the batch,
     /// so a rejected or backpressured enqueue produces no offset and no receipt.
     ///
-    /// The managed-push flag is *not* set here. This shared admission path also backs
-    /// ordinary `push_and_buffer` (`INSERT INTO`) and the compatibility
-    /// [`crate::UntypedSourceHandle::push_arrow`], which must stay unmanaged so
-    /// connector sources keep byte-identical checkpoint metadata. Only
-    /// [`crate::UntypedSourceHandle::push_arrow_receipted`] and
-    /// [`Self::declare_managed_push`] opt a source in.
+    /// This shared admission path does not set the managed-push flag, so ordinary
+    /// `push_and_buffer` (`INSERT INTO`) and the compatibility
+    /// [`crate::UntypedSourceHandle::push_arrow`] stay unmanaged and connector sources
+    /// keep byte-identical checkpoint metadata. Use [`Self::admit_arrow_managed`] when the
+    /// batch must be admitted as a managed push source.
     pub(crate) fn admit_arrow(
         &self,
         batch: RecordBatch,
+    ) -> Result<OrderedInputOffset, laminar_core::streaming::StreamingError> {
+        self.admit_arrow_locked(batch, false)
+    }
+
+    /// Admit a batch and atomically declare this source a managed push source.
+    ///
+    /// The managed declaration is published while holding the same admission lock that
+    /// [`Self::managed_admission_cut`] reads under, so a checkpoint barrier can never observe
+    /// this batch admitted while the source still looks unmanaged. This backs the receipted
+    /// push handle.
+    pub(crate) fn admit_arrow_managed(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<OrderedInputOffset, laminar_core::streaming::StreamingError> {
+        self.admit_arrow_locked(batch, true)
+    }
+
+    fn admit_arrow_locked(
+        &self,
+        batch: RecordBatch,
+        managed: bool,
     ) -> Result<OrderedInputOffset, laminar_core::streaming::StreamingError> {
         validate_source_batch(
             &self.name,
@@ -190,6 +217,12 @@ impl SourceEntry {
         // native channel accepted the batch, so ordinal assignment matches enqueue order
         // even when two producers interleave.
         let mut buffer = self.buffer.lock();
+        if managed {
+            // Publish the managed flag under the admission lock. The barrier reads the flag under
+            // this same lock, so it either sees the source as managed or runs before this batch was
+            // admitted; the two operations can never be observed apart.
+            self.managed_push.store(true, Ordering::Release);
+        }
         self.source.push_arrow(batch.clone())?;
         let offset = self.admitted_input_offset.next_offset();
         buffer.push(batch);
@@ -234,22 +267,39 @@ impl SourceEntry {
         &self.source_instance
     }
 
-    /// Snapshot the managed admission cut atomically with admission.
+    /// Record that the catalog bridge has polled and forwarded `count` admitted batches.
     ///
-    /// Returns `None` unless this is a declared managed push source. Otherwise it holds the
-    /// admission lock, so the read is synchronized with [`Self::admit_arrow`]: no batch can be
-    /// half-admitted when the cut is taken, and every batch admitted afterwards reserves a
-    /// strictly greater ordinal. The catalog bridge calls this when it establishes its
-    /// checkpoint barrier, so batches admitted after the barrier stay outside the committed
-    /// checkpoint cut.
+    /// The bridge calls this immediately after a successful `poll_batch`, so the forwarded
+    /// coordinate only ever names batches that were actually handed to the pipeline before a
+    /// barrier. A batch that is admitted but still queued in the subscription is never counted.
+    pub(crate) fn record_forwarded_input(&self, count: u64) {
+        if count != 0 {
+            self.forwarded_input_offset
+                .fetch_add(count, Ordering::AcqRel);
+        }
+    }
+
+    /// Snapshot the managed cut a committed checkpoint barrier should report.
+    ///
+    /// Returns `None` unless this is a declared managed push source. The offset is the native
+    /// admission ordinal of the last batch the catalog bridge has polled and forwarded, not the
+    /// current admission position. A batch admitted after the barrier but not yet polled keeps a
+    /// strictly greater ordinal and stays outside the committed cut, so
+    /// [`crate::LaminarDB::checkpoint_through`] never reports coverage for a batch the committed
+    /// checkpoint excludes.
     pub(crate) fn managed_admission_cut(&self) -> Option<(SourceInstance, OrderedInputOffset)> {
+        // Hold the admission lock so the read is ordered against managed admission:
+        // `admit_arrow_managed` publishes the managed flag while holding this same lock, so a
+        // barrier that observes the lock either sees a managed source or observes the source
+        // before its first receipted admission. A batch can therefore never be captured as an
+        // unmanaged footprint, nor included before it was admitted.
+        let _admission = self.buffer.lock();
         if !self.is_managed_push() {
             return None;
         }
-        let _admission = self.buffer.lock();
         Some((
             self.source_instance.clone(),
-            self.admitted_input_offset.current(),
+            OrderedInputOffset::new(self.forwarded_input_offset.load(Ordering::Acquire)),
         ))
     }
 }
@@ -420,6 +470,7 @@ impl SourceCatalog {
             data_notify: Arc::new(Notify::new()),
             source_instance,
             admitted_input_offset: AdmittedInputCounter::default(),
+            forwarded_input_offset: AtomicU64::new(0),
             managed_push: std::sync::atomic::AtomicBool::new(false),
         });
 

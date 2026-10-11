@@ -44,8 +44,8 @@ impl StreamingCoordinator {
         )?;
         // A managed push source binds its native admission cut into the barrier checkpoint
         // when it establishes the barrier (see `CatalogSourceConnector::checkpoint`), so
-        // batches admitted after the barrier stay outside the committed cut. Persist that cut
-        // even for a non-replayable bridge so it reaches the committed manifest; recovery
+        // batches the source has not yet polled stay outside the committed cut. Persist that
+        // cut even for a non-replayable bridge so it reaches the committed manifest; recovery
         // still selects replay cursors by `supports_replay()`, so the metadata is not a
         // replay cursor.
         let managed = barrier_checkpoint
