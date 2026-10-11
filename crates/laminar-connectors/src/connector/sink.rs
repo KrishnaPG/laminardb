@@ -104,6 +104,49 @@ pub trait SinkConnector: Send {
         Ok(SinkContract::default())
     }
 
+    /// Key columns by which this configuration applies keyed mutations: rows whose trailing
+    /// Utf8 `_op` is `U` replace the row with that key and rows whose `_op` is `D` delete it,
+    /// reading only the key columns. Last writer wins per key within one flush.
+    ///
+    /// `None` (the default) means the configuration cannot faithfully apply key-only deletes,
+    /// so keyed-mutation sources cannot feed it directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration itself is invalid.
+    fn keyed_mutation_key(
+        &self,
+        _config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        Ok(None)
+    }
+
+    /// Resolve a writer contract from already-bound query output before activation.
+    /// Destinations with authoritative schemas override this read-only hook.
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Sink,
+            crate::schema::resolution::SchemaOrigin::Query,
+            &input,
+        )
+    }
+
+    /// Perform only explicitly configured, idempotent external preparation after
+    /// read-only resolution and deployment/delivery admission. The returned binding
+    /// must contain the concrete identity used during subsequent activation/replay.
+    async fn prepare_schema(
+        &mut self,
+        _config: &ConnectorConfig,
+        _binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
     /// Open the connection and prepare to accept writes.
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
 

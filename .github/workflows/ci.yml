@@ -115,6 +115,21 @@ jobs:
           key: ${{ matrix.os }}
       - uses: taiki-e/install-action@nextest
 
+      - uses: actions/setup-python@v6
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.13'
+
+      - name: Install Python process worker
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install -r python/laminardb_process/requirements.lock
+          python -m pip install --no-deps ./python/laminardb_process
+
+      - name: Python process worker tests
+        if: runner.os == 'Linux'
+        run: python -m unittest discover -s python/laminardb_process/tests -p 'test_*.py'
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
@@ -134,6 +149,7 @@ jobs:
           # larger bounded stack scoped to test processes on resource-constrained runners.
           RUST_MIN_STACK: 4194304
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_PROCESS_PYTHON: python3
 
       # Windows: explicit features (default set, with vendored OpenSSL)
       - name: Run tests (Windows)
@@ -173,6 +189,43 @@ jobs:
         env:
           LAMINAR_TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  # ============================================
+  # MongoDB CDC direct pipelines
+  # ============================================
+  mongodb-cdc-integration:
+    name: MongoDB CDC (direct pipelines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mongodb-cdc
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+      - name: Start MongoDB, PostgreSQL, and Iceberg fixtures
+        run: |
+          docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+          docker compose -f tests/docker/iceberg-compose.yml up -d --wait
+      - name: Connector change-stream, replay, and admission tests
+        run: cargo test -p laminar-connectors --no-default-features --features mongodb-cdc --test mongodb_integration --test cdc_admission -- --test-threads=2
+      - name: MongoDB schema contracts
+        run: cargo test -p laminar-connectors --no-default-features --features mongodb-cdc --test schema_mongodb_integration -- --ignored --test-threads=1
+        env:
+          LAMINAR_SCHEMA_TEST_MONGO: mongodb://127.0.0.1:27117/?directConnection=true&tls=false
+      - name: Direct MongoDB pipeline end-to-end tests
+        run: cargo test -p laminar-db --no-default-features --features mongodb-cdc,postgres-sink,delta-lake,files,iceberg --test mongodb_cdc_e2e -- --test-threads=1
+        env:
+          LAMINAR_REQUIRE_MONGODB_CDC: "1"
+      - name: Fixture logs
+        if: failure()
+        run: |
+          docker compose -f tests/docker/mongodb-cdc-compose.yml logs --tail=200
+          docker compose -f tests/docker/iceberg-compose.yml logs --tail=200
 
   # ============================================
   # Release Build (main/develop only)
@@ -399,12 +452,13 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Match the toolchain used by the Pages documentation build.
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build docs
-        run: cargo doc --workspace --no-deps --all-features
+        run: cargo +nightly doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings --cfg docsrs"
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -514,7 +568,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, mongodb-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -524,6 +578,7 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
              [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.mongodb-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.iceberg-integration.result }}" != "success" ]] || \
              [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \

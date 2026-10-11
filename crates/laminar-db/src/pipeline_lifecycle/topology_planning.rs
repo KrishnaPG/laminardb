@@ -92,13 +92,26 @@ impl LaminarDB {
             .await?;
         self.revalidate_persisted_cluster_query_shapes(&streams)
             .await?;
-        let resolved = super::resolve_stream_output_schemas(
+        let mut resolved = super::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
             &rustc_hash::FxHashSet::default(),
             &interval.joins,
         )
         .await?;
+        for registration in self.connector_manager.lock().process_functions().values() {
+            if self
+                .catalog
+                .get_stream_entry(&registration.output_name)
+                .is_none()
+            {
+                continue;
+            }
+            resolved.schemas.insert(
+                registration.output_name.clone(),
+                Arc::clone(&registration.descriptor.output_schema),
+            );
+        }
         let mut connector_sha256 = BTreeMap::new();
         let mut source_input_modes = BTreeMap::new();
         let mut schemas: BTreeMap<_, _> = resolved
@@ -110,8 +123,14 @@ impl LaminarDB {
         let mut source_names = self.catalog.list_sources();
         source_names.sort_unstable();
         for name in source_names {
+            // Cluster topologies have no direct keyed-mutation sink route: its singleton
+            // sources and sinks lack fenced placement.
             self.validate_registered_mutation_source_admission(
-                &name, &sources, &temporal, &interval,
+                &name,
+                &sources,
+                &temporal,
+                &interval,
+                &rustc_hash::FxHashSet::default(),
             )?;
             let source = self.catalog.get_source(&name).ok_or_else(|| {
                 TopologyError::Invalid(format!(
@@ -166,6 +185,49 @@ impl LaminarDB {
             source_input_modes.insert(name.clone(), contract.input_mode);
             schemas.insert(name, Arc::clone(&source.schema));
         }
+        connector_sha256.extend(
+            self.plan_topology_sinks(&sinks, &schemas, &resolved, &source_input_modes)
+                .await?,
+        );
+        if let Some((input, _)) = &restore {
+            self.bind_topology_subscriptions(&mut streams, input, &resolved.schemas)?;
+        }
+        let graph = if let Some((input, scope)) = restore {
+            self.build_topology_restore_operator_graph(
+                &streams,
+                &tables,
+                &resolved.changelog_carrying,
+                &interval.joins,
+                &input.descriptor().target_pipeline,
+                scope,
+            )?
+        } else {
+            self.build_connector_operator_graph(
+                &streams,
+                &tables,
+                &resolved.changelog_carrying,
+                &interval.joins,
+                None,
+            )?
+        };
+        self.initialize_topology_graph(
+            graph,
+            &resolved.schemas,
+            schemas,
+            connector_sha256,
+            source_input_modes,
+        )
+        .await
+    }
+
+    async fn plan_topology_sinks(
+        &self,
+        sinks: &std::collections::HashMap<String, crate::connector_manager::SinkRegistration>,
+        schemas: &BTreeMap<String, arrow_schema::SchemaRef>,
+        resolved: &super::output_schema::ResolvedStreamOutputs,
+        planned_sources: &BTreeMap<String, SourceInputMode>,
+    ) -> Result<BTreeMap<String, String>, DbError> {
+        let mut connector_sha256 = BTreeMap::new();
         let mut sink_names: Vec<_> = sinks.keys().collect();
         sink_names.sort_unstable();
         for name in sink_names {
@@ -180,6 +242,12 @@ impl LaminarDB {
                 return Err(TopologyError::Unsupported(format!(
                     "sink '{name}' has no durable connector; catalog-only output is not an external migration sink"
                 )).into());
+            }
+            if planned_sources.contains_key(&registration.input) {
+                return Err(super::direct_mutation_routes::cluster_source_sink_error(
+                    name,
+                    &registration.input,
+                ));
             }
             let mut config = crate::connector_manager::build_sink_config(
                 registration,
@@ -199,6 +267,7 @@ impl LaminarDB {
                     delivery: self.config.delivery_guarantee,
                     runtime: RuntimeMode::Cluster,
                     carries_changelog: resolved.changelog_carrying.contains(&registration.input),
+                    mutation_key: None,
                     checkpointing_enabled: self.config.checkpoint.is_some(),
                     checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
                 },
@@ -241,35 +310,7 @@ impl LaminarDB {
                 ))?,
             );
         }
-        if let Some((input, _)) = &restore {
-            self.bind_topology_subscriptions(&mut streams, input, &resolved.schemas)?;
-        }
-        let graph = if let Some((input, scope)) = restore {
-            self.build_topology_restore_operator_graph(
-                &streams,
-                &tables,
-                &resolved.changelog_carrying,
-                &interval.joins,
-                &input.descriptor().target_pipeline,
-                scope,
-            )?
-        } else {
-            self.build_connector_operator_graph(
-                &streams,
-                &tables,
-                &resolved.changelog_carrying,
-                &interval.joins,
-                None,
-            )?
-        };
-        self.initialize_topology_graph(
-            graph,
-            &resolved.schemas,
-            schemas,
-            connector_sha256,
-            source_input_modes,
-        )
-        .await
+        Ok(connector_sha256)
     }
 
     async fn initialize_topology_graph(

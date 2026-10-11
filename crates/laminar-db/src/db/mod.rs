@@ -4,10 +4,15 @@
 #[cfg(feature = "cluster")]
 mod assignment_authority;
 #[cfg(feature = "cluster")]
+mod catalog_bootstrap;
+mod checkpoint_namespace;
+#[cfg(feature = "cluster")]
 mod cluster_subscription;
 #[cfg(test)]
 mod datafusion_memory_tests;
 mod session;
+mod source_watermarks;
+pub(crate) use source_watermarks::{RecoveredInputChannelProgress, SourceWatermarkState};
 #[cfg(feature = "cluster")]
 mod topology;
 #[cfg(feature = "cluster")]
@@ -31,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, BinaryArray, RecordBatch, StringArray};
+use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use laminar_core::catalog::CatalogObjectKind;
@@ -328,7 +333,8 @@ pub struct LaminarDB {
     /// OS-released exclusive lock for a local checkpoint namespace. Deployment
     /// identity prevents reuse after reset; this lock prevents two live processes from writing
     /// divergent cuts into the same deployment.
-    pub(crate) checkpoint_namespace_lock: parking_lot::Mutex<Option<std::fs::File>>,
+    pub(crate) schema_creation_lock: tokio::sync::Mutex<()>,
+    pub(crate) checkpoint_namespace_lock: parking_lot::Mutex<Option<Arc<std::fs::File>>>,
     /// Every sink actor in the active generation, retained from spawn until terminal observation.
     /// A replacement cannot start while any prior actor can still mutate an external system.
     pub(crate) owned_sink_handles: Arc<parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>>,
@@ -635,8 +641,7 @@ fn reads_catalog(statement: &StreamingStatement) -> bool {
         )
 }
 
-#[cfg(feature = "cluster")]
-fn catalog_create_identity(
+pub(crate) fn catalog_create_identity(
     statement: &StreamingStatement,
 ) -> Result<Option<(String, CatalogObjectKind, &'static str)>, DbError> {
     let identity = match statement {
@@ -723,12 +728,6 @@ fn validate_cluster_catalog_create(
             "cluster catalog DDL cannot persist secret property '{key}'; use $${{ENV_VAR}} in server TOML or ${{ENV_VAR}} through the SQL API (without a default), or omit it for a connector environment fallback"
         )));
     }
-    if connector_source_requires_schema_discovery(statement) {
-        return Err(DbError::InvalidOperation(
-            "cluster connector sources require an explicit column schema; runtime schema discovery is not a durable catalog identity"
-                .into(),
-        ));
-    }
     let identity = catalog_create_identity(statement)?.ok_or_else(|| {
         DbError::InvalidOperation(
             "cluster catalog bootstrap accepts only reversible typed CREATE statements".into(),
@@ -746,8 +745,7 @@ fn validate_cluster_catalog_create(
     Ok(identity)
 }
 
-#[cfg(feature = "cluster")]
-fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
+pub(crate) fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
     if value.contains("://") {
         return laminar_connectors::security::value_contains_uri_secret(value, allow_reference);
     }
@@ -766,8 +764,7 @@ fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
     }
 }
 
-#[cfg(feature = "cluster")]
-fn catalog_property_contains_unsupported_secret(
+pub(crate) fn catalog_property_contains_unsupported_secret(
     key: &str,
     value: &str,
     allow_reference: bool,
@@ -792,8 +789,7 @@ fn catalog_property_contains_unsupported_secret(
         && uri_contains_unsupported_secret(value, allow_reference)
 }
 
-#[cfg(feature = "cluster")]
-fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
+pub(crate) fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
     use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
     let tokens = Tokenizer::new(&sqlparser::dialect::GenericDialect {}, sql)
@@ -811,8 +807,7 @@ fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
     }))
 }
 
-#[cfg(feature = "cluster")]
-fn sensitive_catalog_property(statement: &StreamingStatement) -> Option<String> {
+pub(crate) fn sensitive_catalog_property(statement: &StreamingStatement) -> Option<String> {
     fn find<'a>(
         options: impl IntoIterator<Item = (&'a String, &'a String)>,
         allow_reference: bool,
@@ -1033,398 +1028,6 @@ pub(crate) type ForceCheckpointRx =
     crossfire::AsyncRx<crossfire::mpsc::Array<ForceCheckpointRequest>>;
 
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RecoveredInputChannelProgress {
-    pub(crate) watermark: Option<i64>,
-    pub(crate) idle: bool,
-}
-
-pub(crate) struct InputChannelProgress {
-    pub(crate) input_channel: Vec<u8>,
-    pub(crate) watermark: Option<i64>,
-    pub(crate) idle: bool,
-}
-
-struct InputChannelWatermark {
-    generator: laminar_core::time::BoundedOutOfOrdernessGenerator,
-    idle: bool,
-    last_activity: Instant,
-}
-
-struct PartitionedSourceWatermarks {
-    max_out_of_orderness_ms: i64,
-    max_future_skew_ms: i64,
-    idle_timeout: Option<Duration>,
-    inventory: Option<Arc<[Vec<u8>]>>,
-    channels: rustc_hash::FxHashMap<Box<[u8]>, InputChannelWatermark>,
-    recovered: rustc_hash::FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
-    recovered_inventory: Option<Arc<[Vec<u8>]>>,
-    external_floor: i64,
-}
-
-impl PartitionedSourceWatermarks {
-    fn channel(
-        &self,
-        recovered: Option<RecoveredInputChannelProgress>,
-        admission_floor: i64,
-    ) -> InputChannelWatermark {
-        let mut generator =
-            laminar_core::time::BoundedOutOfOrdernessGenerator::new(self.max_out_of_orderness_ms)
-                .with_max_future_skew(self.max_future_skew_ms);
-        let watermark = recovered
-            .and_then(|progress| progress.watermark)
-            .map_or(admission_floor, |watermark| watermark.max(admission_floor));
-        if watermark > i64::MIN {
-            laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
-                &mut generator,
-                watermark,
-            );
-        }
-        InputChannelWatermark {
-            generator,
-            idle: recovered.is_some_and(|progress| progress.idle),
-            last_activity: Instant::now(),
-        }
-    }
-
-    fn effective_watermark(&self, channel: &InputChannelWatermark) -> i64 {
-        laminar_core::time::WatermarkGenerator::current_watermark(&channel.generator)
-            .max(self.external_floor)
-    }
-
-    fn frontier(&self) -> i64 {
-        if self.channels.is_empty() {
-            return i64::MIN;
-        }
-        let mut active = false;
-        let mut active_min = i64::MAX;
-        let mut idle_max = i64::MIN;
-        for channel in self.channels.values() {
-            let watermark = self.effective_watermark(channel);
-            idle_max = idle_max.max(watermark);
-            if !channel.idle {
-                active = true;
-                active_min = active_min.min(watermark);
-            }
-        }
-        if active {
-            active_min
-        } else {
-            idle_max
-        }
-    }
-
-    fn all_idle(&self) -> bool {
-        self.inventory
-            .as_ref()
-            .is_some_and(|_| self.channels.values().all(|channel| channel.idle))
-    }
-}
-
-pub(crate) struct SourceWatermarkState {
-    pub(crate) extractor: laminar_core::time::EventTimeExtractor,
-    pub(crate) generator: Box<dyn laminar_core::time::WatermarkGenerator>,
-    pub(crate) column: String,
-    partitioned: Option<PartitionedSourceWatermarks>,
-}
-
-impl SourceWatermarkState {
-    pub(crate) fn new(
-        extractor: laminar_core::time::EventTimeExtractor,
-        generator: Box<dyn laminar_core::time::WatermarkGenerator>,
-        column: String,
-    ) -> Self {
-        Self {
-            extractor,
-            generator,
-            column,
-            partitioned: None,
-        }
-    }
-
-    pub(crate) fn with_input_channels(
-        mut self,
-        max_out_of_orderness: Duration,
-        max_future_skew_ms: i64,
-        idle_timeout: Option<Duration>,
-        recovered: rustc_hash::FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
-        recovered_inventory: Option<Arc<[Vec<u8>]>>,
-    ) -> Self {
-        self.partitioned = Some(PartitionedSourceWatermarks {
-            max_out_of_orderness_ms: i64::try_from(max_out_of_orderness.as_millis())
-                .unwrap_or(i64::MAX),
-            max_future_skew_ms,
-            idle_timeout,
-            inventory: None,
-            channels: rustc_hash::FxHashMap::default(),
-            recovered,
-            recovered_inventory,
-            external_floor: i64::MIN,
-        });
-        self
-    }
-
-    pub(crate) const fn is_partitioned(&self) -> bool {
-        self.partitioned.is_some()
-    }
-
-    pub(crate) fn input_channels_all_idle(&self) -> Option<bool> {
-        self.partitioned
-            .as_ref()
-            .map(PartitionedSourceWatermarks::all_idle)
-    }
-
-    /// Install a trusted, durable source-decision floor without wall-clock skew rejection.
-    ///
-    /// Unlike checkpoint restore this is monotonic: a live source can only advance. The normal
-    /// `advance_watermark` path intentionally rejects implausibly future event timestamps, but a
-    /// committed cluster cut may legitimately originate from a peer clock and must be reproduced
-    /// exactly by both aggregate and per-channel checkpoint state.
-    pub(crate) fn install_committed_watermark_floor(&mut self, watermark: i64) -> Option<i64> {
-        if watermark == i64::MIN {
-            return None;
-        }
-        if let Some(state) = self.partitioned.as_mut() {
-            state.external_floor = state.external_floor.max(watermark);
-        }
-        if watermark <= self.generator.current_watermark() {
-            return None;
-        }
-        self.generator.restore_watermark_for_recovery(watermark);
-        Some(watermark)
-    }
-
-    pub(crate) fn install_input_channels(
-        &mut self,
-        inventory: Option<Arc<[Vec<u8>]>>,
-        admission_floor: i64,
-    ) -> Result<bool, String> {
-        let activation_floor = admission_floor.max(self.generator.current_watermark());
-        let Some(state) = self.partitioned.as_mut() else {
-            return Ok(false);
-        };
-        let inventory = inventory.ok_or_else(|| {
-            "ordered event-time source checkpoint omitted its input-channel inventory".to_string()
-        })?;
-        if inventory.iter().any(Vec::is_empty)
-            || !inventory.windows(2).all(|pair| pair[0] < pair[1])
-        {
-            return Err(
-                "input-channel inventory must contain non-empty, strictly ordered identities"
-                    .into(),
-            );
-        }
-        if state.inventory.as_ref().is_some_and(|installed| {
-            Arc::ptr_eq(installed, &inventory) || installed.as_ref() == inventory.as_ref()
-        }) {
-            return Ok(false);
-        }
-
-        let initial_install = state.inventory.is_none();
-        if initial_install {
-            let recovered_expected = state.recovered_inventory.as_deref();
-            if let Some(input_channel) = inventory.iter().find(|input_channel| {
-                !state.recovered.contains_key(input_channel.as_slice())
-                    && recovered_expected.is_some_and(|expected| {
-                        expected
-                            .binary_search_by(|candidate| candidate.as_slice().cmp(input_channel))
-                            .is_ok()
-                    })
-            }) {
-                return Err(format!(
-                    "recovered input channel {input_channel:02x?} has no committed watermark progress"
-                ));
-            }
-        }
-        let mut previous = std::mem::take(&mut state.channels);
-        let mut channels = rustc_hash::FxHashMap::with_capacity_and_hasher(
-            inventory.len(),
-            rustc_hash::FxBuildHasher,
-        );
-        for input_channel in inventory.iter() {
-            if let Some(channel) = previous.remove(input_channel.as_slice()) {
-                channels.insert(input_channel.clone().into_boxed_slice(), channel);
-                continue;
-            }
-            let recovered = if initial_install {
-                state.recovered.remove(input_channel.as_slice())
-            } else {
-                None
-            };
-            channels.insert(
-                input_channel.clone().into_boxed_slice(),
-                state.channel(recovered, activation_floor),
-            );
-        }
-        if initial_install {
-            state.recovered.clear();
-            state.recovered_inventory = None;
-        }
-        state.inventory = Some(inventory);
-        state.channels = channels;
-        self.generator.advance_watermark(state.frontier());
-        Ok(true)
-    }
-
-    pub(crate) fn observe_input_channels(
-        &mut self,
-        batch: &RecordBatch,
-        admission_floor: i64,
-    ) -> Result<Option<i64>, String> {
-        let Some(state) = self.partitioned.as_mut() else {
-            let floor = self.generator.advance_watermark(admission_floor);
-            let event = match self.extractor.extract(batch) {
-                Ok(timestamp) => self.generator.on_event(timestamp).map(|wm| wm.timestamp()),
-                Err(laminar_core::time::EventTimeError::NullTimestamp { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            };
-            return Ok(event.or_else(|| floor.map(|watermark| watermark.timestamp())));
-        };
-        if state.inventory.is_none() {
-            return Err("ordered event-time source emitted a batch before installing its input-channel inventory".into());
-        }
-        let timestamps = self
-            .extractor
-            .extract_millis_array(batch)
-            .map_err(|error| error.to_string())?;
-        let partitions = batch
-            .column_by_name(laminar_connectors::connector::SOURCE_PARTITION_COLUMN)
-            .ok_or_else(|| "ordered event-time batch omitted __source_partition".to_string())?
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| {
-                "ordered event-time batch __source_partition must be Binary".to_string()
-            })?;
-        if partitions.len() != timestamps.len() {
-            return Err("event-time and input-channel column lengths differ".into());
-        }
-
-        let observed_at = Instant::now();
-        let activation_floor = admission_floor.max(self.generator.current_watermark());
-        for row in 0..timestamps.len() {
-            if partitions.is_null(row) {
-                return Err(format!("null input-channel identity at row {row}"));
-            }
-            let input_channel = partitions.value(row);
-            let channel = state.channels.get_mut(input_channel).ok_or_else(|| {
-                format!("row {row} references an input channel outside the installed inventory")
-            })?;
-            if channel.idle {
-                laminar_core::time::WatermarkGenerator::advance_watermark(
-                    &mut channel.generator,
-                    activation_floor,
-                );
-            }
-            channel.idle = false;
-            channel.last_activity = observed_at;
-            if !timestamps.is_null(row) {
-                laminar_core::time::WatermarkGenerator::on_event(
-                    &mut channel.generator,
-                    timestamps.value(row),
-                );
-            }
-        }
-        let frontier = state.frontier();
-        Ok(self
-            .generator
-            .advance_watermark(frontier)
-            .map(|watermark| watermark.timestamp()))
-    }
-
-    pub(crate) fn advance_external_watermark(&mut self, watermark: i64) -> Option<i64> {
-        if let Some(state) = self.partitioned.as_mut() {
-            let candidate_floor = state.external_floor.max(watermark);
-            let frontier = state.frontier().max(candidate_floor);
-            let current = self.generator.current_watermark();
-            let advanced = self.generator.advance_watermark(frontier);
-            if frontier > current && advanced.is_none() {
-                return None;
-            }
-            state.external_floor = candidate_floor;
-            advanced.map(|watermark| watermark.timestamp())
-        } else {
-            self.generator
-                .advance_watermark(watermark)
-                .map(|watermark| watermark.timestamp())
-        }
-    }
-
-    pub(crate) fn tick_input_channel_idleness(&mut self) -> (Option<i64>, bool) {
-        let Some(state) = self.partitioned.as_mut() else {
-            return (
-                self.generator
-                    .on_periodic()
-                    .map(|watermark| watermark.timestamp()),
-                false,
-            );
-        };
-        let now = Instant::now();
-        let external_floor = state.external_floor;
-        let mut has_channel = false;
-        let mut has_active = false;
-        let mut active_min = i64::MAX;
-        let mut idle_max = i64::MIN;
-        for channel in state.channels.values_mut() {
-            has_channel = true;
-            if !channel.idle
-                && state.idle_timeout.is_some_and(|timeout| {
-                    now.saturating_duration_since(channel.last_activity) >= timeout
-                })
-            {
-                channel.idle = true;
-            }
-            let watermark =
-                laminar_core::time::WatermarkGenerator::current_watermark(&channel.generator)
-                    .max(external_floor);
-            idle_max = idle_max.max(watermark);
-            if !channel.idle {
-                has_active = true;
-                active_min = active_min.min(watermark);
-            }
-        }
-        let frontier = if !has_channel {
-            i64::MIN
-        } else if has_active {
-            active_min
-        } else {
-            idle_max
-        };
-        (
-            self.generator
-                .advance_watermark(frontier)
-                .map(|watermark| watermark.timestamp()),
-            state.inventory.is_some() && !has_active,
-        )
-    }
-
-    pub(crate) fn input_channel_progress(
-        &self,
-    ) -> Result<Option<Vec<InputChannelProgress>>, String> {
-        let Some(state) = self.partitioned.as_ref() else {
-            return Ok(None);
-        };
-        let inventory = state.inventory.as_ref().ok_or_else(|| {
-            "ordered event-time source has no installed input-channel inventory".to_string()
-        })?;
-        let mut progress = Vec::with_capacity(inventory.len());
-        for input_channel in inventory.iter() {
-            let channel = state
-                .channels
-                .get(input_channel.as_slice())
-                .ok_or_else(|| {
-                    "installed input-channel inventory and watermark state diverged".to_string()
-                })?;
-            let watermark = state.effective_watermark(channel);
-            progress.push(InputChannelProgress {
-                input_channel: input_channel.clone(),
-                watermark: (watermark > i64::MIN).then_some(watermark),
-                idle: channel.idle,
-            });
-        }
-        Ok(Some(progress))
-    }
-}
 
 /// Keep rows at/after the watermark. `Ok(None)` = all rows late;
 /// `Err` = schema drift (missing/non-timestamp column).
@@ -1773,7 +1376,6 @@ impl LaminarDB {
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry)?;
-        let physical_rules = extra_optimizer_rules.to_vec();
 
         Ok(Self {
             runtime_mode,
@@ -1822,6 +1424,7 @@ impl LaminarDB {
             #[cfg(all(test, feature = "cluster"))]
             compute_before_ready_panic: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: tokio::sync::Mutex::new(None),
+            schema_creation_lock: tokio::sync::Mutex::new(()),
             checkpoint_namespace_lock: parking_lot::Mutex::new(None),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1882,7 +1485,7 @@ impl LaminarDB {
                     ))
                 },
             )),
-            physical_optimizer_rules: physical_rules.into(),
+            physical_optimizer_rules: extra_optimizer_rules.to_vec().into(),
             pipeline_target_partitions: target_partitions,
             #[cfg(feature = "cluster")]
             shuffle_sender: parking_lot::Mutex::new(None),
@@ -2666,12 +2269,14 @@ impl LaminarDB {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
             return Ok(None);
         };
-        let Some((manifest, topology)) = store.load_with_topology().await.map_err(|error| {
-            DbError::Pipeline(format!(
-                "[{}] catalog manifest load failed: {error}",
-                laminar_core::error_codes::RECOVERY_FAILED
-            ))
-        })?
+        let Some((manifest, topology)) = futures::FutureExt::boxed(store.load_with_topology())
+            .await
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "[{}] catalog manifest load failed: {error}",
+                    laminar_core::error_codes::RECOVERY_FAILED
+                ))
+            })?
         else {
             return Ok(None);
         };
@@ -2707,7 +2312,13 @@ impl LaminarDB {
                 continue;
             }
             CATALOG_MANIFEST_REPLAY
-                .scope((), self.execute_single_already_gated(&entry.ddl))
+                .scope(
+                    (),
+                    crate::ddl::schema_resolution::RESOLVED_SCHEMA.scope(
+                        entry.schema_binding.clone(),
+                        self.execute_single_already_gated(&entry.ddl),
+                    ),
+                )
                 .await
                 .map_err(|error| {
                     DbError::Pipeline(format!(
@@ -4389,7 +4000,7 @@ impl LaminarDB {
             .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
 
         if matches!(&info.properties.connector, LookupConnector::External(_)) {
-            self.register_lookup_connector(&info, &pk);
+            self.register_lookup_connector(&info, &pk)?;
         }
 
         {
@@ -4439,7 +4050,7 @@ impl LaminarDB {
         }))
     }
 
-    fn preflight_lookup_connector(
+    pub(crate) fn preflight_lookup_connector(
         &self,
         properties: &laminar_sql::parser::lookup_table::LookupTableProperties,
     ) -> Result<(), DbError> {
@@ -4484,71 +4095,6 @@ impl LaminarDB {
             )));
         }
         Ok(())
-    }
-
-    fn register_lookup_connector(&self, info: &laminar_sql::planner::LookupTableInfo, pk: &str) {
-        use laminar_sql::parser::lookup_table::LookupConnector;
-
-        let connector_type = match &info.properties.connector {
-            LookupConnector::External(name) => name.clone(),
-            LookupConnector::Static => unreachable!(),
-        };
-
-        self.table_store
-            .write()
-            .set_connector(&info.name, &connector_type);
-
-        // Keys consumed by LookupTableProperties are excluded; "format.*" keys
-        // go to format_options with the prefix stripped.
-        let consumed = [
-            "connector",
-            "strategy",
-            "cache.memory",
-            "cache.ttl",
-            "pushdown",
-            "format",
-        ];
-        let mut connector_options = HashMap::with_capacity(info.raw_options.len());
-        let mut format_options = HashMap::with_capacity(4);
-        for (k, v) in &info.raw_options {
-            let lower = k.to_lowercase();
-            if consumed.contains(&lower.as_str()) {
-                continue;
-            }
-            if let Some(suffix) = lower.strip_prefix("format.") {
-                format_options.insert(suffix.to_string(), v.clone());
-            } else {
-                connector_options.insert(k.clone(), v.clone());
-            }
-        }
-
-        // Carry as bytes; the partial lookup cache is byte-weighted, not entry-counted.
-        let cache_max_bytes = info
-            .properties
-            .cache_memory
-            .map(|m| usize::try_from(m.as_bytes()).unwrap_or(usize::MAX));
-
-        let cache_ttl = info
-            .properties
-            .cache_ttl
-            .map(std::time::Duration::from_secs);
-
-        self.connector_manager
-            .lock()
-            .register_table(crate::connector_manager::TableRegistration {
-                name: info.name.clone(),
-                primary_key: pk.to_string(),
-                connector_type: Some(connector_type),
-                connector_options,
-                format: info.raw_options.get("format").cloned(),
-                format_options,
-                on_demand: matches!(
-                    info.properties.strategy,
-                    laminar_sql::parser::lookup_table::LookupStrategy::OnDemand
-                ),
-                cache_max_bytes,
-                cache_ttl,
-            });
     }
 
     /// Rebuild the lookup optimizer rules for the current set of registered tables.
@@ -4658,142 +4204,6 @@ impl LaminarDB {
         last_result.ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
     }
 
-    /// Apply and durably seal the complete startup catalog as one immutable batch.
-    /// Existing sealed catalogs accept exact replay/no-op definitions only.
-    ///
-    /// # Errors
-    /// Returns an error for a partial or divergent bootstrap, unsafe catalog mutation, lost leader
-    /// authority, or manifest sealing failure. Local creates are rolled back on every error.
-    #[cfg(feature = "cluster")]
-    pub async fn execute_cluster_bootstrap_batch(
-        &self,
-        sql: &[String],
-    ) -> Result<Vec<ExecuteResult>, DbError> {
-        self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
-        self.connector_registry.freeze();
-        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(DbError::Shutdown);
-        }
-        if DbState::load(&self.state) != DbState::Created {
-            return Err(DbError::InvalidOperation(
-                "cluster catalog bootstrap is only valid before pipeline startup".into(),
-            ));
-        }
-
-        let mut parsed = Vec::new();
-        for batch_entry in sql {
-            for stmt_sql in sql_utils::split_statements(batch_entry) {
-                let mut statements = parse_streaming_sql(stmt_sql)?;
-                if statements.len() != 1 {
-                    return Err(DbError::InvalidOperation(
-                        "cluster bootstrap entries must contain exactly one SQL statement".into(),
-                    ));
-                }
-                let statement = statements.pop().ok_or_else(|| {
-                    DbError::InvalidOperation(
-                        "cluster bootstrap entries must contain exactly one SQL statement".into(),
-                    )
-                })?;
-                let (name, kind, _) = validate_cluster_catalog_create(self, stmt_sql, &statement)?;
-                parsed.push((stmt_sql.to_owned(), statement, name, kind));
-            }
-        }
-        {
-            let mut names = std::collections::HashSet::with_capacity(parsed.len());
-            for (_, _, name, _) in &parsed {
-                if !names.insert(name.as_str()) {
-                    return Err(DbError::InvalidOperation(format!(
-                        "cluster bootstrap defines '{name}' more than once"
-                    )));
-                }
-            }
-        }
-
-        let _topology_ddl = self.topology_ddl_lock.write().await;
-        self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
-        self.ensure_coordinated_recovery_mutation_unfenced("cluster catalog bootstrap")?;
-        if DbState::load(&self.state) != DbState::Created {
-            return Err(DbError::InvalidOperation(
-                "cluster catalog bootstrap is only valid before pipeline startup".into(),
-            ));
-        }
-
-        if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            return self
-                .validate_sealed_topology_bootstrap(&manifest, &parsed)
-                .await;
-        }
-
-        if !self.catalog_manifest_inventory()?.is_empty() {
-            return Err(DbError::Pipeline(
-                "cannot seal a new cluster catalog over uncommitted local topology".into(),
-            ));
-        }
-        let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
-            DbError::Pipeline("cluster catalog manifest store is not configured".into())
-        })?;
-        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-            DbError::Pipeline(
-                "[LDB-6043] cluster catalog bootstrap requires a cluster controller".into(),
-            )
-        })?;
-        let leader_proof = controller
-            .capture_catalog_bootstrap_proof()
-            .ok_or_else(|| {
-                DbError::Pipeline(
-                    "[LDB-6043] cluster catalog bootstrap requires the active durable leader lease"
-                        .into(),
-                )
-            })?;
-        self.validate_catalog_seal_authority(Some(&leader_proof))?;
-
-        let mut bootstrap_guard = CatalogBootstrapGuard {
-            db: self,
-            created: Vec::with_capacity(parsed.len()),
-            sealed: false,
-        };
-        let mut results = Vec::with_capacity(parsed.len());
-        for (stmt_sql, statement, name, kind) in &parsed {
-            let result = CATALOG_BOOTSTRAP
-                .scope((), self.execute_parsed_single(stmt_sql, statement))
-                .await?;
-            let ExecuteResult::Ddl(info) = &result else {
-                return Err(DbError::Pipeline(format!(
-                    "cluster catalog create '{name}' returned a non-DDL result"
-                )));
-            };
-            if !info.applied || info.object_name != *name {
-                return Err(DbError::Pipeline(format!(
-                    "cluster catalog create '{name}' did not apply exactly once"
-                )));
-            }
-            bootstrap_guard.record(name.clone(), *kind);
-            results.push(result);
-        }
-
-        let manifest = laminar_core::cluster::control::CatalogManifest::new(
-            self.catalog_manifest_inventory()?,
-        )
-        .map_err(|error| {
-            DbError::Pipeline(format!("invalid cluster catalog inventory: {error}"))
-        })?;
-
-        #[cfg(test)]
-        let catalog_seal_gate = { self.catalog_seal_gate.lock().clone() };
-        #[cfg(test)]
-        if let Some((entered, release)) = catalog_seal_gate {
-            entered.notify_one();
-            release.notified().await;
-        }
-        self.validate_catalog_seal_authority(Some(&leader_proof))?;
-        store
-            .seal(&manifest, &leader_proof)
-            .await
-            .map_err(|error| DbError::Pipeline(format!("catalog manifest seal failed: {error}")))?;
-        bootstrap_guard.sealed();
-        Ok(results)
-    }
-
     /// Apply one startup catalog definition and seal it as the complete inventory.
     /// Prefer [`Self::execute_cluster_bootstrap_batch`] for server configuration.
     ///
@@ -4829,11 +4239,7 @@ impl LaminarDB {
                 // direct-mutation write lock or invoke the startup bootstrap exception here.
                 return Box::pin(self.submit_cluster_topology_sql(sql, statement)).await;
             }
-            let _topology_ddl = self.topology_ddl_lock.write().await;
-            self.ensure_catalog_cleanup_unfenced("database mutation")?;
-            #[cfg(feature = "cluster")]
-            self.ensure_coordinated_recovery_mutation_unfenced("database mutation")?;
-            self.execute_parsed_single(sql, statement).await
+            futures::FutureExt::boxed(self.execute_schema_ddl(sql, statement)).await
         } else if reads_catalog(statement) {
             let _topology_read = self.topology_ddl_lock.read().await;
             if mutates_database(statement) {
@@ -4864,30 +4270,13 @@ impl LaminarDB {
         self.execute_parsed_single(sql, &statements[0]).await
     }
 
-    async fn execute_parsed_single(
+    pub(crate) async fn execute_parsed_single(
         &self,
         sql: &str,
         statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
         #[cfg(feature = "cluster")]
-        if is_topology_ddl(statement) && !catalog_manifest_replay_active() {
-            let store_configured = self.catalog_manifest_store.lock().is_some();
-            let cluster_runtime = self.is_cluster_runtime();
-            if store_configured || cluster_runtime {
-                validate_cluster_catalog_create(self, sql, statement)?;
-                if !store_configured {
-                    return Err(DbError::Pipeline(
-                        "cluster topology DDL requires a catalog manifest store".into(),
-                    ));
-                }
-                if !catalog_bootstrap_active() {
-                    return Err(DbError::Pipeline(
-                        "[LDB-6043] configured cluster topology can change only through startup bootstrap/replay until a replicated topology-version barrier is implemented"
-                            .into(),
-                    ));
-                }
-            }
-        }
+        self.preflight_cluster_catalog_mutation(sql, statement)?;
 
         let result = match statement {
             StreamingStatement::CreateSource(create) => {
@@ -4902,7 +4291,7 @@ impl LaminarDB {
                 Ok(result)
             }
             StreamingStatement::CreateSink(create) => {
-                let result = self.handle_create_sink(create)?;
+                let result = futures::FutureExt::boxed(self.handle_create_sink(create)).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     if info.applied {
                         self.connector_manager
@@ -4983,7 +4372,7 @@ impl LaminarDB {
             }
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
-                    let result = self.handle_create_table(ct)?;
+                    let result = Box::pin(self.handle_create_table(ct)).await?;
                     if let ExecuteResult::Ddl(ref info) = result {
                         if info.applied {
                             self.connector_manager
@@ -5574,9 +4963,16 @@ impl LaminarDB {
                 _ => {}
             }
             let mut planner = self.planner.lock();
-            planner
-                .plan(&statements[0])
-                .map_err(laminar_sql::Error::from)?
+            let plan = match (
+                &statements[0],
+                crate::ddl::schema_resolution::supplied_binding(),
+            ) {
+                (StreamingStatement::CreateLookupTable(create), Some(binding)) => {
+                    planner.plan_lookup_table_with_schema(create, Arc::new(binding.logical))
+                }
+                _ => planner.plan(&statements[0]),
+            };
+            plan.map_err(laminar_sql::Error::from)?
         };
 
         match plan {
@@ -5755,13 +5151,21 @@ impl LaminarDB {
     /// List registered streams.
     pub fn streams(&self) -> Vec<crate::handle::StreamInfo> {
         let mgr = self.connector_manager.lock();
-        mgr.streams()
+        let mut streams = mgr
+            .streams()
             .iter()
             .map(|(name, reg)| crate::handle::StreamInfo {
                 name: name.clone(),
                 sql: Some(reg.query_sql.clone()),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        streams.extend(mgr.process_functions().values().map(|registration| {
+            crate::handle::StreamInfo {
+                name: registration.output_name.clone(),
+                sql: None,
+            }
+        }));
+        streams
     }
 
     /// Build the pipeline topology graph (nodes + edges) from registered sources, streams, and sinks.
@@ -5904,18 +5308,35 @@ impl LaminarDB {
         let object_store: Arc<dyn object_store::ObjectStore> = if let Some(ref url) =
             self.config.object_store_url
         {
-            laminar_core::checkpoint::object_store_builder::build_object_store(
-                url,
-                &self.config.object_store_options,
-            )
-            .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
+            let owner = self.checkpoint_namespace_lock.lock().clone();
+            match owner {
+                Some(owner)
+                    if laminar_connectors::storage::StorageProvider::detect_uri(url)
+                        == Some(laminar_connectors::storage::StorageProvider::Local) =>
+                {
+                    let root = laminar_core::checkpoint::object_store_builder::file_url_path(url)
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+                    laminar_core::checkpoint::object_store_builder::owned_durable_local_object_store(root, &owner)
+                        .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
+                }
+                _ => laminar_core::checkpoint::object_store_builder::build_object_store(
+                    url,
+                    &self.config.object_store_options,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("checkpoint object store: {error}"))
+                })?,
+            }
         } else {
             let data_dir = cp_config
                 .data_dir
                 .clone()
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-            laminar_core::checkpoint::object_store_builder::durable_local_object_store(data_dir)
+            match self.checkpoint_namespace_lock.lock().clone() {
+                Some(owner) => laminar_core::checkpoint::object_store_builder::owned_durable_local_object_store(data_dir, &owner),
+                None => laminar_core::checkpoint::object_store_builder::durable_local_object_store(data_dir),
+            }
                 .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
         };
         Ok(Some(object_store))

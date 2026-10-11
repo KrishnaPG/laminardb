@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use laminar_core::streaming::StreamCheckpointConfig;
-use laminar_db::{ExecuteResult, LaminarConfig, LaminarDB};
+use laminar_db::{DbError, ExecuteResult, LaminarConfig, LaminarDB};
 
 fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
     LaminarConfig {
@@ -401,9 +401,8 @@ async fn chained_projection_over_incremental_is_correct_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// Guard: chained aggregates AND simple projections/filters over an incremental MV are allowed
-/// (they net the changelog); a complex shape (join) is rejected. Sinks are no longer rejected at
-/// DDL — capability is enforced at pipeline start (see `sink_from_incremental_mv_*`).
+/// Chained aggregates and projections/filters can consume an incremental MV's changelog.
+/// Joins are rejected during DDL; sink capabilities are checked before connector activation.
 #[tokio::test]
 async fn terminality_guard_allows_agg_and_projection_rejects_join() {
     let dir = tempfile::tempdir().unwrap();
@@ -439,33 +438,31 @@ async fn terminality_guard_allows_agg_and_projection_rejects_join() {
     db.shutdown().await.unwrap();
 }
 
-/// A sink from an incremental MV is no longer rejected at DDL, but a connector that can neither
-/// upsert nor handle changelog records (the `files` sink) is rejected at pipeline start with
-/// `[LDB-1300]` — never silently dropping the changelog's retractions.
+/// Files sinks cannot consume incremental retractions and are rejected before preparation.
 #[cfg(feature = "files")]
 #[tokio::test]
-async fn sink_from_incremental_mv_rejects_noncapable_sink_at_start() {
+async fn sink_from_incremental_mv_rejects_noncapable_sink_at_ddl() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
-    // Guard relaxed: the sink DDL itself now succeeds over an incremental MV.
-    db.execute(&format!(
-        "CREATE SINK f FROM agg INTO FILES (path = '{}') FORMAT JSON",
-        out.display().to_string().replace('\\', "/")
-    ))
-    .await
-    .expect("CREATE SINK over an incremental MV now succeeds at DDL");
-    // Capability is enforced at start: the files sink can't consume a changelog.
-    let started = db.start().await;
-    let err = format!(
-        "{:?}",
-        started.expect_err("a non-capable sink over an incremental MV must be rejected at start")
+    let error = db
+        .execute(&format!(
+            "CREATE SINK f FROM agg INTO FILES (path = '{}') FORMAT JSON",
+            out.display().to_string().replace('\\', "/")
+        ))
+        .await
+        .expect_err("an append-only sink cannot consume incremental retractions");
+    assert!(
+        matches!(error, DbError::Config(ref detail) if detail.contains("FullChangelog")),
+        "{error}"
     );
-    assert!(err.contains("LDB-1300"), "expected LDB-1300, got: {err}");
-    db.shutdown().await.ok();
+    assert!(db.sinks().is_empty());
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    db.start().await.unwrap();
+    db.shutdown().await.unwrap();
 }
 
 /// The capability check fires ONLY for incremental MVs: a full-emit (non-incremental) aggregate
@@ -491,8 +488,7 @@ async fn sink_from_nonincremental_mv_allows_noncapable_sink() {
     db.shutdown().await.ok();
 }
 
-/// The capability check follows the changelog through a stream: a non-capable sink over a STREAM
-/// that projects an incremental MV is rejected at start too, not just a direct incremental-MV input.
+/// Startup follows retractions through a stream and requires full changelog sink support.
 #[cfg(feature = "files")]
 #[tokio::test]
 async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
@@ -511,12 +507,14 @@ async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
     ))
     .await
     .expect("CREATE SINK over the stream succeeds at DDL");
-    let started = db.start().await;
-    let err = format!(
-        "{:?}",
-        started.expect_err("a non-capable sink over a changelog stream must be rejected at start")
-    );
-    assert!(err.contains("LDB-1300"), "expected LDB-1300, got: {err}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    let error = db
+        .start()
+        .await
+        .expect_err("an append-only sink cannot consume stream retractions");
+    let error = format!("{error:?}");
+    assert!(error.contains("LDB-1300"), "{error}");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
     db.shutdown().await.ok();
 }
 

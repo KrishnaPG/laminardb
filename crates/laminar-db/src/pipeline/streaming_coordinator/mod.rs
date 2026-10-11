@@ -49,6 +49,7 @@ use crate::catalog::{schema_has_reserved_mutation_columns, validate_source_batch
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
+pub(crate) use source_channel::metrics::SourceQueueMetrics;
 use source_channel::{QueuedSourceMsg, SourceMsgRx, SourceMsgTx};
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 type ForceCheckpointRequest = crate::db::ForceCheckpointRequest;
@@ -263,7 +264,8 @@ impl TrackedSourceRegistration {
         self.contract
     }
 
-    pub(crate) fn with_temporal_right_mutations(mut self) -> Self {
+    /// Admit keyed mutation metadata for a temporal-right or direct keyed-mutation sink route.
+    pub(crate) fn with_keyed_upsert_mutations(mut self) -> Self {
         debug_assert_eq!(self.contract.input_mode, SourceInputMode::KeyedUpsert);
         self.admitted_non_append_mode = Some(SourceInputMode::KeyedUpsert);
         self

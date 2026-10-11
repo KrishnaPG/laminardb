@@ -32,6 +32,14 @@ fn test_parse_missing_required() {
 }
 
 #[test]
+fn source_rejects_connector_owned_replay_order() {
+    let error =
+        KafkaSourceConfig::from_config(&make_config(&[("replay.order", "partition_rounds")]))
+            .unwrap_err();
+    assert!(error.to_string().contains("ordering belongs to the engine"));
+}
+
+#[test]
 #[allow(deprecated)]
 fn test_parse_multi_topic() {
     let cfg = KafkaSourceConfig::from_config(&make_config(&[("topic", "a, b, c")])).unwrap();
@@ -770,7 +778,7 @@ fn resolve_subject_record_name() {
             Some("com.acme.Order"),
             "orders"
         ),
-        "com.acme.Order-value"
+        "com.acme.Order"
     );
 }
 
@@ -782,7 +790,7 @@ fn resolve_subject_topic_record_name() {
             Some("com.acme.Order"),
             "orders"
         ),
-        "orders-com.acme.Order-value"
+        "orders-com.acme.Order"
     );
 }
 

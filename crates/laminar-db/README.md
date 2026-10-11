@@ -38,6 +38,39 @@ reference-table enrichment; managed direct-source final windows and
 certified interval/temporal joins have their own admitted paths. Feature flags and checkpoints
 alone do not imply exactly-once delivery.
 
+## Stateful process functions
+
+Embedded databases can register a trusted native Rust handler or a connected loopback Rust or
+Python worker before `start()`. Each function consumes one append-only event-time source and
+uses engine-owned keyed state and timers. Local `AtLeastOnce` delivery admits native and remote
+Rust handlers with checkpointing and one append-only connector source declaring
+`SourceReplayOrder::SingleChannelFixedBatches` and deterministic row positions. Singleton and
+splittable placement are admitted locally, with one global physical input channel. Each fixed
+replay batch executes as one input/watermark cut, using its event timestamps and the declared
+out-of-orderness. Poll limits cannot change batch membership. The profile disables coalescing,
+wall-clock idleness, the wall-clock future-skew guard and external watermark advancement;
+inactivity timers therefore need subsequent source input to advance event time.
+Per-partition row positions or raw `SingleChannel` order alone do not qualify; built-in
+connectors currently leave replay order unspecified. Kafka preserves native partition order;
+FILES discovery order is not retained. Neither currently qualifies for guaranteed process
+replay. Independent-channel merging belongs to the engine and remains unsupported. The existing
+startup checks require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
+after a crash may publish an output again. Supervised Python also admits `AtLeastOnce` in the
+Rust library when reviewed code declares `replay_safe` and its complete package belongs to an
+unprivileged Linux deployment's read-only root image. A separately connected matching client
+does not establish the required lifetime binding. See the
+[Python replay profile](../../python/laminardb_process/README.md#replay-safe-linux-deployment).
+Undeclared Python remains `BestEffort`. Multiple logical sources remain unsupported.
+Single-owner and multi-owner clusters admit native and loopback remote Rust at-least-once with
+splittable placement and the same fixed-batch source profile. Register the deployment binding
+on every owner, then include `process_function_bootstrap_sql()` after source DDL and before
+consumers in the sealed startup catalog. Qualified supervised Python uses the same state and
+ownership lifecycle. The server installs this binding from `[[process_function]]` and fences
+serving and intake on worker exit. Cluster timers follow committed watermark cuts; checkpoint
+frequency bounds their latency. Package drift, live catalog changes,
+exactly-once process delivery and distributed subscriptions over process output are rejected.
+See the [account activity example](../../examples/process_account).
+
 Local subscriptions use in-memory replay history; cluster subscriptions expose committed,
 partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate
 snapshot query followed by a subscription nor a client cursor establishes an atomic

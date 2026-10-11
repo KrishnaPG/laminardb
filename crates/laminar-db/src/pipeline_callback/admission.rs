@@ -4,6 +4,23 @@ use super::{Arc, ConnectorPipelineCallback};
 
 impl ConnectorPipelineCallback {
     #[cfg(feature = "cluster")]
+    pub(super) fn require_process_authority(
+        &self,
+        boundary: &str,
+    ) -> Result<(), crate::pipeline::CycleError> {
+        if self
+            .cluster_controller
+            .as_ref()
+            .is_none_or(|controller| controller.process_lease_is_live())
+        {
+            return Ok(());
+        }
+        let error = format!("cluster process lease expired before {boundary}");
+        super::set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+        Err(crate::pipeline::CycleError::Recovery(error))
+    }
+
+    #[cfg(feature = "cluster")]
     // None defers incomplete participant preparation or an already held cut without a fault.
     pub(super) async fn checkpoint_flags_for_assignment(
         controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,

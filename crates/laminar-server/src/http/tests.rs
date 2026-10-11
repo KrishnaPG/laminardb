@@ -428,6 +428,7 @@ fn test_state_with_db_and_gate(
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            process_functions: vec![],
             discovery: None,
             node_id: None,
             sql: None,
@@ -520,6 +521,7 @@ fn test_state_with_auth_and_gate(
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            process_functions: vec![],
             discovery: None,
             node_id: None,
             sql: None,
@@ -853,6 +855,7 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
     ];
     for (method, path) in [
         ("GET", "/api/v1/sources"),
+        ("GET", "/api/v1/process-functions"),
         ("GET", "/api/v1/graph"),
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
@@ -878,6 +881,22 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
             );
         }
     }
+}
+
+#[tokio::test]
+async fn process_function_catalog_is_behind_console_auth() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    let request = Request::builder()
+        .uri("/api/v1/process-functions")
+        .header("authorization", "Bearer supersecret-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"[]");
 }
 
 #[tokio::test]
@@ -1578,7 +1597,7 @@ async fn explicit_reload_commits_live_sections_but_retains_mixed_restart_only_ch
     current.sources.push(crate::config::SourceConfig {
         name: "removed_source".to_string(),
         connector: "kafka".to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![],
         primary_key: vec![],
@@ -3684,6 +3703,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     assert!(uninitialized["locally_active_version"].is_null());
 
     let manifest = CatalogManifest::new(vec![CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "existing".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 7,
@@ -3738,6 +3758,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     snapshot_store.save_if_absent(&seed).await.unwrap();
     let mut target = manifest.clone();
     target.entries.push(CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "candidate".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,

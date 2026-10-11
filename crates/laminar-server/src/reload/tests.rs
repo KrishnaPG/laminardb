@@ -10,6 +10,7 @@ fn empty_config() -> ServerConfig {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         discovery: None,
         node_id: None,
         sql: None,
@@ -22,7 +23,7 @@ fn make_source(name: &str) -> SourceConfig {
     SourceConfig {
         name: name.to_string(),
         connector: "kafka".to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![],
         primary_key: vec![],
@@ -198,13 +199,13 @@ fn test_diff_source_changed() {
     old.sources.push(make_source("s1"));
     let mut new = empty_config();
     let mut changed = make_source("s1");
-    changed.format = "avro".to_string();
+    changed.format = Some("avro".to_string());
     new.sources.push(changed);
     let diff = diff_configs(&old, &new);
     assert!(diff.sources_added.is_empty());
     assert!(diff.sources_removed.is_empty());
     assert_eq!(diff.sources_changed.len(), 1);
-    assert_eq!(diff.sources_changed[0].format, "avro");
+    assert_eq!(diff.sources_changed[0].format.as_deref(), Some("avro"));
 }
 
 #[test]
@@ -322,7 +323,7 @@ async fn test_apply_add_source() {
     diff.sources_added.push(SourceConfig {
         name: "test_src".to_string(),
         connector: "kafka".to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![ColumnDef {
             name: "id".to_string(),
@@ -433,4 +434,28 @@ async fn test_apply_warnings_passed_through() {
     assert!(result.success);
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("[server]"));
+}
+
+#[test]
+fn process_function_binding_changes_require_restart() {
+    let old = empty_config();
+    let mut changed = old.clone();
+    changed.process_functions = toml::from_str::<ServerConfig>(
+        r#"
+[[process_function]]
+source = "events"
+output = "activity"
+source_sql = "CREATE SOURCE events (id BIGINT)"
+manifest = "manifest.json"
+handler_file = "handler.py"
+function = "handle"
+"#,
+    )
+    .unwrap()
+    .process_functions;
+    let diff = diff_configs(&old, &changed);
+    assert!(diff.is_empty());
+    assert!(diff.warnings.iter().any(|warning| {
+        warning.contains("[[process_function]]") && warning.contains("requires restart")
+    }));
 }

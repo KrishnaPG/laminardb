@@ -23,6 +23,11 @@ impl KafkaSourceConfig {
     /// Returns an error when a required property is missing or any value is invalid.
     #[allow(deprecated)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        if config.get("replay.order").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka replay.order is unsupported; cross-partition replay ordering belongs to the engine".into(),
+            ));
+        }
         let mut parsed = Self::default();
         parsed.parse_connection(config)?;
         parsed.parse_schema(config)?;

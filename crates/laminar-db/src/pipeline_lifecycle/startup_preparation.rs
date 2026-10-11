@@ -14,6 +14,7 @@ impl LaminarDB {
                 "_arrow_schema".to_string(),
                 crate::pipeline_callback::encode_arrow_schema(&entry.schema),
             );
+            crate::ddl::schema_resolution::set_primary_key_columns(&mut config, &entry.primary_key);
         }
         Ok(config)
     }
@@ -46,7 +47,7 @@ impl LaminarDB {
             }
         }
 
-        let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
+        let (source_regs, sink_regs, stream_regs, table_regs, has_external, process_regs) = {
             let mgr = self.connector_manager.lock();
             (
                 mgr.sources().clone(),
@@ -54,6 +55,10 @@ impl LaminarDB {
                 mgr.streams().clone(),
                 mgr.tables().clone(),
                 mgr.has_external_connectors(),
+                mgr.process_functions()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
             )
         };
 
@@ -68,6 +73,7 @@ impl LaminarDB {
         }
 
         let startup_runtime = self.runtime_mode();
+        self.validate_process_source_orders(&process_regs, &source_regs)?;
 
         let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
             &source_regs,
@@ -83,16 +89,12 @@ impl LaminarDB {
                 startup_runtime,
             )
             .await?;
-        let mut registered_source_names = source_regs.keys().collect::<Vec<_>>();
-        registered_source_names.sort_unstable();
-        for source_name in registered_source_names {
-            self.validate_registered_mutation_source_admission(
-                source_name,
-                &source_regs,
-                &temporal_source_roles,
-                &ordered_interval_admissions,
-            )?;
-        }
+        let direct_mutation_sources = self.validate_mutation_source_routes(
+            (&source_regs, &sink_regs, &stream_regs),
+            &temporal_source_roles,
+            &ordered_interval_admissions,
+            startup_runtime,
+        )?;
 
         let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
@@ -115,7 +117,8 @@ impl LaminarDB {
                     sink_regs.values(),
                     stream_regs.values(),
                     table_regs.values(),
-                ),
+                )
+                .with_process_functions(process_regs.iter()),
                 startup_runtime,
                 injected_cluster_checkpoint_store,
                 {
@@ -143,7 +146,7 @@ impl LaminarDB {
             .await?;
         }
 
-        let install_runtime = has_external || !stream_regs.is_empty();
+        let install_runtime = has_external || !stream_regs.is_empty() || !process_regs.is_empty();
         #[cfg(feature = "cluster")]
         let install_runtime = install_runtime || topology.is_some();
         if install_runtime {
@@ -164,6 +167,7 @@ impl LaminarDB {
                 pipeline_identity,
                 temporal_source_roles,
                 ordered_interval_admissions,
+                direct_mutation_sources,
                 runtime_shutdown,
                 #[cfg(feature = "cluster")]
                 topology,

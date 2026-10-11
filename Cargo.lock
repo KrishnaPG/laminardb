@@ -5175,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -5252,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -5303,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5327,11 +5327,15 @@ dependencies = [
  "laminar-core",
  "laminar-derive",
  "laminar-sql",
+ "libc",
+ "mongodb",
  "object_store",
  "ort",
  "parking_lot 0.12.5",
  "prometheus",
  "proptest",
+ "prost",
+ "protoc-bin-vendored",
  "quick_cache",
  "rdkafka",
  "reqwest 0.13.5",
@@ -5346,20 +5350,25 @@ dependencies = [
  "thiserror 2.0.20",
  "tokenizers",
  "tokio",
+ "tokio-postgres",
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
  "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
  "trait-variant",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "laminar-derive"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "laminar-connectors",
@@ -5371,7 +5380,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5396,6 +5405,7 @@ dependencies = [
  "laminardb-pgwire",
  "md-5 0.10.6",
  "mimalloc",
+ "mongodb",
  "notify",
  "object_store",
  "openssl",
@@ -5435,7 +5445,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5460,7 +5470,7 @@ dependencies = [
 
 [[package]]
 name = "laminardb-pgwire"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -5490,7 +5500,7 @@ dependencies = [
 
 [[package]]
 name = "laminardb-pgwire-replication"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

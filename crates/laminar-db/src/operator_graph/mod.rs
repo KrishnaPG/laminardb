@@ -37,8 +37,10 @@ use laminar_sql::translator::{
 
 mod catalog_context;
 mod input_admission;
+mod process;
 mod state_restore;
 
+#[cfg(test)]
 use input_admission::retained_input_bytes;
 #[cfg(feature = "cluster")]
 mod execution_poison;
@@ -326,6 +328,12 @@ pub(crate) trait GraphOperator: Send {
     /// it compiles. Cluster DDL admission does not consume this descriptor yet.
     fn cluster_capability(&self) -> OperatorCapability;
 
+    /// Whether raw input batches may be concatenated before this operator evaluates them.
+    /// The default preserves boundaries; only initialized, batch-invariant plans opt in.
+    fn certifies_input_batch_coalescing(&self) -> bool {
+        false
+    }
+
     /// Return cached retained-state accounting for cold-cadence metrics publication.
     ///
     /// Implementations must not scan per-key working state here. A bounded topology walk over
@@ -465,6 +473,28 @@ pub(crate) trait GraphOperator: Send {
     /// Whether a successful empty-input step may advance this operator's output frontier.
     fn advances_frontier_without_input(&self) -> bool {
         false
+    }
+
+    /// Bind fresh or restored process state to the verified startup assignment and local roster.
+    /// The graph calls this before compute launch and drops the entire image on failure.
+    #[cfg(feature = "cluster")]
+    fn bind_startup_assignment(
+        &mut self,
+        _assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        _owned_vnodes: &[u32],
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Bind process execution to the same lease and transport as its startup state image.
+    /// This grants no cluster admission or source intake authority.
+    #[cfg(feature = "cluster")]
+    fn bind_process_execution_authority(
+        &mut self,
+        _config: &crate::operator::sql_query::ClusterShuffleConfig,
+        _deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    ) -> Result<(), DbError> {
+        Ok(())
     }
 
     /// Bind a privately restored operator's future transport to the exact target generation.
@@ -1071,6 +1101,8 @@ pub(crate) struct OperatorGraph {
     ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
     // Must be the main multi-threaded runtime; Ring-1 workers (AI, lookup-enrich) spawn here.
     main_runtime_handle: Option<tokio::runtime::Handle>,
+    #[cfg(feature = "process-remote")]
+    process_work_wake: Option<Arc<tokio::sync::Notify>>,
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
     // Changelog-producing intermediates used for consumer admission and changelog enrichment.
@@ -1180,6 +1212,8 @@ impl OperatorGraph {
             live_handles: FxHashMap::default(),
             ai_runtime: None,
             main_runtime_handle: None,
+            #[cfg(feature = "process-remote")]
+            process_work_wake: None,
             partial_lookup_tables: FxHashMap::default(),
             changelog_tables: FxHashSet::default(),
             reference_tables: FxHashSet::default(),
@@ -1345,7 +1379,9 @@ impl OperatorGraph {
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .any(|(node_id, node)| {
-                !node.operator.wants_input() || self.node_has_buffered_input(node_id)
+                node.operator.deferred_work_is_runnable()
+                    || !node.operator.wants_input()
+                    || self.node_has_buffered_input(node_id)
             })
     }
 
@@ -3169,63 +3205,6 @@ impl OperatorGraph {
                 .with_label_values(&[name])
                 .set(watermark);
         }
-    }
-
-    fn route_output(
-        &mut self,
-        node_id: usize,
-        batches: Vec<RecordBatch>,
-        results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    ) -> Result<(), DbError> {
-        if batches.is_empty() {
-            return Ok(());
-        }
-        let node_name = Arc::clone(&self.nodes[node_id].name);
-        if let Some(expected) = self.intermediate_schemas.get(node_name.as_ref()).cloned() {
-            for (batch_index, batch) in batches.iter().enumerate() {
-                let actual = batch.schema();
-                let exact_fields =
-                    expected.fields().len() == actual.fields().len()
-                        && expected.fields().iter().zip(actual.fields()).all(
-                            |(expected, actual)| {
-                                expected.name() == actual.name()
-                                    && expected.data_type() == actual.data_type()
-                                    && expected.is_nullable() == actual.is_nullable()
-                            },
-                        );
-                if !exact_fields {
-                    self.poison_after_terminal_error();
-                    return Err(DbError::PipelineTerminal(format!(
-                        "stream '{}' emitted batch {batch_index} with fields {:?}; startup resolved fields {:?}",
-                        node_name,
-                        actual.fields(),
-                        expected.fields()
-                    )));
-                }
-            }
-        }
-        let bytes = retained_input_bytes(&batches);
-        self.preflight_output(node_id, batches.len(), bytes)?;
-        let is_output = self.output_node_ids.contains(&node_id);
-
-        if is_output {
-            results.insert(node_name, batches.clone());
-        }
-
-        let route_count = self.nodes[node_id].output_routes.len();
-        if route_count == 1 {
-            let (target, port) = self.nodes[node_id].output_routes[0];
-            self.push_to_port(target, port, batches, bytes);
-        } else if route_count > 1 {
-            // Clone batches N-1 times; the last route takes ownership.
-            for i in 0..route_count - 1 {
-                let (target, port) = self.nodes[node_id].output_routes[i];
-                self.push_to_port(target, port, batches.clone(), bytes);
-            }
-            let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
-            self.push_to_port(target, port, batches, bytes);
-        }
-        Ok(())
     }
 
     pub(crate) async fn execute_cycle(

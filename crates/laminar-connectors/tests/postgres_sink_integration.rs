@@ -18,11 +18,13 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
-use laminar_connectors::config::ConnectorConfig;
+use laminar_connectors::config::{ConnectorConfig, ConnectorState};
 use laminar_connectors::connector::SinkConnector;
+use laminar_connectors::error::ConnectorError;
 use laminar_connectors::postgres::{
     register_postgres_sink, PostgresSink, PostgresSinkConfig, WriteMode,
 };
@@ -358,6 +360,35 @@ async fn test_upsert_insert_and_update() {
     sink.close().await.expect("close");
 }
 
+#[tokio::test]
+async fn test_generated_column_rejects_input_on_postgres_18() {
+    let container = Postgres::default()
+        .with_tag("18")
+        .start()
+        .await
+        .expect("start postgres 18 container");
+    let host = container.get_host().await.expect("get host").to_string();
+    let port = container.get_host_port_ipv4(5432).await.expect("get port");
+    let pg = connect(&host, port).await;
+    pg.batch_execute(
+        "CREATE TABLE public.test_events (id bigint NOT NULL, \
+         computed bigint GENERATED ALWAYS AS (id * 2) STORED)",
+    )
+    .await
+    .expect("create generated column");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("computed", DataType::Int64, true),
+    ]));
+    let mut sink = PostgresSink::new(schema, sink_config(&host, port, WriteMode::Append), None);
+    let error = sink
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect_err("generated column cannot accept input");
+    assert!(matches!(error, ConnectorError::SchemaMismatch(_)));
+    assert!(error.to_string().contains("generated-column policy"));
+}
+
 // ── Auto-create table test ──────────────────────────────────────────
 
 #[tokio::test]
@@ -428,7 +459,22 @@ async fn test_statement_timeout_is_applied_to_pool_connections() {
         started.elapsed() < Duration::from_secs(6),
         "statement timeout was not applied: {error}"
     );
-    sink.close().await.expect("close after timeout");
+    assert_eq!(sink.state(), ConnectorState::Failed);
+    let retry_error = sink.flush().await.expect_err("failed writer cannot retry");
+    assert!(matches!(retry_error, ConnectorError::InvalidState { .. }));
+    let close_error = sink
+        .close()
+        .await
+        .expect_err("close reports writer failure");
+    assert!(matches!(close_error, ConnectorError::InvalidState { .. }));
+    assert_eq!(sink.state(), ConnectorState::Closed);
+    assert_eq!(sink.buffered_rows(), 0);
+    let count: i64 = pg
+        .query_one("SELECT COUNT(*) FROM public.test_events", &[])
+        .await
+        .expect("timed-out transaction rolled back")
+        .get(0);
+    assert_eq!(count, 0);
 }
 
 // ── Changelog (upsert + delete) test ────────────────────────────────
@@ -559,5 +605,149 @@ async fn test_upsert_collapses_zset_changelog() {
     assert_eq!(rows[1].get::<_, i64>(0), 2);
     assert!((rows[1].get::<_, f64>(1) - 20.0).abs() < f64::EPSILON);
 
+    sink.close().await.expect("close");
+}
+
+// ── Decimal ↔ NUMERIC ───────────────────────────────────────────────
+
+fn decimal_array(
+    values: &[Option<i128>],
+    precision: u8,
+    scale: i8,
+) -> arrow_array::Decimal128Array {
+    arrow_array::Decimal128Array::from(values.to_vec())
+        .with_precision_and_scale(precision, scale)
+        .unwrap()
+}
+
+async fn numeric_text(
+    pg: &tokio_postgres::Client,
+    column: &str,
+    order: &str,
+) -> Vec<Option<String>> {
+    pg.query(
+        &format!("SELECT {column}::text FROM public.test_events ORDER BY {order}"),
+        &[],
+    )
+    .await
+    .expect("select")
+    .iter()
+    .map(|row| row.get(0))
+    .collect()
+}
+
+/// COPY BINARY carries pre-encoded NUMERIC values; zero digit groups next to the decimal point
+/// (`1.00005`, `0.00001234`) must survive, as must sign, zero, null, and the full precision.
+#[tokio::test]
+async fn test_append_decimals_round_trip_exactly() {
+    let (_container, host, port) = start_pg().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("amount", DataType::Decimal128(20, 8), true),
+    ]));
+    let mut sink = PostgresSink::new(
+        schema.clone(),
+        sink_config(&host, port, WriteMode::Append),
+        None,
+    );
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open");
+    let amounts = [
+        Some(100_005_000),
+        Some(1234),
+        Some(-1_234_567_000_000),
+        Some(0),
+        Some(99_999_999_999_999_999_999),
+        None,
+    ];
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from((1..=6).collect::<Vec<i64>>())),
+            Arc::new(decimal_array(&amounts, 20, 8)),
+        ],
+    )
+    .unwrap();
+    sink.write_batch(&batch).await.expect("write");
+    sink.flush().await.expect("flush");
+
+    let pg = connect(&host, port).await;
+    let column = pg
+        .query_one(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = 'public.test_events'::regclass AND attname = 'amount'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0);
+    assert_eq!(column, "numeric(20,8)");
+    assert_eq!(
+        numeric_text(&pg, "amount", "id").await,
+        [
+            Some("1.00005000".to_string()),
+            Some("0.00001234".to_string()),
+            Some("-12345.67000000".to_string()),
+            Some("0.00000000".to_string()),
+            Some("999999999999.99999999".to_string()),
+            None,
+        ]
+    );
+    sink.close().await.expect("close");
+}
+
+/// UNNEST upserts and key-only deletes send decimals as exact text, including a decimal key.
+#[tokio::test]
+async fn test_changelog_decimal_key_upsert_and_delete() {
+    let (_container, host, port) = start_pg().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Decimal128(38, 4), false),
+        Field::new("amount", DataType::Decimal128(10, 5), true),
+        Field::new("_op", DataType::Utf8, false),
+    ]));
+    let mut config = sink_config(&host, port, WriteMode::Upsert);
+    config.changelog_mode = true;
+    let mut sink = PostgresSink::new(schema.clone(), config, None);
+    sink.open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect("open");
+    let batch = |ids: &[i128], amounts: &[Option<i128>], ops: &[&str]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(decimal_array(
+                    &ids.iter().copied().map(Some).collect::<Vec<_>>(),
+                    38,
+                    4,
+                )),
+                Arc::new(decimal_array(amounts, 10, 5)),
+                Arc::new(StringArray::from(ops.to_vec())),
+            ],
+        )
+        .unwrap()
+    };
+    sink.write_batch(&batch(
+        &[15_000, 20_001, 30_000],
+        &[Some(100_005), Some(1), None],
+        &["U", "U", "U"],
+    ))
+    .await
+    .expect("write puts");
+    sink.flush().await.expect("flush puts");
+    sink.write_batch(&batch(&[20_001, 15_000], &[None, Some(-5)], &["D", "U"]))
+        .await
+        .expect("write delete and update");
+    sink.flush().await.expect("flush delete and update");
+
+    let pg = connect(&host, port).await;
+    assert_eq!(
+        numeric_text(&pg, "id", "id").await,
+        [Some("1.5000".to_string()), Some("3.0000".to_string())]
+    );
+    assert_eq!(
+        numeric_text(&pg, "amount", "id").await,
+        [Some("-0.00005".to_string()), None]
+    );
     sink.close().await.expect("close");
 }

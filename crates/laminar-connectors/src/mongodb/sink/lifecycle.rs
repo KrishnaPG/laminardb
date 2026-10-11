@@ -24,17 +24,27 @@ impl SinkConnector for MongoDbSink {
         };
         cfg.validate()?;
         Self::validate_schema(&schema, &cfg)?;
+        // `cdc_replay` interprets immutable history records itself; it consumes no engine
+        // changelog, so it advertises append-only input and admission rejects retractions.
         let (topology, input_mode) = match cfg.write_mode {
             WriteMode::Insert => (SinkTopology::MultiWriter, SinkInputMode::AppendOnly),
-            WriteMode::Upsert { .. } | WriteMode::CdcReplay => {
-                (SinkTopology::Singleton, SinkInputMode::FullChangelog)
-            }
+            WriteMode::CdcReplay => (SinkTopology::Singleton, SinkInputMode::AppendOnly),
+            WriteMode::Upsert { .. } => (SinkTopology::Singleton, SinkInputMode::FullChangelog),
         };
         Ok(SinkContract::new(
             SinkConsistency::DurableAtLeastOnce,
             topology,
             input_mode,
         ))
+    }
+
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let parsed = super::super::config::MongoDbSinkConfig::from_config(config)?;
+        super::schema_resolution::resolve(config, &parsed, input).await
     }
 
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
@@ -50,6 +60,23 @@ impl SinkConnector for MongoDbSink {
         } else {
             self.apply_connector_config(config)?;
         }
+        let mut current =
+            super::schema_resolution::resolve(config, &self.config, self.schema.clone()).await?;
+        if config
+            .schema_binding()
+            .is_some_and(|binding| binding.value != current.value)
+        {
+            return Err(ConnectorError::SchemaMismatch("MongoDB collection identity or validator changed before activation; migrate the binding".into()));
+        }
+        if config.schema_binding().is_none() {
+            self.prepare_target(config, &mut current).await?;
+        }
+        if current.value.is_none() {
+            return Err(ConnectorError::SchemaMismatch(
+                "MongoDB activation requires a prepared collection UUID".into(),
+            ));
+        }
+        self.binding = Some(current);
         self.connect().await?;
 
         self.state = ConnectorState::Running;
@@ -61,6 +88,14 @@ impl SinkConnector for MongoDbSink {
         );
 
         Ok(())
+    }
+
+    async fn prepare_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        self.prepare_target(config, binding).await
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {

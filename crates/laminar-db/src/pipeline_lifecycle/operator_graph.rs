@@ -1,8 +1,10 @@
+use laminar_connectors::connector::SourceConnector as _;
+
 use super::{
-    admit_source_contract, admit_source_recovery_contract, admit_temporal_source_contract,
-    exact_table_reference, schema_has_reserved_mutation_columns, Arc,
-    ConnectorTaskFenceRegistration, DbError, FxHashMap, HashMap, LaminarDB, RuntimeMode,
-    SourceInputMode, SourceTopology, TemporalSourceRole, TrackedSourceRegistration,
+    admit_routed_source, admit_source_contract, exact_table_reference,
+    schema_has_reserved_mutation_columns, Arc, ConnectorTaskFenceRegistration, DbError, FxHashMap,
+    HashMap, LaminarDB, RuntimeMode, SourceInputMode, SourceRoute, SourceTopology,
+    TemporalSourceRole, TrackedSourceRegistration,
 };
 
 impl LaminarDB {
@@ -189,6 +191,28 @@ impl LaminarDB {
         // Seed changelog producers up front so consumer admission is independent of build order.
         graph.set_changelog_tables(changelog_carrying.clone());
 
+        self.install_registered_operators(&mut graph, stream_regs)?;
+
+        Ok(graph)
+    }
+
+    fn install_registered_operators(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    ) -> Result<(), DbError> {
+        let mut registrations = self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        registrations.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
+        for registration in &registrations {
+            graph.add_process_function(registration)?;
+        }
+
         let mut ordered_streams: Vec<_> = stream_regs.values().collect();
         ordered_streams.sort_by(|left, right| left.name.cmp(&right.name));
         for reg in ordered_streams {
@@ -204,7 +228,7 @@ impl LaminarDB {
         }
         graph.take_build_errors()?;
 
-        Ok(graph)
+        Ok(())
     }
 
     fn install_operator_graph_catalog_context(
@@ -236,12 +260,12 @@ impl LaminarDB {
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         ordered_interval_source_modes: &FxHashMap<String, SourceInputMode>,
+        direct_mutation_sources: &rustc_hash::FxHashSet<String>,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Vec<TrackedSourceRegistration>, DbError> {
         use crate::pipeline::SourceRegistration;
-        use laminar_connectors::connector::SourceConnector as _;
         let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
         for (name, reg) in source_regs {
             if reg.connector_type.is_none() {
@@ -280,58 +304,42 @@ impl LaminarDB {
                     source.with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
             }
             let contract = source.contract();
+            self.validate_instantiated_process_source_order(name, contract)?;
             let has_primary_key = source_entry
                 .as_ref()
                 .is_some_and(|entry| !entry.primary_key.is_empty());
             let has_reserved_mutation_columns = source_entry
                 .as_ref()
                 .is_some_and(|entry| schema_has_reserved_mutation_columns(entry.schema.as_ref()));
-            let temporal_role = temporal_source_roles.get(name).copied();
-            let ordered_interval_mode = ordered_interval_source_modes.get(name).copied();
-            let admission = if let Some(mode) = ordered_interval_mode {
-                if mode == contract.input_mode {
-                    admit_source_recovery_contract(
-                        contract,
-                        self.config.delivery_guarantee,
-                        checkpointing_enabled,
-                        runtime_mode,
-                    )
-                } else {
-                    Err("bounded interval source contract changed after startup admission")
-                }
-            } else if let Some(role) = temporal_role {
-                admit_temporal_source_contract(
-                    contract,
-                    role,
-                    has_primary_key,
-                    has_reserved_mutation_columns,
-                    self.config.delivery_guarantee,
-                    checkpointing_enabled,
-                    runtime_mode,
-                )
+            let route = if direct_mutation_sources.contains(name) {
+                SourceRoute::DirectMutationSinks
+            } else if let Some(mode) = ordered_interval_source_modes.get(name) {
+                SourceRoute::OrderedInterval(*mode)
+            } else if let Some(role) = temporal_source_roles.get(name) {
+                SourceRoute::Temporal(*role)
             } else {
-                admit_source_contract(
-                    contract,
-                    has_primary_key,
-                    has_reserved_mutation_columns,
-                    self.config.delivery_guarantee,
-                    checkpointing_enabled,
-                    runtime_mode,
-                )
+                SourceRoute::Plain
             };
-            admission.map_err(|reason| {
+            admit_routed_source(
+                contract,
+                route,
+                has_primary_key,
+                has_reserved_mutation_columns,
+                self.config.delivery_guarantee,
+                checkpointing_enabled,
+                runtime_mode,
+            )
+            .map_err(|reason| {
                 DbError::Config(format!(
                     "source '{name}' is not admissible in {runtime_mode:?} mode with {} delivery: \
                      {reason} (contract: {contract:?})",
                     self.config.delivery_guarantee
                 ))
             })?;
-            if matches!(temporal_role, Some(TemporalSourceRole::Right))
-                && contract.input_mode == SourceInputMode::KeyedUpsert
-            {
-                source = source.with_temporal_right_mutations();
+            if route.keeps_keyed_mutations(contract) {
+                source = source.with_keyed_upsert_mutations();
             }
-            if let Some(mode) = ordered_interval_mode {
+            if let SourceRoute::OrderedInterval(mode) = route {
                 source = source.with_ordered_interval_input_mode(mode)?;
             }
             let assignment_scoped = cfg!(feature = "cluster")

@@ -154,13 +154,197 @@ subscriptions.
 
 | Use | Available connectors |
 |---|---|
-| Sources | Kafka, NATS, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
+| Sources | Kafka, NATS, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
 | Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
 | Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
 
-PostgreSQL and MongoDB change-data-capture ingestion is not yet available as a streaming source.
+MongoDB change streams can feed sinks directly, either as change history or as a mirror of
+each document. See [MongoDB change data capture](#mongodb-change-data-capture) to get started.
+PostgreSQL change-data-capture ingestion is not yet available as a streaming source.
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
+
+### MongoDB change data capture
+
+LaminarDB can read changes straight from a MongoDB change stream and write them to
+PostgreSQL, Delta Lake, Iceberg, files, or another MongoDB. There is no Kafka or Debezium in
+between.
+
+You can use it in two ways:
+
+- **Mirror** (`output.mode = 'document'`): keep a copy of each document up to date. Inserts
+  and updates become upserts and deletes remove the row. PostgreSQL and Delta Lake support
+  this.
+- **History** (the default): write one row for every change, deletes included. This suits
+  audit logs and lake tables, for example files, Delta Lake, Iceberg, or a PostgreSQL table. A
+  MongoDB sink can also replay the history into an exact copy of the collection.
+
+#### Try it locally
+
+You need Docker, a Rust toolchain, and a checkout of this repository. These steps mirror a
+MongoDB collection into a PostgreSQL table.
+
+1. Start MongoDB and PostgreSQL:
+
+   ```bash
+   docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+   ```
+
+   MongoDB listens on `127.0.0.1:27117` and PostgreSQL on `127.0.0.1:15433` (user `laminar`,
+   password `laminar-test-secret`, database `mirror`). Change streams only work on a replica
+   set, so even this test MongoDB is a one-node replica set.
+
+2. Create the collection. A mirror needs the full document after every update, so turn on
+   pre- and post-images:
+
+   ```bash
+   docker exec laminardb-mongo-rs mongosh --port 27117 --quiet --eval \
+     'db.getSiblingDB("app").createCollection("users", {changeStreamPreAndPostImages: {enabled: true}})'
+   ```
+
+3. Save this as `laminardb.toml`:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE users (
+       _id VARCHAR NOT NULL, name VARCHAR, email VARCHAR, doc VARCHAR,
+       PRIMARY KEY (_id)
+   ) FROM "mongodb-cdc" (
+       'connection.uri' = 'mongodb://127.0.0.1:27117/?directConnection=true&tls=false',
+       'database' = 'app', 'collection' = 'users',
+       'output.mode' = 'document', 'full.document.mode' = 'required',
+       'snapshot.mode' = 'initial',
+       'objectid.columns' = '_id', 'document.json.column' = 'doc'
+   );
+
+   CREATE SINK users_pg FROM users INTO "postgres-sink" (
+       'hostname' = '127.0.0.1', 'port' = '15433', 'database' = 'mirror',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'table.name' = 'users', 'auto.create.table' = 'true',
+       'write.mode' = 'upsert', 'primary.key' = '_id', 'changelog.mode' = 'true'
+   );
+   '''
+
+   [server]
+   bind = "127.0.0.1:8080"
+   delivery = "at_least_once"
+
+   [checkpoint]
+   url = "file:///tmp/laminardb-cdc"
+   interval = "1s"
+   ```
+
+   LaminarDB connects to MongoDB over TLS unless the URI says `tls=false`. The test MongoDB has
+   no TLS, so this URI turns it off. Passwords can't be written into the SQL: `$${PG_PASSWORD}`
+   reaches the SQL as `${PG_PASSWORD}`, and LaminarDB reads it from the environment when it
+   connects.
+
+4. Start the server. The first build takes a few minutes.
+
+   ```bash
+   PG_PASSWORD=laminar-test-secret cargo run --release -p laminar-server --bin laminardb -- \
+     --config laminardb.toml
+   ```
+
+5. In another terminal, change some data in MongoDB, then look at PostgreSQL:
+
+   ```bash
+   docker exec laminardb-mongo-rs mongosh --port 27117 --quiet --eval '
+     const users = db.getSiblingDB("app").users;
+     users.insertOne({name: "Ada", email: "ada@example.com"});
+     users.insertOne({name: "Alan", email: "alan@example.com"});
+     users.updateOne({name: "Ada"}, {$set: {email: "ada@lovelace.dev"}});
+     users.deleteOne({name: "Alan"});'
+
+   docker exec laminardb-cdc-postgres psql -U laminar -d mirror -c 'SELECT _id, name, email FROM users'
+   ```
+
+   You should see one row: Ada, with her new email. Alan was inserted and then deleted, so he
+   is gone. Changes usually arrive in well under a second.
+
+If you stop the server and start it again, it carries on from its last checkpoint. It does
+not copy the collection a second time.
+
+#### Things to know
+
+- Run it with checkpointing on and at-least-once delivery. After a crash, some changes may be
+  applied twice. Upserts and deletes make that harmless.
+- In a mirror, the `PRIMARY KEY` must be `_id`, and every other column must allow nulls,
+  because a delete only carries the key. List ObjectId columns in `objectid.columns`.
+- Column types must match the stored values. For example, a MongoDB double can't go into a
+  `BIGINT` column. If you don't want to map fields one by one, `document.json.column` holds the
+  whole document as JSON.
+- `snapshot.mode = 'initial'` copies the documents that already exist, then follows changes
+  from that point. Without it, only changes made after the first start are captured.
+- The source stops with an error, instead of guessing, when the oplog no longer holds the
+  changes it needs, when the collection is dropped or replaced, or when a post-image is
+  missing. Size the oplog for the longest outage you expect.
+- It runs embedded or on a single-node server. Cluster mode and exactly-once delivery aren't
+  supported yet.
+
+The [connector guide](crates/laminar-connectors/README.md#mongodb-cdc) covers every option, the
+history record format, and failure handling in detail.
+
+### Connector schemas
+
+You can omit source columns when the connector can read them from metadata, such as an Avro
+schema in Schema Registry or a Parquet file. Generators and OpenTelemetry have fixed schemas.
+For OpenTelemetry, leave `format` out of the TOML source and omit `FORMAT` in SQL; it uses
+the native OTLP protocol. Codec-based sources use their connector's default when `format` is omitted.
+JSON and CSV sources need declared columns unless file sampling is explicitly enabled.
+Sinks get their input fields from the source or stream they read. The query must fit the
+destination's fields and types; use aliases and casts in a stream to adjust the output.
+
+For example, if the `events` and `archive` topics already have Avro value schemas containing
+`id` and `label`, you can use them without repeating those fields in SQL:
+
+```sql
+CREATE SOURCE events FROM KAFKA (
+  'bootstrap.servers' = 'localhost:19092', 'topic' = 'events',
+  'group.id' = 'schema-example', 'schema.registry.url' = 'http://localhost:8081'
+) FORMAT AVRO;
+CREATE STREAM output AS SELECT label, id FROM events;
+CREATE SINK archive FROM output INTO KAFKA (
+  'bootstrap.servers' = 'localhost:19092', 'topic' = 'archive',
+  'schema.registry.url' = 'http://localhost:8081'
+) FORMAT AVRO;
+```
+
+By default, this reads the latest schema under each topic's `<topic>-value` subject once when
+you create the object. These settings control selection, sampling and external creation:
+
+| Setting | When to use it |
+|---|---|
+| `schema.registry.url` | Avro registry service URL, such as `http://localhost:8081`. Supply the service URL, not a subject or schema-resource URL. |
+| `schema.registry.value.subject` | Choose a value subject explicitly. Use it when multiple topics, a regex subscription or a naming strategy would make selection ambiguous. |
+| `schema.registry.value.version` or `schema.registry.value.id` | Pin a positive version or schema ID. Set one of these, not both. Without either, creation resolves latest once. |
+| `schema.registry.record.name` | Supply the record name when using the existing record-based subject naming strategies. An explicit value subject overrides subject derivation. |
+| `schema.registry.auto.register` | Defaults to `false`. Set it to `true` on a Kafka sink to permit registration during creation. Changing `schema.compatibility` also requires this permission. |
+| `schema.inference` | Defaults to `false`. Set it to `true` for CSV or JSON file sources to sample up to four files, 1 MiB and 1,000 rows within ten seconds. Empty or all-null samples fail; a sample cannot prove what future files will contain. |
+| `auto.create` | Defaults to `false` for Delta Lake and Iceberg sinks and MongoDB standard collections. Set it to `true` to permit creation of a missing destination. |
+| `auto.create.table` | Defaults to `false` for PostgreSQL sinks. Set it to `true` to permit creation of a missing table. |
+| `schema.evolution` | Keep it `false` for Delta sinks using durable schema contracts. Change an incompatible target through a controlled migration. |
+
+For instance, a local Delta sink may create its table when you ask it to:
+
+```sql
+CREATE SINK delta_out FROM output INTO "delta-lake"
+  ('table.path' = './delta-output', 'auto.create' = 'true');
+```
+
+Durable deployments save the resolved contract before starting the connector. Restarts reuse
+that contract, including the selected registry identity. Keep historical Avro writer schemas
+in the registry for replay. Connectivity, authorization and destination identity checks still
+apply after restart. Creating an external table or registering a schema can succeed before
+catalog publication fails, leaving an unused resource for you to review.
+
+Use `DESCRIBE events` to inspect resolved fields and their origin. The
+[schema guide](docs/SCHEMA_RESOLUTION.md) covers supported formats, mappings, recovery and
+migration. Schema discovery uses the existing deployment and delivery restrictions.
+
+MongoDB time-series sinks permit creation through the existing `timeseries.time_field`
+setting. Saved bindings track the backing bucket UUID, so dropping and recreating a
+time-series collection requires a new binding.
 
 ## AI functions
 
@@ -202,6 +386,7 @@ See the [deployment guide](deploy/README.md) for setup and operational details.
 ## More documentation
 
 - [SQL reference](docs/SQL_REFERENCE.md)
+- [Connector schema resolution and recovery](docs/SCHEMA_RESOLUTION.md)
 - [Server configuration](crates/laminar-server/README.md)
 - [Connector guide](crates/laminar-connectors/README.md)
 - [Rust API](https://docs.rs/laminar-db)

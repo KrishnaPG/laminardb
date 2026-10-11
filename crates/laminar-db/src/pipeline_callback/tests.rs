@@ -589,6 +589,7 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         graph: crate::operator_graph::OperatorGraph::new(SessionContext::new()),
         stream_entries: Vec::new(),
         sinks: Vec::new(),
+        direct_sinks: crate::direct_mutation::DirectSinkInputs::default(),
         owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
         watermark_states: FxHashMap::default(),
         source_entries_for_wm: FxHashMap::default(),
@@ -981,6 +982,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     let catalog = CatalogManifestStore::new(Arc::clone(&leader.authority));
     let parent = CatalogManifest {
         entries: vec![CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: "existing".into(),
             kind: CatalogObjectKind::Source,
             catalog_generation: 1,
@@ -1002,6 +1004,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         .unwrap();
     let mut target = parent.clone();
     target.entries.push(CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "candidate".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,
@@ -4019,6 +4022,7 @@ fn cluster_callback_fixture(
             graph: crate::operator_graph::OperatorGraph::new(SessionContext::new()),
             stream_entries: Vec::new(),
             sinks: Vec::new(),
+            direct_sinks: crate::direct_mutation::DirectSinkInputs::default(),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             watermark_states,
             source_entries_for_wm,
